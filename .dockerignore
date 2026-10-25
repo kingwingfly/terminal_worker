@@ -1,0 +1,13 @@
+# The archiver's image builds from the repository root; it needs only the Rust workspace.
+.git
+.wrangler
+.dev.vars
+.local-password
+node_modules
+dist
+target
+test-results
+crates/worker/build
+web
+seed
+tests

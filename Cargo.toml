@@ -1,0 +1,24 @@
+[workspace]
+members = ["crates/core", "crates/worker", "crates/frontend", "crates/preview", "crates/archiver"]
+resolver = "2"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "=0.2.129"
+web-sys = "=0.3.106"
+js-sys = "=0.3.106"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+
+# The Mermaid preview worker, the most Rust code the terminal loads: built for size, it takes a
+# third less, and still draws a diagram in milliseconds. The PDF and grammar workers are mostly
+# data, which this would not shrink.
+[profile.size]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"

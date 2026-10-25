@@ -1,0 +1,17 @@
+[package]
+name = "terminal-worker-archiver"
+version = "0.1.0"
+edition = "2024"
+description = "Reads and writes zip and tar archives for the terminal, in its container"
+
+[dependencies]
+terminal-worker-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+tiny_http = "0.12"
+# Pure Rust deflate (miniz_oxide), the same on every host, so that archives rebuilt after an
+# interruption are byte for byte the ones begun.
+flate2 = "1.1"
+tar = { version = "0.4", default-features = false }
+zip = { version = "9.1", default-features = false, features = ["deflate-flate2"] }

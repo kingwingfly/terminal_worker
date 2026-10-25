@@ -1,0 +1,4 @@
+# npm run setup generates the actual .dev.vars and .local-password.
+# Do not use these example strings as real credentials.
+ADMIN_PASSWORD=replace-with-a-long-random-password
+SESSION_SECRET=replace-with-an-independent-random-secret
