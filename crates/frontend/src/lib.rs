@@ -419,7 +419,7 @@ fn App() -> impl IntoView {
                 </div>
                 <div class="workspace-panes">
                 <section class="file-panel" aria-label="File manager">
-                <div class="directory-bar"><span>{move || format!("~/archive{}", current.get().cwd.get())}</span>
+                <div class="directory-bar"><span>{move || current.get().cwd.get()}</span>
                     <button on:click=move |_| current.get_untracked().run("upload".into())>"↑ Upload files"</button></div>
                 <div class="files" aria-label="Current directory">
                     <Show when=move || current.get().cwd.get() != "/"><button class="file" on:click=move |_| current.get_untracked().run("cd ..".into())><span class="file-kind">{file_icon("directory", true)}</span><span>"../"</span></button></Show>

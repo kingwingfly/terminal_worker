@@ -59,6 +59,57 @@ test('pipes join filters, fd finds what may be listed, and xargs and fd -x run c
   expect(await output(page, 'fd -e none | xargs -r rm')).not.toContain('Usage');
 });
 
+test('wildcards expand to sorted paths as bash expands them, and rm -rf * empties a directory', async ({ page, request }) => {
+  const names = async path => (await (await request.get('/api/ls?path=' + encodeURIComponent(base + path))).json()).entries.map(e => e.name).sort();
+  await terminal(page);
+  // Sorted, relative as typed, without hidden names, in every part of a path.
+  expect(await output(page, 'echo *')).toBe('a.md docs x.tmp y.tmp');
+  expect(await output(page, 'echo *.tmp ?.md')).toBe('x.tmp y.tmp a.md');
+  expect(await output(page, 'echo docs/*/*.md')).toBe('docs/deep/spéctrum notes.md');
+  expect(await output(page, 'echo d*/./b.md')).toBe('docs/./b.md');
+  expect(await output(page, 'echo docs/*/../b.md')).toBe('docs/deep/../b.md');
+  expect(await output(page, 'echo docs/*/..')).toBe('docs/deep/..');
+  expect(await output(page, 'echo docs/*/../')).toBe('docs/deep/../');
+  expect(await output(page, 'echo */')).toBe('docs/');
+  expect(await output(page, 'echo [xy].tmp')).toBe('x.tmp y.tmp');
+  expect(await output(page, 'echo .*')).toBe('.hidden');
+  expect(await output(page, 'echo ' + base + '/d*')).toBe(base + '/docs');
+  // Quoted or escaped wildcards are literal; a pattern that matches nothing stays as typed.
+  expect(await output(page, `echo '*' \\*.md "?.md" *.none`)).toBe('* *.md ?.md *.none');
+  expect(await output(page, 'cat docs/*.md docs/*.txt | wc -l')).toBe('6');
+  await run(page, 'rm *.tmp');
+  await expect.poll(() => names('')).toEqual(['.hidden', 'a.md', 'docs']);
+  // rm -rf * leaves hidden names, as bash does; in an empty directory it does nothing.
+  await run(page, 'cd docs'); await run(page, 'rm -rf *');
+  await expect.poll(() => names('/docs')).toEqual([]);
+  await run(page, 'rm -rf *');
+  await expect(page.locator('#command').locator('xpath=ancestor::form').locator('.busy')).toHaveText('↵');
+  await expect(last(page)).toHaveClass(/command-echo/);
+  await run(page, 'cd ..'); await run(page, 'rm -r *');
+  await expect.poll(() => names('')).toEqual(['.hidden']);
+});
+
+test('wildcard suffixes use search permission and quoted bracket characters stay literal', async ({ page, request }) => {
+  await terminal(page);
+  await run(page, 'mkdir patterns');
+  await run(page, 'touch patterns/a patterns/b patterns/c patterns/- patterns/! patterns/^');
+  expect(await output(page, 'echo patterns/[a"-"c]')).toBe('patterns/- patterns/a patterns/c');
+  expect(await output(page, 'echo patterns/["!"a]')).toBe('patterns/! patterns/a');
+  expect(await output(page, 'echo patterns/["^"a]')).toBe('patterns/^ patterns/a');
+  // A literal suffix needs search permission, not permission to list its parent.
+  expect((await command(request, ['chmod', '711', base + '/docs'])).ok()).toBe(true);
+  await run(page, 'exit');
+  await run(page, 'cd ' + base);
+  expect(await output(page, 'echo d*/b.md')).toBe('docs/b.md');
+  expect(await output(page, 'echo d*/./b.md')).toBe('docs/./b.md');
+  expect(await output(page, 'echo d*/../a.md')).toBe('docs/../a.md');
+  expect(await output(page, 'echo d*/missing.md')).toBe('d*/missing.md');
+  expect(await output(page, 'echo d*/*.md')).toBe('d*/*.md');
+  expect((await command(request, ['chmod', '700', base + '/docs'])).ok()).toBe(true);
+  expect(await output(page, 'echo d*/b.md')).toBe('d*/b.md');
+  expect(await output(page, 'echo d*/../a.md')).toBe('d*/../a.md');
+});
+
 test('mv and cp follow Linux defaults, ask with -i, share content, and refuse what rename would', async ({ page, request }) => {
   await terminal(page);
   await run(page, 'cp -r docs copy'); await run(page, 'mv a.md docs/');

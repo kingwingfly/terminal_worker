@@ -11,7 +11,9 @@
 //!
 //! Bytes go between R2 and the container as streams, and every file written is written through
 //! the authority, as the job's account.
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -129,6 +131,16 @@ impl DurableObject for ArchiveRunner {
                         .await;
                     self.close().await;
                 } else {
+                    // Said in the job too, which would otherwise seem to hang.
+                    let _ = self
+                        .call(
+                            Method::Post,
+                            &format!("/internal/job/update?id={job}"),
+                            Some(json!({"lines": [[true, format!(
+                                "Attempt {failures} of {ATTEMPTS} failed, trying again: {e}"
+                            )]]})),
+                        )
+                        .await;
                     storage.put("failures", failures).await?;
                     storage.set_alarm(i64::from(2000 * failures)).await?;
                 }
@@ -219,11 +231,29 @@ impl ArchiveRunner {
                 "Containers are not available; see the README's archive section".into(),
             )
         })?;
+        // A container that cannot start says so only to its monitor: keep why, so as to stop
+        // waiting for it at once.
+        let ended = Rc::new(RefCell::new(None::<String>));
         if !container.running() {
             container.start(None)?;
+            if let Some(watched) = self.state.container() {
+                let ended = ended.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let why = match watched.wait_for_exit().await {
+                        Ok(()) => "it exited".to_string(),
+                        Err(e) => e.to_string(),
+                    };
+                    *ended.borrow_mut() = Some(why);
+                });
+            }
         }
         let fetcher = container.get_tcp_port(PORT)?;
         for _ in 0..120 {
+            if let Some(why) = ended.borrow_mut().take() {
+                return Err(Error::RustError(format!(
+                    "The archiver did not start: {why}"
+                )));
+            }
             if let Ok(response) = fetcher.fetch("http://archiver/status", None).await
                 && response.status_code() == 200
             {

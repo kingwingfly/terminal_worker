@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod completion;
 pub mod find;
+pub mod glob;
 pub mod permissions;
 pub mod shell;
 pub mod text;
