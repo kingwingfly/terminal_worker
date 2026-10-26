@@ -209,16 +209,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             if !n.directory {
                 return Reply::error("Not a directory", 400);
             }
-            let mut entries: Vec<_> = db
-                .children(&path)
-                .iter()
-                .map(|(p, n)| commands::entry(db, p, n))
-                .collect();
-            entries.sort_by(|a, b| {
-                b.directory
-                    .cmp(&a.directory)
-                    .then_with(|| a.name.cmp(&b.name))
-            });
+            let entries = commands::entries(db, &path, &db.children(&path));
             Reply::ok(json!(Listing { path, entries }))
         }),
         (Method::Post, "/api/mkdir") => run(state, move |db| {
@@ -359,7 +350,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let id = param("id");
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
-                commit_upload(db, &who, &id, None, None, true)
+                finish_upload(db, &who, &id, true)
             })
         }
         (Method::Delete, "/api/uploads") => {
@@ -411,6 +402,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             struct Commit {
                 id: String,
                 index: Option<u64>,
+                key: Option<String>,
                 sha256: Option<String>,
                 #[serde(default)]
                 complete: bool,
@@ -424,7 +416,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     db,
                     &who,
                     &commit.id,
-                    commit.index,
+                    commit.index.zip(commit.key),
                     commit.sha256,
                     commit.complete,
                 )
@@ -680,7 +672,9 @@ fn job_reply(
             db,
             &actor,
             body["upload"].as_str().unwrap_or_default(),
-            body["index"].as_u64(),
+            body["index"]
+                .as_u64()
+                .zip(body["key"].as_str().map(String::from)),
             body["sha256"].as_str().map(String::from),
             body["complete"] == true,
         ),
@@ -717,9 +711,11 @@ fn job_reply(
 const BATCH_MAX: usize = 100;
 
 /// Run one command as the session `key`, elevated if it asks for sudo.
-fn command_reply(db: &mut Db, key: Option<&str>, command: commands::Command) -> Reply {
+fn command_reply(db: &mut Db, key: Option<&str>, mut command: commands::Command) -> Reply {
     let who = auth::identity(db, key);
     let actor = acl!(auth::elevated(db, key, command.sudo), &who);
+    // `~` is the signed-in account's home, also under sudo, as the shell expands it before sudo.
+    command.home = db.user_by_id(who.id).map(|(_, user)| user.home);
     let result = if command
         .args
         .first()
@@ -753,9 +749,15 @@ pub async fn kick(env: &Env, reply: &Value) {
     }
 }
 
-/// The R2 object holding chunk `index` of `file`.
+/// A new R2 object for chunk `index` of `file`. Each write has its own, so a chunk sent again,
+/// or late, never overwrites one already committed, which readers and copies may be reading.
 pub fn chunk_key(file: &str, index: u64) -> String {
-    format!("chunks/{file}/{index}")
+    format!("chunks/{file}/{index}-{}", &auth::random_token()[..16])
+}
+/// Whether `key` is an object `chunk_key` named for chunk `index` of `file`.
+fn chunk_of(key: &str, file: &str, index: u64) -> bool {
+    key.strip_prefix(&format!("chunks/{file}/{index}-"))
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// An upload to begin: `size` bytes, in chunks of `chunk_size`.
@@ -858,20 +860,61 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
     Reply::ok(json!({"id":id,"created":old.is_none(),"size":size,"chunk_size":chunk_size.max(1)}))
 }
 
-/// Record chunk `index` of upload `id` as written, and complete the upload if asked.
+/// Record `chunk`, an index and the object written for it, as part of upload `id`, and complete
+/// the upload if asked. A chunk is committed once: what readers have seen of it never changes,
+/// and an object written for nothing goes to the garbage.
 fn commit_upload(
     db: &mut Db,
     who: &Identity,
     id: &str,
-    index: Option<u64>,
+    chunk: Option<(u64, String)>,
     sha256: Option<String>,
     complete: bool,
 ) -> Reply {
-    let Some(file) = db.file(id) else {
-        if let Some(index) = index {
-            db.discard(&chunk_key(id, index));
+    let Some((index, key)) = chunk else {
+        return finish_upload(db, who, id, complete);
+    };
+    if !chunk_of(&key, id, index) {
+        return Reply::error("Chunk key does not belong to this upload", 400);
+    }
+    let refused = match db.file(id) {
+        None => Some(Reply::error("Upload was cancelled or has expired", 409)),
+        Some(file) if file.uploader != who.id => Some(denied(
+            "Permission denied: this upload belongs to another account",
+            who,
+        )),
+        Some(file) if file.complete() => Some(Reply::error("Upload is already complete", 409)),
+        Some(file) if index >= file.chunk_count() => {
+            Some(Reply::error("Chunk index is out of range", 400))
         }
-        return Reply::error("Upload was cancelled or has expired", 409).keep();
+        Some(_) => match db.committed_hash(id, index) {
+            // Sent again: the chunk committed first stays.
+            Some(hash) if hash.is_none() || sha256.is_none() || hash == sha256 => {
+                Some(Reply::ok(json!({"committed":index})))
+            }
+            Some(_) => Some(Reply::error(
+                &format!("Chunk {index} was already committed with other content"),
+                409,
+            )),
+            None => None,
+        },
+    };
+    if let Some(reply) = refused {
+        db.discard(&key);
+        return reply.keep();
+    }
+    let now = auth::now();
+    db.add_chunk(id, index, &key, sha256.as_deref(), now);
+    db.set_expiry("upload", id, now + UPLOAD_TTL);
+    if !complete {
+        return Reply::ok(json!({"committed":index}));
+    }
+    finish_upload(db, who, id, true)
+}
+/// Complete upload `id` if asked and every chunk is committed.
+fn finish_upload(db: &mut Db, who: &Identity, id: &str, complete: bool) -> Reply {
+    let Some(file) = db.file(id) else {
+        return Reply::error("Upload was cancelled or has expired", 409);
     };
     if file.uploader != who.id {
         return denied(
@@ -882,16 +925,8 @@ fn commit_upload(
     if file.complete() {
         return Reply::error("Upload is already complete", 409);
     }
-    let now = auth::now();
-    if let Some(index) = index {
-        if index >= file.chunk_count() {
-            return Reply::error("Chunk index is out of range", 400);
-        }
-        db.add_chunk(id, index, &chunk_key(id, index), sha256.as_deref(), now);
-        db.set_expiry("upload", id, now + UPLOAD_TTL);
-    }
     if !complete {
-        return Reply::ok(json!({"committed":index}));
+        return Reply::ok(json!({"committed":null}));
     }
     if db.chunks(id).len() as u64 != file.chunk_count() {
         return Reply::error("Upload is missing chunks", 409);
@@ -1018,10 +1053,11 @@ async fn login(
         ));
     }
     run(state, move |db| {
-        // The password verified above must still be the account's.
+        // The password verified above must still be the account's, and the account unlocked:
+        // a session issued after a lock would come back when the account is unlocked.
         if db
             .user_by_id(user.id)
-            .is_none_or(|(_, u)| u.hash != user.hash)
+            .is_none_or(|(_, u)| u.hash != user.hash || u.locked)
         {
             return Reply::error("Account changed during sign-in; please try again", 409);
         }
@@ -1158,10 +1194,25 @@ async fn passwd(
     }
     let salt = auth::random_token();
     let hash = auth::hash(&value.password, &salt, env).await?;
+    let sudo = value.sudo;
     run(state, move |db| {
         let Some(mut account) = db.user(&name).filter(|u| u.id == target.id) else {
             return Reply::error("User does not exist", 404);
         };
+        // What was checked before hashing must still hold: the same signed-in account, acting as
+        // it did, and, without root, the current password verified still the account's, which
+        // is not locked meanwhile.
+        let now = auth::identity(db, key.as_deref());
+        let still = auth::elevated(db, key.as_deref(), sudo).is_ok_and(|a| a.id == actor.id);
+        if now.id != who.id
+            || !still
+            || actor.id != 0 && (account.hash != target.hash || account.locked)
+        {
+            return Reply::error(
+                "Account changed during the password change; please try again",
+                409,
+            );
+        }
         account.salt = salt;
         account.hash = hash;
         account.locked = false;

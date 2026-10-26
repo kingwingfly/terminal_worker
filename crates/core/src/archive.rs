@@ -36,13 +36,16 @@ pub enum Existing {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "job", rename_all = "lowercase")]
 pub enum Job {
-    /// Write `paths` into the new archive `archive`.
+    /// Write `paths` into the new archive `archive`; relative ones are found in `directory`, if
+    /// given (tar -C), and stored relative to it.
     Create {
         format: Format,
         archive: String,
         paths: Vec<String>,
         recursive: bool,
         verbose: bool,
+        #[serde(default)]
+        directory: Option<String>,
     },
     /// Write the members of `archive`, or those named in `members`, into `directory`.
     Extract {
@@ -107,6 +110,7 @@ pub fn zip_args(args: &[String]) -> Result<Job, String> {
         paths: operands,
         recursive,
         verbose,
+        directory: None,
     })
 }
 
@@ -253,24 +257,15 @@ pub fn tar_args(args: &[String]) -> Result<Job, String> {
                     "tar: refusing to create an empty archive; name what to put in it".into(),
                 );
             }
-            if let Some(dir) = directory {
-                operands = operands
-                    .into_iter()
-                    .map(|p| {
-                        if p.starts_with('/') {
-                            p
-                        } else {
-                            format!("{dir}/{p}")
-                        }
-                    })
-                    .collect();
-            }
+            // -C is where the paths are found, and what their names are relative to, as GNU
+            // tar works in it.
             Ok(Job::Create {
                 format: tar_format(&archive, gzip),
                 archive,
                 paths: operands,
                 recursive: true,
                 verbose,
+                directory,
             })
         }
         Some('x') => Ok(Job::Extract {
@@ -320,15 +315,16 @@ pub fn member_path(directory: &str, name: &str) -> Result<(String, bool), String
     Ok((path, stripped))
 }
 
-/// The name an archive stores for the input typed as `typed`: without a leading `/`, `./` or
-/// `../`, as zip and tar store them.
+/// The name an archive stores for the input typed as `typed`: without a leading `/` or `./`,
+/// and without anything up to its last `..`, as GNU tar removes it, so that no name the archive
+/// stores climbs out of where it is extracted.
 pub fn stored_name(typed: &str) -> String {
     let parts: Vec<&str> = typed
         .split('/')
         .filter(|p| !p.is_empty() && *p != ".")
-        .skip_while(|p| *p == "..")
         .collect();
-    parts.join("/")
+    let after = parts.iter().rposition(|p| *p == "..").map_or(0, |i| i + 1);
+    parts[after..].join("/")
 }
 
 #[cfg(test)]
@@ -348,6 +344,7 @@ mod tests {
                 paths: vec!["docs".into(), "a b.md".into()],
                 recursive: true,
                 verbose: false,
+                directory: None,
             }
         );
         assert!(zip_args(&args("only.zip")).is_err());
@@ -400,6 +397,7 @@ mod tests {
                     paths: vec!["docs".into()],
                     recursive: true,
                     verbose: false,
+                    directory: None,
                 },
                 "{line}"
             );
@@ -431,9 +429,10 @@ mod tests {
             Job::Create {
                 format: Format::Tar,
                 archive: "a.tar".into(),
-                paths: vec!["src/x".into(), "/abs".into()],
+                paths: vec!["x".into(), "/abs".into()],
                 recursive: true,
                 verbose: false,
+                directory: Some("src".into()),
             }
         );
         for bad in [
@@ -476,5 +475,7 @@ mod tests {
         assert_eq!(stored_name("/home/a/docs/"), "home/a/docs");
         assert_eq!(stored_name("../../x/./y"), "x/y");
         assert_eq!(stored_name("./notes.md"), "notes.md");
+        assert_eq!(stored_name("docs/../notes.md"), "notes.md");
+        assert_eq!(stored_name("a/../../b/c"), "b/c");
     }
 }

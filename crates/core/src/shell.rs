@@ -185,12 +185,29 @@ fn expand(template: &str, path: &str) -> String {
             _ => s.to_string(),
         }
     };
-    template
-        .replace("{//}", parent)
-        .replace("{/.}", &stem(name))
-        .replace("{/}", name)
-        .replace("{.}", &stem(path))
-        .replace("{}", path)
+    let tokens = [
+        ("{//}", parent.to_string()),
+        ("{/.}", stem(name)),
+        ("{/}", name.to_string()),
+        ("{.}", stem(path)),
+        ("{}", path.to_string()),
+    ];
+    // One pass over the template, so that braces in a path put in are never read as another
+    // placeholder.
+    let mut out = String::new();
+    let mut rest = template;
+    'next: while let Some(c) = rest.chars().next() {
+        for (token, value) in &tokens {
+            if let Some(after) = rest.strip_prefix(token) {
+                out.push_str(value);
+                rest = after;
+                continue 'next;
+            }
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
 }
 fn has_placeholder(arg: &str) -> bool {
     ["{}", "{/}", "{//}", "{.}", "{/.}"]
@@ -289,6 +306,11 @@ mod tests {
             ["mv", "docs/notes.md", "docs/notes.bak"]
         );
         assert_eq!(exec_one(&template, "a")[2], "./a.bak");
+        // Braces in a name are part of it, not placeholders.
+        assert_eq!(
+            exec_one(&template, "d/a{}b.md"),
+            ["mv", "d/a{}b.md", "d/a{}b.bak"]
+        );
         assert_eq!(
             exec_one(&["chmod".into(), "600".into()], ".hidden"),
             ["chmod", "600", ".hidden"]

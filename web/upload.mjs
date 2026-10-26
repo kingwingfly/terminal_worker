@@ -52,13 +52,15 @@ function send(id, index, blob, sha256, requests) {
   });
 }
 // Send a chunk, again after a moment if the network or the server failed; a refusal is final.
-async function sendWithRetries(id, index, blob, sha256, requests, signal) {
+// `halted` says whether the upload stopped meanwhile, as another chunk failed.
+async function sendWithRetries(id, index, blob, sha256, requests, signal, halted) {
   for (let attempt = 0; ; attempt++) {
     try { return await send(id, index, blob, sha256, requests); }
     catch (error) {
       if (signal.aborted || error instanceof Cancelled) throw new Cancelled();
       if (attempt + 1 >= RETRIES || (error.status >= 400 && error.status < 500 && error.status !== 400)) throw error;
       await new Promise(resolve => setTimeout(resolve, 1000 * 2 ** attempt));
+      if (halted()) throw new Cancelled();
     }
   }
 }
@@ -90,14 +92,19 @@ export async function uploadFile(file, destination, { progress = () => {}, signa
   remember(key, { id: upload.id, next: next() });
   const pending = []; for (let index = 0; index < count; index++) if (!committed.has(index)) pending.push(index);
   progress(percent(committed.size, count));
-  const requests = new Set(), abort = () => requests.forEach(xhr => xhr.abort());
+  // Once one chunk fails for good, the others stop too, rather than go on sending after the
+  // upload has been reported as failed.
+  let halted = false, failure;
+  const requests = new Set(), abort = () => { halted = true; requests.forEach(xhr => xhr.abort()); };
   signal.addEventListener('abort', abort, { once: true });
   try {
     await Promise.all(Array.from({ length: Math.min(PARALLEL, pending.length) }, async () => {
-      while (pending.length) {
+      while (pending.length && !halted) {
         if (signal.aborted) throw new Cancelled();
         const index = pending.shift();
-        await sendWithRetries(upload.id, index, file.slice(index * size, Math.min((index + 1) * size, file.size)), parts[index], requests, signal);
+        try {
+          await sendWithRetries(upload.id, index, file.slice(index * size, Math.min((index + 1) * size, file.size)), parts[index], requests, signal, () => halted);
+        } catch (error) { if (!(error instanceof Cancelled)) failure ??= error; abort(); throw error; }
         committed.add(index); remember(key, { id: upload.id, next: next() });
         progress(percent(committed.size, count));
       }
@@ -105,11 +112,12 @@ export async function uploadFile(file, destination, { progress = () => {}, signa
     if (signal.aborted) throw new Cancelled();
   } catch (error) {
     abort();
-    if (signal.aborted || error instanceof Cancelled) {
+    // Only Cancel cancels the upload; chunks stopped because another failed keep it to resume.
+    if (signal.aborted || (error instanceof Cancelled && !failure)) {
       await fetch('/api/uploads?id=' + encodeURIComponent(upload.id), { method: 'DELETE' }).catch(() => {});
       remember(key, null); throw new Cancelled();
     }
-    throw new Error(error.message + '; choose the same file again to resume');
+    throw new Error((failure || error).message + '; choose the same file again to resume');
   } finally { signal.removeEventListener('abort', abort); }
   const done = await json(await fetch('/api/uploads/complete?id=' + encodeURIComponent(upload.id), { method: 'POST' }));
   remember(key, null);

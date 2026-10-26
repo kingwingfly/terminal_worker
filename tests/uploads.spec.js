@@ -49,6 +49,9 @@ test('chunked uploads check every chunk, are readable while they arrive, resume,
     expect((await chunk(admin, id, 2, parts[1])).status()).toBe(400);
     expect((await chunk(admin, id, 3, parts[0])).status()).toBe(400);
     expect((await chunk(admin, id, 0, parts[0])).status()).toBe(200);
+    // A chunk is committed once: sending it again is harmless, other content is refused.
+    expect((await chunk(admin, id, 0, parts[0])).status()).toBe(200);
+    expect((await chunk(admin, id, 0, parts[1])).status()).toBe(409);
     // Another account cannot write to this upload, or see it.
     expect((await reader.get('/api/uploads?id=' + id)).status()).toBe(200);
     const status = await (await admin.get('/api/uploads?id=' + id)).json();
@@ -71,10 +74,15 @@ test('chunked uploads check every chunk, are readable while they arrive, resume,
     expect((await chunk(admin, id, 2, parts[2])).status()).toBe(200);
     expect((await admin.post('/api/uploads/complete?id=' + id)).status()).toBe(409);
     expect((await chunk(admin, id, 1, parts[1])).status()).toBe(200);
+    // A chunk sent while the upload completes never changes the completed file.
+    const late = chunk(admin, id, 1, parts[0]);
+    await new Promise(r => setTimeout(r, 50));
     expect((await admin.post('/api/uploads/complete?id=' + id)).status()).toBe(201);
+    expect((await late).status()).toBe(409);
     const downloaded = await whole;
     expect(downloaded.status()).toBe(200);
     expect(Buffer.compare(await downloaded.body(), bytes)).toBe(0);
+    expect(Buffer.compare(await (await reader.get(file(path), { headers: { 'Accept-Encoding': 'identity' } })).body(), bytes)).toBe(0);
     expect((await reader.head(file(path))).headers()['x-upload-state']).toBeUndefined();
     expect((await admin.get('/api/uploads?id=' + id)).status()).toBe(404);
     // Cancelling removes a new file at once.

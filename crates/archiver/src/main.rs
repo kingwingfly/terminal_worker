@@ -99,13 +99,22 @@ impl Archiver {
             }
             (Method::Post, "/list") => {
                 let unpack = param("unpack").is_some_and(|v| v == "1");
+                // Unpacked aside, and named `unpacked` only once whole, as status says it is.
                 let target = self.path("unpacked");
+                let staging = self.path("unpacking");
                 let _ = fs::remove_dir_all(&target);
-                match list(&self.path("archive"), unpack.then_some(target.as_path())) {
+                let _ = fs::remove_dir_all(&staging);
+                match list(&self.path("archive"), unpack.then_some(staging.as_path())) {
                     Ok((format, members)) => {
+                        if unpack && let Err(e) = fs::rename(&staging, &target) {
+                            return error(500, e);
+                        }
                         json_reply(200, json!({"format": format, "members": members}))
                     }
-                    Err(e) => error(422, e),
+                    Err(e) => {
+                        let _ = fs::remove_dir_all(&staging);
+                        error(422, e)
+                    }
                 }
             }
             (Method::Get, "/entry") => match number("index") {
@@ -173,13 +182,27 @@ impl Archiver {
     }
 }
 
-/// Write the request's body to `path`.
+/// Write the request's body to `path`, which appears only once all of it has arrived: a body
+/// cut short reads as ended, and status would take what it left for the whole file.
 fn receive(request: &mut Request, path: &Path) -> Reply {
-    let written = File::create(path).and_then(|mut file| io::copy(request.as_reader(), &mut file));
-    match written {
-        Ok(size) => json_reply(200, json!({"size": size})),
+    let expected = request.body_length().map(|n| n as u64);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let partial = path.with_file_name(format!(".{name}.partial"));
+    let written =
+        File::create(&partial).and_then(|mut file| io::copy(request.as_reader(), &mut file));
+    let reply = match written {
+        Ok(size) if expected.is_some_and(|expected| expected != size) => error(
+            400,
+            format!("received {size} of {} bytes", expected.unwrap_or_default()),
+        ),
+        Ok(size) => match fs::rename(&partial, path) {
+            Ok(()) => return json_reply(200, json!({"size": size})),
+            Err(e) => error(500, e),
+        },
         Err(e) => error(500, e),
-    }
+    };
+    let _ = fs::remove_file(&partial);
+    reply
 }
 /// `length` bytes of the file at `path` from `offset`, or the rest of it.
 fn send(path: &Path, offset: u64, length: Option<u64>) -> Reply {

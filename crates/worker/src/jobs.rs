@@ -95,6 +95,8 @@ fn source(db: &Db, who: &Identity, cmd: &str, path: &str) -> Result<Source, Stri
 }
 
 /// The members of an archive made of `paths`, as they are now; warnings for what is left out.
+/// Relative paths are found in `directory` if given, as tar -C works in it, and stored as typed.
+#[allow(clippy::too_many_arguments)]
 fn inputs(
     db: &Db,
     who: &Identity,
@@ -103,7 +105,28 @@ fn inputs(
     paths: &[String],
     recursive: bool,
     output: &str,
+    directory: Option<&str>,
 ) -> Result<(Vec<Input>, Vec<String>), String> {
+    let within;
+    let command = match directory {
+        Some(typed) => {
+            let dir = command_path(db, who, command, typed).map_err(|e| format!("{cmd}: {e}"))?;
+            let node = db
+                .access(who, &dir, EXEC)
+                .map_err(|e| format!("{cmd}: {typed}: {e}"))?;
+            if !node.directory {
+                return Err(format!("{cmd}: {typed}: Cannot open: Not a directory"));
+            }
+            within = commands::Command {
+                args: Vec::new(),
+                cwd: dir,
+                sudo: command.sudo,
+                home: command.home.clone(),
+            };
+            &within
+        }
+        None => command,
+    };
     let mut members = Vec::new();
     let mut warnings = Vec::new();
     let mut names = BTreeSet::new();
@@ -242,9 +265,13 @@ pub fn start(
             archive: name,
             paths,
             recursive,
+            directory,
             ..
         } => {
             let output = path(db, name)?;
+            // Only where `who` may look is it told what is there.
+            db.traverse(who, &output)
+                .map_err(|e| format!("{cmd}: {e}"))?;
             match db.node(&output) {
                 Some(node) if node.directory => {
                     return Err(format!("{cmd}: {output} is a directory"));
@@ -263,7 +290,16 @@ pub fn start(
                     .writable_parent(who, &output)
                     .map_err(|e| format!("{cmd}: {e}"))?,
             }
-            let (members, notes) = inputs(db, who, command, cmd, paths, *recursive, &output)?;
+            let (members, notes) = inputs(
+                db,
+                who,
+                command,
+                cmd,
+                paths,
+                *recursive,
+                &output,
+                directory.as_deref(),
+            )?;
             spec.inputs = members;
             spec.output = Some(output);
             warnings = notes;
@@ -276,6 +312,13 @@ pub fn start(
         } => {
             spec.source = Some(source(db, who, cmd, &path(db, name)?)?);
             let dest = path(db, directory.as_deref().unwrap_or("."))?;
+            // Only where `who` may look is it told what is there; unzip -d creates what is
+            // missing on the way.
+            if let Err(e) = db.traverse(who, &dest)
+                && commands::is_permission_error(&e)
+            {
+                return Err(format!("{cmd}: {e}"));
+            }
             match db.node(&dest) {
                 Some(node) if node.directory => {
                     db.access(who, &dest, WRITE | EXEC)

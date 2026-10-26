@@ -15,8 +15,16 @@ pub struct Filter {
 #[derive(Debug)]
 pub enum Kind {
     Cat,
-    Head(usize),
-    Tail(usize),
+    /// The first `lines` lines, or with `-n -N` all but the last `lines`.
+    Head {
+        lines: usize,
+        all_but: bool,
+    },
+    /// The last `lines` lines, or with `-n +N` those from line `lines` on.
+    Tail {
+        lines: usize,
+        from_start: bool,
+    },
     Grep {
         pattern: Regex,
         invert: bool,
@@ -103,15 +111,25 @@ pub fn parse(command: &str, args: &[String]) -> Result<Filter, String> {
         }
         "head" | "tail" => {
             let (found, files) = options(command, args, "", "n")?;
-            let lines = match found.last() {
-                Some((_, Some(value))) => count(command, value)?,
-                _ => 10,
+            // A sign counts from the other end: head -n -N, tail -n +N.
+            let (lines, sign) = match found.last() {
+                Some((_, Some(value))) => match value.strip_prefix(['+', '-']) {
+                    Some(digits) => (count(command, digits)?, value.chars().next()),
+                    None => (count(command, value)?, None),
+                },
+                _ => (10, None),
             };
             (
                 if command == "head" {
-                    Kind::Head(lines)
+                    Kind::Head {
+                        lines,
+                        all_but: sign == Some('-'),
+                    }
                 } else {
-                    Kind::Tail(lines)
+                    Kind::Tail {
+                        lines,
+                        from_start: sign == Some('+'),
+                    }
                 },
                 files,
             )
@@ -208,7 +226,7 @@ pub fn apply(filter: &Filter, inputs: &[(String, String)]) -> (String, i32) {
     let several = inputs.len() > 1;
     match &filter.kind {
         Kind::Cat => (inputs.iter().map(|(_, t)| t.as_str()).collect(), 0),
-        Kind::Head(n) | Kind::Tail(n) => {
+        Kind::Head { .. } | Kind::Tail { .. } => {
             let mut out = String::new();
             for (i, (name, text)) in inputs.iter().enumerate() {
                 if several {
@@ -218,10 +236,18 @@ pub fn apply(filter: &Filter, inputs: &[(String, String)]) -> (String, i32) {
                     out.push_str(&format!("==> {name} <==\n"));
                 }
                 let lines: Vec<&str> = text.lines().collect();
-                let chosen = if matches!(filter.kind, Kind::Head(_)) {
-                    &lines[..lines.len().min(*n)]
-                } else {
-                    &lines[lines.len().saturating_sub(*n)..]
+                let chosen = match filter.kind {
+                    Kind::Head { lines: n, all_but } if all_but => {
+                        &lines[..lines.len().saturating_sub(n)]
+                    }
+                    Kind::Head { lines: n, .. } => &lines[..lines.len().min(n)],
+                    // tail -n +0 is tail -n +1, the whole input.
+                    Kind::Tail {
+                        lines: n,
+                        from_start,
+                    } if from_start => &lines[n.saturating_sub(1).min(lines.len())..],
+                    Kind::Tail { lines: n, .. } => &lines[lines.len().saturating_sub(n)..],
+                    _ => unreachable!(),
                 };
                 out.push_str(&joined(chosen.iter().copied()));
             }
@@ -380,6 +406,24 @@ mod tests {
         );
         assert_eq!(run("head", &["-2"], &[("-", LINES)]).0, "beta\nalpha\n");
         assert_eq!(run("tail", &["-n1"], &[("-", LINES)]).0, "spéctrum 9\n");
+        // tail -n +N starts at line N; head -n -N leaves out the last N.
+        assert_eq!(
+            run("tail", &["-n", "+5"], &[("-", LINES)]).0,
+            "spéctrum 10\nspéctrum 9\n"
+        );
+        assert_eq!(run("tail", &["-n+0"], &[("-", LINES)]).0, LINES);
+        assert_eq!(run("tail", &["-n", "+9"], &[("-", LINES)]).0, "");
+        assert_eq!(
+            run("tail", &["-n", "-1"], &[("-", LINES)]).0,
+            "spéctrum 9\n"
+        );
+        assert_eq!(
+            run("head", &["-n", "-4"], &[("-", LINES)]).0,
+            "beta\nalpha\n"
+        );
+        assert_eq!(run("head", &["-n", "-9"], &[("-", LINES)]).0, "");
+        assert_eq!(run("head", &["-n", "+1"], &[("-", LINES)]).0, "beta\n");
+        assert!(parse("tail", &["-n".into(), "+x".into()]).is_err());
         assert_eq!(
             run("head", &["-n", "1"], &[("a", "1\n2\n"), ("b", "3")]).0,
             "==> a <==\n1\n\n==> b <==\n3\n"

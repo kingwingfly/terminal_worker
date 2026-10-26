@@ -315,10 +315,11 @@ pub async fn write(req: Request, env: &Env) -> Result<Response> {
         .as_str()
         .unwrap_or_default()
         .to_string();
+    let key = chunk_key(&id, 0);
     let index = if length == 0 {
         None
     } else {
-        if let Err(error) = store(env, &req, &chunk_key(&id, 0), length, mime(&path), None).await {
+        if let Err(error) = store(env, &req, &key, length, mime(&path), None).await {
             console_error!("upload failed: {}", error);
             authority(
                 env,
@@ -337,14 +338,14 @@ pub async fn write(req: Request, env: &Env) -> Result<Response> {
         &req,
         Method::Post,
         "/internal/upload/commit",
-        Some(json!({"id":id,"index":index,"complete":true})),
+        Some(json!({"id":id,"index":index,"key":key,"complete":true})),
     )
     .await
 }
 
 /// PUT chunk `index` of upload `id`, with its SHA-256 in `X-Chunk-SHA256`, which R2 checks.
-/// Sending a chunk again replaces it, so an interrupted upload resumes by sending what is
-/// missing.
+/// Sending a chunk again is harmless: the copy committed first stays, so an interrupted upload
+/// resumes by sending what is missing.
 pub async fn chunk(req: Request, env: &Env) -> Result<Response> {
     let id = param(&req, "id")?;
     let index = param(&req, "index")?;
@@ -390,7 +391,8 @@ pub async fn chunk(req: Request, env: &Env) -> Result<Response> {
         Method::Post,
         "/internal/upload/commit",
         Some(json!({
-            "id": id, "index": index.parse::<u64>().ok(), "sha256": sha256, "complete": false,
+            "id": id, "index": index.parse::<u64>().ok(), "key": key, "sha256": sha256,
+            "complete": false,
         })),
     )
     .await

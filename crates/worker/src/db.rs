@@ -348,7 +348,7 @@ impl Db {
     }
     pub fn add_chunk(&mut self, file: &str, index: u64, key: &str, sha256: Option<&str>, now: u64) {
         self.run(
-            "INSERT INTO chunks(file, idx, key, sha256) VALUES(?, ?, ?, ?) ON CONFLICT(file, idx) DO UPDATE SET key = excluded.key, sha256 = excluded.sha256",
+            "INSERT INTO chunks(file, idx, key, sha256) VALUES(?, ?, ?, ?)",
             vec![text(file), int(index), text(key), sha256.into()],
         );
         self.run(
@@ -363,18 +363,17 @@ impl Db {
         );
         self.clear_expiry("upload", file);
     }
-    /// Delete `file` and send its chunks to the garbage, whatever refers to it.
+    /// Delete `file` and send its chunks to the garbage, whatever refers to it: every object
+    /// under its prefix, also those written but never committed.
     pub fn drop_file(&mut self, file: &str) {
-        self.run(
-            "INSERT OR IGNORE INTO garbage(key) SELECT key FROM chunks WHERE file = ?",
-            vec![text(file)],
-        );
+        self.discard(&format!("chunks/{file}/"));
         self.run("DELETE FROM chunks WHERE file = ?", vec![text(file)]);
         self.run("DELETE FROM files WHERE id = ?", vec![text(file)]);
         self.clear_expiry("upload", file);
         ALARM.set(true);
     }
-    /// An R2 object written for nothing, such as a chunk of a cancelled upload.
+    /// An R2 object written for nothing, such as a chunk of a cancelled upload, or, ending in
+    /// `/`, every object under that prefix.
     pub fn discard(&mut self, key: &str) {
         self.run(
             "INSERT OR IGNORE INTO garbage(key) VALUES(?)",
@@ -502,12 +501,32 @@ impl Db {
             self.release(Some(file));
         }
     }
+    /// The unfinished uploads that nodes in directory `dir` show.
+    pub fn uploading_in(&self, dir: &str) -> Vec<File> {
+        self.rows(
+            "SELECT DISTINCT f.id, f.size, f.chunk_size, f.state, f.sha256, f.uploader, f.target, f.base FROM files f JOIN nodes n ON n.file = f.id WHERE n.parent = ? AND f.state = 'uploading'",
+            vec![text(dir)],
+        )
+    }
     /// The uploads `uploader` has not finished.
     pub fn uploads_of(&self, uploader: u32) -> Vec<File> {
         self.rows(
             "SELECT id, size, chunk_size, state, sha256, uploader, target, base FROM files WHERE uploader = ? AND state = 'uploading' ORDER BY touched DESC LIMIT 50",
             vec![int(uploader)],
         )
+    }
+    /// The SHA-256 chunk `index` of `file` was committed with, or `None` if it is not committed.
+    pub fn committed_hash(&self, file: &str, index: u64) -> Option<Option<String>> {
+        #[derive(Deserialize)]
+        struct Hash {
+            sha256: Option<String>,
+        }
+        self.rows::<Hash>(
+            "SELECT sha256 FROM chunks WHERE file = ? AND idx = ?",
+            vec![text(file), int(index)],
+        )
+        .pop()
+        .map(|h| h.sha256)
     }
     /// The committed chunks of `file`, as (index, SHA-256).
     pub fn chunk_hashes(&self, file: &str) -> Vec<(u64, Option<String>)> {

@@ -50,11 +50,24 @@ impl DurableObject for TerminalAuthority {
         })?;
         let bucket = self.env.bucket("FILES")?;
         loop {
-            let keys = transact(&self.state, |db| (db.garbage(1000), false))?;
+            let mut keys = transact(&self.state, |db| (db.garbage(1000), false))?;
             if keys.is_empty() {
                 break;
             }
-            bucket.delete_multiple(keys.clone()).await?;
+            // A prefix is forgotten once nothing is listed under it.
+            let (prefixes, objects): (Vec<String>, Vec<String>) =
+                keys.iter().cloned().partition(|key| key.ends_with('/'));
+            let mut doomed = objects;
+            for prefix in prefixes {
+                let listed = bucket.list().prefix(&prefix).limit(1000).execute().await?;
+                if listed.truncated() {
+                    keys.retain(|key| *key != prefix);
+                }
+                doomed.extend(listed.objects().iter().map(|o| o.key()));
+            }
+            if !doomed.is_empty() {
+                bucket.delete_multiple(doomed).await?;
+            }
             transact(&self.state, move |db| {
                 db.forget_garbage(&keys);
                 ((), true)

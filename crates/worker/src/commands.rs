@@ -10,6 +10,10 @@ pub struct Command {
     pub cwd: String,
     #[serde(default)]
     pub sudo: bool,
+    /// The home `~` stands for: the signed-in account's, under sudo too, as a shell expands `~`
+    /// before sudo runs; if not set, the acting account's.
+    #[serde(skip)]
+    pub home: Option<String>,
 }
 fn root_path() -> String {
     "/".into()
@@ -136,6 +140,37 @@ pub fn entry(c: &Db, path: &str, n: &Node) -> Entry {
         .and_then(|id| c.file(id))
         .filter(|f| !f.complete())
         .map(|f| c.readable(&f));
+    described(path, n, uploaded, c.username(n.owner), c.groupname(n.group))
+}
+/// The entries of `children`, the nodes in directory `dir`, directories first, then by name.
+/// Each owner, group and unfinished upload is looked up once, not once per entry.
+pub fn entries(c: &Db, dir: &str, children: &[(String, Node)]) -> Vec<Entry> {
+    let uploading: BTreeMap<String, u64> = c
+        .uploading_in(dir)
+        .into_iter()
+        .map(|f| (f.id.clone(), c.readable(&f)))
+        .collect();
+    let mut owners = BTreeMap::new();
+    let mut groups = BTreeMap::new();
+    let mut entries: Vec<Entry> = children
+        .iter()
+        .map(|(path, n)| {
+            let owner = owners.entry(n.owner).or_insert_with(|| c.username(n.owner));
+            let group = groups
+                .entry(n.group)
+                .or_insert_with(|| c.groupname(n.group));
+            let uploaded = n.file.as_ref().and_then(|id| uploading.get(id).copied());
+            described(path, n, uploaded, owner.clone(), group.clone())
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.directory
+            .cmp(&a.directory)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    entries
+}
+fn described(path: &str, n: &Node, uploaded: Option<u64>, owner: String, group: String) -> Entry {
     Entry {
         uploaded,
         name: path.rsplit('/').next().unwrap_or("").into(),
@@ -143,8 +178,8 @@ pub fn entry(c: &Db, path: &str, n: &Node) -> Entry {
         directory: n.directory,
         size: n.size,
         kind: if n.directory { "directory" } else { kind(path) }.into(),
-        owner: c.username(n.owner),
-        group: c.groupname(n.group),
+        owner,
+        group,
         mode: n.mode,
     }
 }
@@ -156,9 +191,10 @@ pub fn command_path(
     value: &str,
 ) -> Result<String, String> {
     let cwd = resolve("/", &command.cwd)?;
-    let home = c
-        .user_by_id(who.id)
-        .map(|(_, user)| user.home)
+    let home = command
+        .home
+        .clone()
+        .or_else(|| c.user_by_id(who.id).map(|(_, user)| user.home))
         .unwrap_or_else(|| "/".into());
     let value = if value == "~" {
         home
@@ -211,8 +247,15 @@ fn remove_one(
             "Cannot remove the current directory or its ancestors; cd elsewhere first".into(),
         );
     }
-    if removal.force && c.node(path).is_none() {
-        return Ok(false);
+    // A missing path is no error with -f, but only where `who` may look: below a directory it
+    // cannot search, rm -f fails whether the path exists or not.
+    if removal.force {
+        match c.traverse(who, path) {
+            Ok(()) if c.node(path).is_none() => return Ok(false),
+            // A directory on the way is missing, below ones `who` may search.
+            Err(e) if !is_permission_error(&e) => return Ok(false),
+            _ => {}
+        }
     }
     c.remove(who, path, removal.recursive)?;
     Ok(true)
@@ -251,7 +294,16 @@ fn copy_one(
     recursive: bool,
     replace: bool,
 ) -> Result<(), String> {
-    for (path, node) in c.subtree(src) {
+    // Only what `who` may read and list: the copy refuses the rest, without telling it apart.
+    let Ok(node) = c.access(who, src, READ) else {
+        return c.copy(who, src, dst, recursive, replace).map(|_| ());
+    };
+    let below = if node.directory && recursive {
+        c.walk(who, src, None).map(|(n, _)| n).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    for (path, node) in std::iter::once((src.to_string(), node)).chain(below) {
         if let Some(file) = node.file.as_deref().and_then(|id| c.file(id))
             && !file.complete()
         {
@@ -346,13 +398,7 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
             }
             let long = o.flags.iter().any(|s| s.contains('l'));
             let children = c.children(&path);
-            let mut entries: Vec<_> = children.iter().map(|(p, n)| entry(c, p, n)).collect();
-            entries.sort_by(|a, b| {
-                b.directory
-                    .cmp(&a.directory)
-                    .then_with(|| a.name.cmp(&b.name))
-            });
-            listing = Some((entries, long));
+            listing = Some((entries(c, &path, &children), long));
             children
                 .iter()
                 .map(|(p, n)| {

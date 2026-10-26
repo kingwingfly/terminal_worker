@@ -158,17 +158,23 @@ pub trait Store {
     fn can_sudo(&self, who: &Identity) -> bool {
         who.id == 0 || self.group("wheel").is_some_and(|g| who.groups.contains(&g))
     }
+    /// Whether `who` may search every directory above `path`, from the root down: what lies
+    /// below a directory it may not search is never looked at, not even whether it exists.
     fn traverse(&self, who: &Identity, path: &str) -> Result<(), String> {
-        let mut at = parent(path);
+        let mut at = String::from("/");
+        let mut parts = parent(path).split('/').filter(|part| !part.is_empty());
         loop {
-            let node = self.node(at).ok_or("Parent directory does not exist")?;
+            let node = self.node(&at).ok_or("Parent directory does not exist")?;
             if !node.directory || !who.allows(&node, EXEC) {
                 return Err(format!("Permission denied: cannot traverse {at}"));
             }
-            if at == "/" {
+            let Some(part) = parts.next() else {
                 break;
+            };
+            if at != "/" {
+                at.push('/');
             }
-            at = parent(at);
+            at.push_str(part);
         }
         Ok(())
     }
@@ -188,9 +194,10 @@ pub trait Store {
         Ok(())
     }
     fn mkdir(&mut self, who: &Identity, path: &str, parents: bool) -> Result<(), String> {
+        let exists = || format!("cannot create directory '{path}': it already exists");
         if path == "/" {
             self.access(who, "/", EXEC)?;
-            return Ok(());
+            return if parents { Ok(()) } else { Err(exists()) };
         }
         let mut at = String::new();
         // Validate every component before mutating, including mkdir -p through existing directories.
@@ -212,6 +219,10 @@ pub trait Store {
                 }
                 pending.push(at.clone());
             }
+        }
+        // As mkdir does without -p, a directory that exists already is an error.
+        if pending.is_empty() && !parents {
+            return Err(exists());
         }
         for path in pending {
             self.set_node(&path, &Node::directory(who.id, who.group, 0o755));
@@ -804,6 +815,25 @@ mod tests {
             c.access(&Identity::root(), "/private/readme.txt", READ)
                 .is_ok()
         );
+        // Whether something exists below a directory one cannot search does not show.
+        c.set_node("/private/inner", &Node::directory(0, 0, 0o755));
+        for path in ["/private/inner/x", "/private/missing/x"] {
+            assert_eq!(
+                c.access(&Identity::guest(), path, READ).unwrap_err(),
+                "Permission denied: cannot traverse /private",
+                "{path}"
+            );
+        }
+    }
+    #[test]
+    fn mkdir_without_parents_refuses_what_exists() {
+        let mut c = store();
+        c.mkdir(&Identity::root(), "/a", false).unwrap();
+        assert!(c.mkdir(&Identity::root(), "/a", false).is_err());
+        assert!(c.mkdir(&Identity::root(), "/", false).is_err());
+        assert!(c.mkdir(&Identity::root(), "/a", true).is_ok());
+        assert!(c.mkdir(&Identity::root(), "/a/b/c", false).is_err());
+        assert!(c.mkdir(&Identity::root(), "/a/b/c", true).is_ok());
     }
     #[test]
     fn deletion_checks_parent_and_every_descendant_before_mutation() {

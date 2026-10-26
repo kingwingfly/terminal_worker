@@ -29,10 +29,16 @@ async function session(path = directory) { return (await api('/api/session?path=
 async function post(endpoint, data) {
   return (await api('/api/' + endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) })).json();
 }
-let authenticating;
-function credentials({ title, description, username, chooseUser = false, newPassword = false, currentPassword = false, submit }) {
-  if (authenticating) return authenticating;
-  authenticating = new Promise(resolve => {
+// One dialog at a time: a request made while another is open, as from another tab, waits for it
+// to close and then asks its own question, rather than receiving the other's answer.
+let dialogs = Promise.resolve();
+function credentials(options) {
+  const answer = dialogs.then(() => askCredentials(options));
+  dialogs = answer.catch(() => {});
+  return answer;
+}
+function askCredentials({ title, description, username, chooseUser = false, newPassword = false, currentPassword = false, submit }) {
+  return new Promise(resolve => {
     const dialog = $('auth'), form = $('auth-form'), password = $('password'), user = $('username');
     $('auth-title').textContent = title; $('auth-description').textContent = description; $('auth-error').textContent = '';
     $('username-field').hidden = !chooseUser; user.value = username || 'root'; user.required = chooseUser;
@@ -47,7 +53,7 @@ function credentials({ title, description, username, chooseUser = false, newPass
       if (completed) return; completed = true;
       for (const id of ['password', 'current-password', 'confirm-password']) $(id).value = '';
       dialog.close(); form.onsubmit = null; dialog.oncancel = null; $('cancel-auth').onclick = null;
-      authenticating = null; resolve(result);
+      resolve(result);
     };
     form.onsubmit = async event => {
       event.preventDefault(); button.disabled = true;
@@ -62,7 +68,6 @@ function credentials({ title, description, username, chooseUser = false, newPass
     $('cancel-auth').onclick = () => { if (!button.disabled) finish(null); };
     dialog.showModal(); (currentPassword ? $('current-password') : password).focus();
   });
-  return authenticating;
 }
 async function identityChanged() {
   // A private preview must not survive switching to a less privileged account.
@@ -84,6 +89,8 @@ async function unlock(path = directory) {
 }
 
 async function sudoAuthenticate() {
+  // A sudo another tab is asking for may make this one unnecessary.
+  await dialogs;
   const current = await session();
   if (!current.authenticated) throw new Error('guest cannot use sudo; sign in to a wheel account with su USER first');
   if (!current.can_sudo) throw new Error('Current account is not in the wheel group');

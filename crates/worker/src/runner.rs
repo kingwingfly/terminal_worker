@@ -463,6 +463,21 @@ impl ArchiveRunner {
     fn rows(&self, query: &str, args: Vec<SqlStorageValue>) -> Result<Vec<Row>> {
         self.sql().exec(query, args)?.to_array()
     }
+    /// How many members of the plan match `condition`.
+    fn count(&self, condition: &str) -> Result<usize> {
+        #[derive(Deserialize)]
+        struct Count {
+            n: usize,
+        }
+        let counted: Count = self
+            .sql()
+            .exec(
+                &format!("SELECT COUNT(*) AS n FROM plan WHERE {condition}"),
+                None,
+            )?
+            .one()?;
+        Ok(counted.n)
+    }
 
     async fn extract(&self, job: &Job, spec: &Spec, deadline: f64) -> Result<Step> {
         let Command::Extract {
@@ -502,29 +517,41 @@ impl ArchiveRunner {
                     .await;
             }
         }
-        if spec.decisions.is_none()
-            && !self.rows("SELECT idx, name, size, mode, kind, target, action FROM plan WHERE action = 'ask' LIMIT 1", vec![])?.is_empty()
-        {
-            return Ok(Step::Wait);
+        if spec.decisions.is_none() {
+            let asking: Vec<String> = self
+                .rows("SELECT idx, name, size, mode, kind, target, action FROM plan WHERE action = 'ask' ORDER BY idx", vec![])?
+                .into_iter()
+                .map(|row| row.target)
+                .collect();
+            if !asking.is_empty() {
+                // A job waiting for its answer does not come here: the step that planned failed
+                // before its question reached the job, so ask it now.
+                self.ask(
+                    Method::Post,
+                    &format!("/internal/job/update?id={id}"),
+                    Some(json!({"question": {"replace": asking}, "state": "question"})),
+                )
+                .await?;
+                return Ok(Step::Wait);
+            }
         }
         let decisions = spec.decisions.clone().unwrap_or_default();
-        let total = self
-            .rows(
-                "SELECT idx, name, size, mode, kind, target, action FROM plan",
-                vec![],
-            )?
-            .len();
+        let total = self.count("1")?;
+        let mut done = self.count("done = 1")?;
         // A member that a restart interrupted starts again.
         self.abort_upload(id).await?;
         let mut lines = Lines::default();
         let mut errors = 0;
+        // Members go in order, so the next one is past the last, found through the key.
+        let mut after = -1;
         loop {
             let Some(row) = self
-                .rows("SELECT idx, name, size, mode, kind, target, action FROM plan WHERE done = 0 ORDER BY idx LIMIT 1", vec![])?
+                .rows("SELECT idx, name, size, mode, kind, target, action FROM plan WHERE done = 0 AND idx > ? ORDER BY idx LIMIT 1", vec![SqlStorageValue::Integer(after)])?
                 .pop()
             else {
                 break;
             };
+            after = row.idx as i64;
             let replace = match row.action.as_str() {
                 "replace" => true,
                 "ask" => decisions.get(&row.target).copied().unwrap_or(false),
@@ -589,7 +616,7 @@ impl ArchiveRunner {
                 "UPDATE plan SET done = 1 WHERE idx = ?",
                 vec![SqlStorageValue::Integer(row.idx as i64)],
             )?;
-            let done: usize = total - self.rows("SELECT idx, name, size, mode, kind, target, action FROM plan WHERE done = 0", vec![])?.len();
+            done += 1;
             let state = self
                 .update(
                     id,
@@ -841,13 +868,14 @@ impl ArchiveRunner {
         for index in 0..count {
             let offset = index * CHUNK_SIZE;
             let length = CHUNK_SIZE.min(row.size - offset);
+            let key = chunk_key(&upload, index);
             self.store(
                 fetcher,
                 &format!(
                     "/entry?job={id}&index={}&offset={offset}&length={length}",
                     row.idx
                 ),
-                &chunk_key(&upload, index),
+                &key,
                 length,
                 None,
             )
@@ -855,7 +883,7 @@ impl ArchiveRunner {
             self.ask(
                 Method::Post,
                 &format!("/internal/job/commit?id={id}"),
-                Some(json!({"upload": upload, "index": index})),
+                Some(json!({"upload": upload, "index": index, "key": key})),
             )
             .await?;
         }
@@ -916,25 +944,43 @@ impl ArchiveRunner {
                 })
             })
             .collect();
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post);
-        init.with_body(Some(
-            json!({"format": format, "mtime": spec.mtime, "chunk_size": CHUNK_SIZE, "inputs": inputs})
-                .to_string()
-                .into(),
-        ));
-        let mut response = fetcher
-            .fetch(format!("http://archiver/build?job={id}"), Some(init))
-            .await?;
-        let built: Value = response.json().await?;
-        if response.status_code() != 200 {
-            return Err(Error::RustError(
-                built["error"]
-                    .as_str()
-                    .unwrap_or("the archive could not be built")
-                    .into(),
-            ));
-        }
+        // Built once: a later step stores what the container built for it, unless the container
+        // lost it, rather than building it all again, and storing a chunk, each step.
+        let cached = storage
+            .get::<String>("built")
+            .await?
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .filter(|built| {
+                status["output"]
+                    .as_u64()
+                    .is_some_and(|size| built["size"].as_u64() == Some(size))
+            });
+        let built = match cached {
+            Some(built) => built,
+            None => {
+                let mut init = RequestInit::new();
+                init.with_method(Method::Post);
+                init.with_body(Some(
+                    json!({"format": format, "mtime": spec.mtime, "chunk_size": CHUNK_SIZE, "inputs": inputs})
+                        .to_string()
+                        .into(),
+                ));
+                let mut response = fetcher
+                    .fetch(format!("http://archiver/build?job={id}"), Some(init))
+                    .await?;
+                let built: Value = response.json().await?;
+                if response.status_code() != 200 {
+                    return Err(Error::RustError(
+                        built["error"]
+                            .as_str()
+                            .unwrap_or("the archive could not be built")
+                            .into(),
+                    ));
+                }
+                storage.put("built", built.to_string()).await?;
+                built
+            }
+        };
         let size = built["size"].as_u64().unwrap_or(0);
         let hashes: Vec<String> =
             serde_json::from_value(built["chunks"].clone()).unwrap_or_default();
@@ -1012,10 +1058,11 @@ impl ArchiveRunner {
             let offset = index * CHUNK_SIZE;
             let length = CHUNK_SIZE.min(size - offset);
             let sha = hashes.get(index as usize).cloned();
+            let key = chunk_key(&upload, index);
             self.store(
                 &fetcher,
                 &format!("/output?job={id}&offset={offset}&length={length}"),
-                &chunk_key(&upload, index),
+                &key,
                 length,
                 sha.as_deref(),
             )
@@ -1023,7 +1070,7 @@ impl ArchiveRunner {
             self.ask(
                 Method::Post,
                 &format!("/internal/job/commit?id={id}"),
-                Some(json!({"upload": upload, "index": index, "sha256": sha})),
+                Some(json!({"upload": upload, "index": index, "key": key, "sha256": sha})),
             )
             .await?;
             let state = self
