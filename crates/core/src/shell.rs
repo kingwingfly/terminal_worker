@@ -40,7 +40,7 @@ pub fn words(input: &str) -> Result<Vec<Vec<Word>>, String> {
     };
     let literal = |c: char, word: &mut String, pattern: &mut String| {
         word.push(c);
-        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\' | '-' | '!' | '^') {
             pattern.push('\\');
         }
         pattern.push(c);
@@ -335,6 +335,26 @@ mod tests {
             texts,
             ["rm", "-rf", "*", "a*", "b?", "c*", "d[1]*", "plain"]
         );
+    }
+
+    #[test]
+    fn quoted_bracket_characters_stay_literal_during_expansion() {
+        for (input, matching, excluded) in [
+            (r#"echo [a"-"c]"#, vec!["a", "-", "c"], vec!["b"]),
+            (r#"echo ["!"a]"#, vec!["!", "a"], vec!["b"]),
+            (r#"echo ["^"a]"#, vec!["^", "a"], vec!["b"]),
+            (r#"echo [a-"c"]"#, vec!["a", "b", "c"], vec!["d"]),
+            (r#"echo [\[-\]]"#, vec!["[", "]"], vec!["^", "a"]),
+        ] {
+            let stages = words(input).unwrap();
+            let pattern = stages[0][1].pattern.as_deref().unwrap();
+            for name in matching {
+                assert!(crate::glob::matches(pattern, name), "{input}: {name}");
+            }
+            for name in excluded {
+                assert!(!crate::glob::matches(pattern, name), "{input}: {name}");
+            }
+        }
     }
 
     #[test]

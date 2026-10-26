@@ -30,8 +30,8 @@ const PIPED_MAX: usize = 10_000_000;
 const XARGS_MAX: usize = 1000;
 /// How many commands one batch request runs, at most.
 const BATCH: usize = 100;
-/// How many directories one wildcard pattern lists, and how many paths it expands to, at most.
-const GLOB_LISTINGS: usize = 1000;
+/// How many filesystem lookups one wildcard pattern makes, and paths it expands to, at most.
+const GLOB_LOOKUPS: usize = 1000;
 const GLOB_PATHS: usize = 10_000;
 
 /// Commands the server runs, through web/app.js's accountCommand; ls and mkdir too, with
@@ -1077,7 +1077,7 @@ impl Shell {
             t => format!("{t}/{name}"),
         };
         let mut found = vec![if pattern.starts_with('/') { "/" } else { "" }.to_string()];
-        let mut listings = 0;
+        let mut lookups = 0;
         for (index, part) in parts.iter().enumerate() {
             let last = index + 1 == parts.len();
             // Before the first pattern, names need no looking up; after it, they must exist.
@@ -1093,13 +1093,32 @@ impl Shell {
                 if self.cancelled() {
                     return Ok(Vec::new());
                 }
-                listings += 1;
-                if listings > GLOB_LISTINGS {
-                    return Err(format!(
-                        "{pattern}: the pattern searches too many directories"
-                    ));
+                let navigation =
+                    matches!(part, Part::Name(name) if matches!(name.as_str(), "." | ".."));
+                lookups += if navigation { 2 } else { 1 };
+                if lookups > GLOB_LOOKUPS {
+                    return Err(format!("{pattern}: the pattern searches too many paths"));
                 }
                 let directory = self.path(if typed.is_empty() { "." } else { &typed })?;
+                if let Part::Name(name) = part {
+                    // Literal names need search permission, not a listing. Dot components
+                    // are not listing entries; check traversal before resolving them away.
+                    if navigation
+                        && request(&(endpoint("stat", &directory) + "&enter=true"), "GET")
+                            .await
+                            .is_err()
+                    {
+                        continue;
+                    }
+                    let target = join(&typed, name);
+                    let path = self.path(&target)?;
+                    if let Ok(entry) = request(&endpoint("stat", &path), "GET").await
+                        && (entry["directory"] == true || last && !directories)
+                    {
+                        next.push(target);
+                    }
+                    continue;
+                }
                 let Ok(entries) = listing(&directory).await else {
                     continue;
                 };

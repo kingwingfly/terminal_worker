@@ -128,8 +128,12 @@ fn set(chars: &[char]) -> Option<(Token, usize)> {
             c = chars[i];
         }
         if chars.get(i + 1) == Some(&'-') && chars.get(i + 2).is_some_and(|&end| end != ']') {
-            ranges.push((c, chars[i + 2]));
-            i += 3;
+            let mut end = i + 2;
+            if chars[end] == '\\' && end + 1 < chars.len() {
+                end += 1;
+            }
+            ranges.push((c, chars[end]));
+            i = end + 1;
         } else {
             ranges.push((c, c));
             i += 1;
