@@ -17,7 +17,7 @@ This file is deliberately named `AGENT.md` as requested by the owner. Read it wi
 See README for prerequisites and commands. The known toolchain uses `worker-build 0.8.5` and `wasm-bindgen-cli 0.2.129`; verify compatibility with Cargo.lock before changing either.
 
 - `npm ci`, `npm run setup`, `npm run build:web`, `npm run dev`.
-- `npm run dev` explicitly binds 127.0.0.1:8788. Direct Wrangler uses the configured port (currently 8787). Inspect listening ports before launching or stopping processes; the owner may run a separate instance.
+- `npm run dev` binds 127.0.0.1:8787, the port direct Wrangler takes from `wrangler.toml`; `seed` and the tests default to it too. Inspect listening ports before launching or stopping processes; the owner may run a separate instance.
 - Frontend changes require a build. Wrangler watches Worker/core sources. Restart only the relevant local server if newly generated chunks return 404 despite existing on disk.
 - Do not build the same Worker output concurrently from multiple Wrangler instances or content projects. Their `.tmp` build directories are shared.
 - The build discovers Cargo's actual target directory with cargo metadata; do not assume a repository-local target directory.
@@ -109,7 +109,7 @@ Report what changed, what was tested, and any real limitation. Do not claim depl
 - All 27 browser/API tests passed in Chromium against freshly seeded, isolated local state on port 8790.
 - The 49 first-party source files, their filenames, and generated application JavaScript/HTML/config were scanned; no Han text remains. Greek/accented path cases retain Unicode coverage.
 - Seed filenames are now welcome.md, readme.txt, and demo.slides.md; generated sample audio is media/signal.wav. Existing uploads in everyday local state were not renamed or rewritten.
-- No remote deployment or Git commit was performed. The temporary validation server/state were removed after testing; the regular local dev server uses port 8788.
+- No remote deployment or Git commit was performed. The temporary validation server/state were removed after testing; the regular local dev server then used port 8788 (now 8787).
 
 ## Rust previews (2026-10-25)
 
@@ -128,4 +128,4 @@ Report what changed, what was tested, and any real limitation. Do not claim depl
 
 - Phase 4 is done: zip, unzip, tar and jobs, run by `ArchiveRunner` with the `crates/archiver` container. The cargo target directory here is `/home/ai/target`, not the repository's.
 - Verified on an isolated instance (port 8793; another project's wrangler took 8797): cargo fmt --check, workspace wasm32 check, 33 core + 4 archiver + 8 frontend + 2 JavaScript unit tests, and all 38 browser/API tests, including the new archive suite (round trips, questions, -o/-n/-k, hostile members, Ctrl+C, a closed tab's job). By hand: killing the container in the middle of a 36 MB zip, the job resumed and the archive was intact, contents equal.
-- `package.json`'s `dev` port was changed to 8787 by someone else during this work; the README and this file still say 8788 in places. No deployment or commit.
+- The owner chose 8787 as the one local port: `npm run dev`, `wrangler.toml`, `seed`, the Playwright configs and the tests now agree. No deployment.

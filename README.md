@@ -24,7 +24,7 @@ In another terminal:
 npm run seed
 ```
 
-Open **http://127.0.0.1:8788**. `npm run dev` explicitly selects port 8788; direct `wrangler dev` uses the configured port. Local development requires no Cloudflare login or account access.
+Open **http://127.0.0.1:8787**. `npm run dev` and direct `wrangler dev` both use port 8787, the one configured in `wrangler.toml`. Local development requires no Cloudflare login or account access.
 
 `setup` creates `.dev.vars` and `.local-password` only when credentials do not exist. Both are gitignored. `ADMIN_PASSWORD` bootstraps root only during the first database initialization; later changes use `passwd`. Changing `.dev.vars` does not reset an existing root password. `SESSION_SECRET` is a password-hash pepper: preserve it when restoring data.
 
@@ -32,7 +32,7 @@ Open **http://127.0.0.1:8788**. `npm run dev` explicitly selects port 8788; dire
 
 Rebuild frontend changes with `npm run build:web` (currently `npm run build` builds the same frontend). Wrangler watches Worker/core Rust sources. If newly generated lazy chunks return 404, restart your local Wrangler process after the build. Avoid concurrent Worker builds into the same `crates/worker/build` directory.
 
-`seed` is local-only, defaults to port 8788, and preserves existing files. It installs `welcome.md`, `readme.txt`, `demo.slides.md`, and a generated `media/signal.wav`. Use `TERMINAL_PORT` to select another local instance. After changing root's password, supply the current password through `TERMINAL_PASSWORD` rather than changing the bootstrap secret.
+`seed` is local-only, defaults to port 8787, and preserves existing files. It installs `welcome.md`, `readme.txt`, `demo.slides.md`, and a generated `media/signal.wav`. Use `TERMINAL_PORT` to select another local instance. After changing root's password, supply the current password through `TERMINAL_PASSWORD` rather than changing the bootstrap secret.
 
 ## Accounts and permissions
 

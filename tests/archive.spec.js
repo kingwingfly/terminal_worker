@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8788';
+const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 const ls = async (request, path) => ((await (await request.get('/api/ls?path=' + encodeURIComponent(path))).json()).entries || []);

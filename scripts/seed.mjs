@@ -1,5 +1,5 @@
 import { readFile, readdir } from 'node:fs/promises';
-const port = process.env.TERMINAL_PORT || '8788';
+const port = process.env.TERMINAL_PORT || '8787';
 if (!/^\d+$/.test(port)) throw new Error('Invalid local port');
 const origin = `http://127.0.0.1:${port}`; // Deliberately local-only; never seed a remote account.
 const vars = await readFile('.dev.vars', 'utf8');
