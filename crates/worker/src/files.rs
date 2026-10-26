@@ -113,6 +113,10 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
     headers.set("Accept-Ranges", "bytes")?;
     headers.set("ETag", &grant.etag)?;
     headers.set("Content-Security-Policy", "default-src 'none'; sandbox")?;
+    // An SVG shows in <img>, which ignores this; opened by itself, it downloads instead.
+    if grant.mime == "image/svg+xml" {
+        headers.set("Content-Disposition", "attachment")?;
+    }
     if grant.state != "complete" {
         headers.set("X-Upload-State", "uploading")?;
     }

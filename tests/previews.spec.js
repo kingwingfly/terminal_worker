@@ -40,7 +40,7 @@ test('Rust previews: highlighted code, diagrams, maths, links within the filesys
  const base='/previews-'+Date.now();await request.post('/api/login',{headers,data:{password}});await request.post('/api/mkdir?path='+base,{headers});
  try{
   const files={
-   'doc.md':'# Previews\n\n[Other notes](other.md) and [the web](https://example.com).\n\n![pixel](img/pixel.png)\n\n```rust\nfn main() {\n    println!("hi");\n}\n```\n\n```mermaid\nflowchart LR\n  A[Alice] --> B[Bob]\n```\n\nInline $a^2 + b^2 = c^2$.\n\n- [x] done\n',
+   'doc.md':'# Previews\n\n[Other notes](other.md) and [the web](https://example.com).\n\n![pixel](img/pixel.png) ![logo](logo.svg)\n\n```rust\nfn main() {\n    println!("hi");\n}\n```\n\n```mermaid\nflowchart LR\n  A[Alice] --> B[Bob]\n```\n\nInline $a^2 + b^2 = c^2$.\n\n- [x] done\n',
    'other.md':'# Other\n\nReached by a relative link.\n',
    'main.rs':'// héllo κόσμε € 😀\nfn main() {\n    let s = "wörld";\n}\n',
    'data.csv':'name,role\n"Doe, Jane",admin\nBob,user\n',
@@ -67,6 +67,11 @@ test('Rust previews: highlighted code, diagrams, maths, links within the filesys
   await expect(page.locator('.markdown img.diagram')).toHaveAttribute('src',/^data:image\/svg\+xml/);
   await expect(page.locator('.markdown math')).toHaveCount(1);
   await expect.poll(()=>page.locator('.markdown img[alt=pixel]').evaluate(e=>e.naturalWidth)).toBe(1);
+  // An SVG shows as an image, whose script does not run; opened by itself, it is sandboxed and downloads.
+  await expect.poll(()=>page.locator('.markdown img[alt=logo]').evaluate(e=>e.naturalWidth)).toBe(40);
+  expect(await page.evaluate(()=>window.svgRan)).toBeUndefined();
+  const svg=(await request.get(file(base+'/logo.svg'),{headers})).headers();
+  expect(svg['content-type']).toBe('image/svg+xml');expect(svg['content-security-policy']).toBe("default-src 'none'; sandbox");expect(svg['content-disposition']).toBe('attachment');
   expect(await page.locator('.markdown a',{hasText:'the web'}).getAttribute('target')).toBe('_blank');
   await expect(page.locator('.markdown')).toContainText('☑ done');
   expect(loaded.sort()).toEqual(['preview_code_systems','preview_diagram']);

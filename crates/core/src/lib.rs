@@ -112,6 +112,8 @@ pub fn mime(path: &str) -> &'static str {
         "avif" => "image/avif",
         "bmp" => "image/bmp",
         "ico" => "image/x-icon",
+        // Safe to serve: an image runs no scripts, and a file opened as a page is sandboxed.
+        "svg" => "image/svg+xml",
         "pdf" => "application/pdf",
         "mp4" | "m4v" => "video/mp4",
         "webm" => "video/webm",
@@ -278,6 +280,7 @@ mod tests {
             assert_eq!(kind(path), "archive", "{path}");
         }
         assert_eq!(mime("/a.tar.gz"), "application/gzip");
+        assert_eq!(mime("/logo.SVG"), "image/svg+xml");
         assert_eq!(kind("/report.docx"), "unknown");
     }
     #[test]
