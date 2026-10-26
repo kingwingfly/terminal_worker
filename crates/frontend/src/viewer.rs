@@ -457,7 +457,12 @@ fn Slides(source: String, path: String) -> impl IntoView {
         for entry in entries.iter() {
             let entry: ResizeObserverEntry = entry.unchecked_into();
             let size = entry.content_rect();
-            let bar = 56.0;
+            // Full screen, the bar floats over the slides rather than taking room from them.
+            let bar = if document().fullscreen_element().is_some() {
+                0.0
+            } else {
+                56.0
+            };
             let scale = (size.width() / SLIDE_SIZE.0).min((size.height() - bar) / SLIDE_SIZE.1);
             let style = entry.target().unchecked_into::<HtmlElement>().style();
             let _ = style.set_property("--scale", &scale.max(0.1).to_string());

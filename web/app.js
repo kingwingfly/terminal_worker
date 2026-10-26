@@ -269,10 +269,29 @@ $('fullscreen').onclick = async () => {
     }
   } catch (error) { status.textContent = `Fullscreen failed: ${error.message}`; status.hidden = false; }
 };
+// Full screen, the preview's bars float over the content, hidden until the pointer moves, as a
+// video player's controls are; they stay while the pointer, or the keyboard's focus, is on one
+// (a button clicked keeps the focus, but not :focus-visible).
+const bars = ':is(.viewer-bar, .preview-bar, .slides-bar)';
+let chromeTimer;
+function showChrome() {
+  const surface = $('viewer-surface');
+  surface.classList.add('chrome'); clearTimeout(chromeTimer);
+  chromeTimer = setTimeout(() => {
+    if (surface.querySelector(`${bars}:hover, ${bars}:has(:focus-visible)`)) showChrome();
+    else surface.classList.remove('chrome');
+  }, 2000);
+}
+const fullscreen = () => document.fullscreenElement === $('viewer-surface');
+$('viewer-surface').addEventListener('pointermove', () => { if (fullscreen()) showChrome(); });
+$('viewer-surface').addEventListener('focusin', event => { if (fullscreen() && event.target.closest(bars)) showChrome(); });
 document.addEventListener('fullscreenchange', () => {
   const active = !!document.fullscreenElement;
   $('fullscreen').setAttribute('aria-label', active ? 'Exit fullscreen' : 'Fullscreen');
   $('fullscreen').setAttribute('aria-pressed', String(active));
+  // Shown a moment on entering, so that the way out is seen.
+  if (fullscreen()) showChrome();
+  else { clearTimeout(chromeTimer); $('viewer-surface').classList.remove('chrome'); }
 });
 window.addEventListener('message', event => { if (event.origin === location.origin && event.source === $('viewer-content').querySelector('iframe')?.contentWindow && event.data === 'close-game') closeViewer(); });
 async function open(path, kind) {

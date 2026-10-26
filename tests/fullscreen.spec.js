@@ -42,6 +42,16 @@ test('slides remain interactive inside the fullscreen surface', async ({ page })
   await enter(page);
   // Full screen, the slides scale up to the space they have.
   await expect.poll(scale).toBeGreaterThan(windowed);
+  // The bars float over the slides, and hide until the pointer moves; on a bar, they stay.
+  const shown = () => page.locator('.viewer-bar').evaluate(e => getComputedStyle(e).opacity);
+  await expect.poll(() => page.locator('.slides-bar').evaluate(e => getComputedStyle(e).position)).toBe('absolute');
+  await page.mouse.move(640, 400);
+  await expect.poll(shown, { timeout: 5000 }).toBe('0');
+  await page.mouse.move(650, 410);
+  await expect.poll(shown).toBe('1');
+  await page.locator('.viewer-bar').hover();
+  await page.waitForTimeout(2500);
+  expect(await shown()).toBe('1');
   await page.keyboard.press('ArrowRight');
   await expect(page.locator('.slides .slide')).toContainText('One filesystem');
   await page.getByRole('button', { name: 'Close preview' }).click();
