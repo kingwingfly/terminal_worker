@@ -27,7 +27,9 @@ web-sys = { workspace = true, features = [
     "KeyboardEvent",
     "MessageEvent",
     "MouseEvent",
+    "Node",
     "NodeList",
+    "Range",
     "ResizeObserver",
     "ResizeObserverEntry",
     "Storage",
@@ -43,6 +45,8 @@ terminal-worker-core = { path = "../core" }
 console_error_panic_hook = "0.1"
 # Pipelines run commands that run commands (xargs, fd -x), and wait for answers to prompts.
 futures = "0.3"
+# The viewer's search, with the regular expressions grep takes.
+regex = { version = "1.13", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
 # Uploads hash files, to resume them and so that R2 checks every chunk.
 sha2 = "0.10"
 # File previews: sanitized Markdown with maths as MathML, CSV tables, and ZIP and tar listings; PDF

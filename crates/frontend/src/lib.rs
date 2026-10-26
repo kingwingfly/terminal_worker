@@ -1,4 +1,5 @@
 mod preview;
+mod search;
 mod shell;
 mod uploads;
 mod viewer;

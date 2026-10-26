@@ -34,3 +34,15 @@ dialog { color:var(--text); background:#101714; border:1px solid #3d5345; border
 .tab .tab-close:hover{opacity:1}
 .tab-new{background:none;border:0;color:var(--muted);font-size:16px;padding:4px 10px}
 .tab-new:hover,.tab:hover{color:var(--text)}
+/* Search in a preview: a panel over its top right, and the matches it highlights. */
+#viewer-search[hidden],.preview-search[hidden]{display:none}
+.preview-search{position:absolute;top:76px;right:72px;z-index:6;display:flex;align-items:center;gap:6px;padding:8px 10px;background:#16211b;border:1px solid #3d5345;border-radius:6px;box-shadow:0 8px 30px #0009;max-width:calc(100% - 32px)}
+.preview-search input{width:min(320px,50vw);border:1px solid #405448;background:#080d0a;color:var(--text);border-radius:4px;padding:6px 8px;font:16px ui-monospace,monospace}
+.preview-search input[aria-invalid="true"]{border-color:#c46a5a}
+.preview-search button{padding:4px 8px;font-size:15px;min-width:32px}
+.search-toggle[aria-pressed="true"]{background:#2b4434;border-color:var(--green);color:var(--text)}
+.search-status{font-size:14px;color:var(--muted);min-width:7ch;max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.search-status.search-error{color:#ffb6a9}
+::highlight(preview-search){background-color:#6b5a1f}
+::highlight(preview-search-current){background-color:#e0b84a;color:#111}
+@media(max-width:650px){.preview-search{left:16px;right:16px;top:70px;flex-wrap:wrap}.preview-search input{flex:1;width:auto}}

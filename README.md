@@ -164,6 +164,8 @@ A file is listed as soon as its upload starts, with its progress, and can be rea
 | `POST /api/uploads/complete?id=` / `DELETE /api/uploads?id=` | Finish, or cancel |
 | `PUT /api/file?path=` | A whole file in one request, up to 100 MB (the editor saves this way) |
 
+Text, code, diffs and Markdown can be searched in the viewer: the search button or Ctrl/Cmd+F opens a panel that takes a regular expression (Rust syntax, as `grep` takes) or plain text, with a match-case toggle; Enter and Shift+Enter (or F3) step through the matches, which are highlighted without changing the preview, and Esc closes the panel.
+
 Previews render in Rust, as the terminal does; PDF pages, Mermaid diagrams, and code highlighting run in web workers (`crates/preview`), each loaded the first time a preview needs it.
 
 - PDF: drawn by hayro, a page at a time, with page navigation. Encrypted PDFs do not open; download them.

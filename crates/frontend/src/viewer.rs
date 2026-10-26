@@ -16,6 +16,7 @@ use web_sys::{
 };
 
 use crate::preview::{self, ARCHIVE_MAX, DiffLine, Kind, TEXT_MAX, file_path, file_url};
+use crate::search::Searchable;
 use crate::workers;
 
 /// The most bytes of a PDF opened, as many as an upload has.
@@ -164,15 +165,20 @@ fn render(preview: Preview, path: String) -> AnyView {
                 view! { <MarkdownView html source path /> }.into_any()
             }
             Kind::Code { text, language } => view! {
-                <Enhanced>
-                    <pre class="text-preview"><code data-lang=language>{text}</code></pre>
-                </Enhanced>
+                <Searchable>
+                    <Enhanced>
+                        <pre class="text-preview"><code data-lang=language>{text}</code></pre>
+                    </Enhanced>
+                </Searchable>
             }
             .into_any(),
             Kind::Table(table) => table_view(table),
             Kind::Archive(entries) => archive_view(entries),
             Kind::Cards(cards) => cards_view(cards),
-            Kind::Diff(lines) => diff_view(lines),
+            Kind::Diff(lines) => {
+                let diff = diff_view(lines);
+                view! { <Searchable>{diff}</Searchable> }.into_any()
+            }
             Kind::None => no_preview(),
         },
     }
@@ -375,9 +381,11 @@ fn MarkdownView(html: String, source: String, path: String) -> impl IntoView {
             } else {
                 let html = html.clone();
                 view! {
-                    <Enhanced>
-                        <article class="markdown" inner_html=html></article>
-                    </Enhanced>
+                    <Searchable>
+                        <Enhanced>
+                            <article class="markdown" inner_html=html></article>
+                        </Enhanced>
+                    </Searchable>
                 }
                 .into_any()
             }
