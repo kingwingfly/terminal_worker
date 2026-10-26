@@ -5,16 +5,50 @@
 /// quotes them. An unquoted `|` separates stages; the shell's other operators are refused
 /// rather than taken as words.
 pub fn pipeline(input: &str) -> Result<Vec<Vec<String>>, String> {
+    Ok(words(input)?
+        .into_iter()
+        .map(|stage| stage.into_iter().map(|word| word.text).collect())
+        .collect())
+}
+
+/// A word of a command line: its text, and, if it has wildcards outside quotes, the pattern
+/// it expands to the paths of, as [`crate::glob`] reads patterns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Word {
+    pub text: String,
+    pub pattern: Option<String>,
+}
+
+/// The stages of the pipeline `input`, as [`pipeline`] splits it, each its words with their
+/// patterns.
+pub fn words(input: &str) -> Result<Vec<Vec<Word>>, String> {
     let mut stages = Vec::new();
     let mut words = Vec::new();
     let mut word = String::new();
+    // The word as a pattern: its quoted or escaped wildcards escaped.
+    let mut pattern = String::new();
+    let mut wild = false;
     let mut quote = None;
     let mut escaped = false;
     let mut active = false;
+    let end = |word: &mut String, pattern: &mut String, wild: &mut bool, words: &mut Vec<Word>| {
+        let pattern = std::mem::take(pattern);
+        words.push(Word {
+            text: std::mem::take(word),
+            pattern: std::mem::take(wild).then_some(pattern),
+        });
+    };
+    let literal = |c: char, word: &mut String, pattern: &mut String| {
+        word.push(c);
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    };
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
         if escaped {
-            word.push(c);
+            literal(c, &mut word, &mut pattern);
             escaped = false;
             active = true;
             continue;
@@ -27,7 +61,7 @@ pub fn pipeline(input: &str) -> Result<Vec<Vec<String>>, String> {
             if c == q {
                 quote = None;
             } else {
-                word.push(c);
+                literal(c, &mut word, &mut pattern);
             }
             continue;
         }
@@ -38,14 +72,14 @@ pub fn pipeline(input: &str) -> Result<Vec<Vec<String>>, String> {
             }
             c if c.is_whitespace() => {
                 if active {
-                    words.push(std::mem::take(&mut word));
+                    end(&mut word, &mut pattern, &mut wild, &mut words);
                     active = false;
                 }
             }
             '|' if chars.peek() == Some(&'|') => return Err(unsupported("||")),
             '|' => {
                 if active {
-                    words.push(std::mem::take(&mut word));
+                    end(&mut word, &mut pattern, &mut wild, &mut words);
                     active = false;
                 }
                 if words.is_empty() {
@@ -57,6 +91,8 @@ pub fn pipeline(input: &str) -> Result<Vec<Vec<String>>, String> {
             '&' | ';' | '<' | '>' => return Err(unsupported(&c.to_string())),
             c => {
                 word.push(c);
+                pattern.push(c);
+                wild |= matches!(c, '*' | '?' | '[');
                 active = true;
             }
         }
@@ -65,7 +101,7 @@ pub fn pipeline(input: &str) -> Result<Vec<Vec<String>>, String> {
         return Err("Unterminated quote or escape".into());
     }
     if active {
-        words.push(word);
+        end(&mut word, &mut pattern, &mut wild, &mut words);
     }
     if words.is_empty() {
         return if stages.is_empty() {
@@ -275,6 +311,30 @@ mod tests {
             assert_eq!(pipeline(empty).unwrap_err(), EMPTY_STAGE, "{empty}");
         }
         assert!(pipeline("echo 'open").is_err());
+    }
+
+    #[test]
+    fn unquoted_wildcards_make_patterns() {
+        let stage = &words(r#"rm -rf * 'a*' "b?" c\* d[1]'*' plain"#).unwrap()[0];
+        let patterns: Vec<_> = stage.iter().map(|w| w.pattern.as_deref()).collect();
+        assert_eq!(
+            patterns,
+            [
+                None,
+                None,
+                Some("*"),
+                None,
+                None,
+                None,
+                Some("d[1]\\*"),
+                None
+            ]
+        );
+        let texts: Vec<_> = stage.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["rm", "-rf", "*", "a*", "b?", "c*", "d[1]*", "plain"]
+        );
     }
 
     #[test]

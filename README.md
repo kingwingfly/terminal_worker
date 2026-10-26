@@ -52,7 +52,7 @@ Anonymous visitors share the `guest` identity. The server checks owner/group/oth
 
 Defaults are files 644, directories 755, and user homes 700. Public files inside private homes also need traversable ancestors; for example, home 711 and file 644 allow reading a known path without listing the home. Use 755 to permit listing.
 
-The executable bit is stored and displayed, but files and commands never execute on the host. There are no symlinks, special mode bits, POSIX ACLs, glob expansion, or configurable umask. Omitted chmod classes apply to all three classes.
+The executable bit is stored and displayed, but files and commands never execute on the host. There are no symlinks, special mode bits, POSIX ACLs, or configurable umask. Omitted chmod classes apply to all three classes.
 
 ### Identity changes and sudo
 
@@ -124,7 +124,7 @@ Passwords use random salts, PBKDF2-SHA256 (100,000 iterations), and a server-sid
 
 ### Pipes
 
-`A | B` passes what A writes to B. Commands that read input are the text filters `cat`, `head`, `tail`, `grep` (Rust regular expressions, as with `grep -E`), `wc`, `sort`, and `uniq`, plus `xargs`, which runs a command with the items it reads (`-0`, `-d`, `-n`, `-I`, `-r`, `-t`, as in GNU xargs). Stages run one after another in the browser; the server runs file commands, many at a time for xargs and `fd -x`, each in its own transaction. Other shell operators (`&&`, `||`, `;`, `<`, `>`, `&`) are refused rather than taken literally; quote them to use them as text. There is no globbing; `fd ... -X` or `fd ... | xargs` fill that role.
+`A | B` passes what A writes to B. Commands that read input are the text filters `cat`, `head`, `tail`, `grep` (Rust regular expressions, as with `grep -E`), `wc`, `sort`, and `uniq`, plus `xargs`, which runs a command with the items it reads (`-0`, `-d`, `-n`, `-I`, `-r`, `-t`, as in GNU xargs). Stages run one after another in the browser; the server runs file commands, many at a time for xargs and `fd -x`, each in its own transaction. Other shell operators (`&&`, `||`, `;`, `<`, `>`, `&`) are refused rather than taken literally; quote them to use them as text. Unquoted wildcards expand as in bash before a stage runs: `*`, `?` and `[...]` (`[a-z]`, `[!x]`) match names in each part of a path (`rm -rf *`, `cat docs/*.md`, `echo */`), sorted, listed with the caller's permissions. Names starting with a dot match only a pattern starting with one; quoted or escaped wildcards are literal; a pattern that matches nothing stays as typed. Brace expansion (`{a,b}`) and `**` are not supported; `fd` fills that role.
 
 ```text
 fd -e md | xargs wc -l

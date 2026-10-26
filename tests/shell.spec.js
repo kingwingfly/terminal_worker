@@ -59,6 +59,32 @@ test('pipes join filters, fd finds what may be listed, and xargs and fd -x run c
   expect(await output(page, 'fd -e none | xargs -r rm')).not.toContain('Usage');
 });
 
+test('wildcards expand to sorted paths as bash expands them, and rm -rf * empties a directory', async ({ page, request }) => {
+  const names = async path => (await (await request.get('/api/ls?path=' + encodeURIComponent(base + path))).json()).entries.map(e => e.name).sort();
+  await terminal(page);
+  // Sorted, relative as typed, without hidden names, in every part of a path.
+  expect(await output(page, 'echo *')).toBe('a.md docs x.tmp y.tmp');
+  expect(await output(page, 'echo *.tmp ?.md')).toBe('x.tmp y.tmp a.md');
+  expect(await output(page, 'echo docs/*/*.md')).toBe('docs/deep/spéctrum notes.md');
+  expect(await output(page, 'echo */')).toBe('docs/');
+  expect(await output(page, 'echo [xy].tmp')).toBe('x.tmp y.tmp');
+  expect(await output(page, 'echo .*')).toBe('.hidden');
+  expect(await output(page, 'echo ' + base + '/d*')).toBe(base + '/docs');
+  // Quoted or escaped wildcards are literal; a pattern that matches nothing stays as typed.
+  expect(await output(page, `echo '*' \\*.md "?.md" *.none`)).toBe('* *.md ?.md *.none');
+  expect(await output(page, 'cat docs/*.md docs/*.txt | wc -l')).toBe('6');
+  await run(page, 'rm *.tmp');
+  await expect.poll(() => names('')).toEqual(['.hidden', 'a.md', 'docs']);
+  // rm -rf * leaves hidden names, as bash does; in an empty directory it does nothing.
+  await run(page, 'cd docs'); await run(page, 'rm -rf *');
+  await expect.poll(() => names('/docs')).toEqual([]);
+  await run(page, 'rm -rf *');
+  await expect(page.locator('#command').locator('xpath=ancestor::form').locator('.busy')).toHaveText('↵');
+  await expect(last(page)).toHaveClass(/command-echo/);
+  await run(page, 'cd ..'); await run(page, 'rm -r *');
+  await expect.poll(() => names('')).toEqual(['.hidden']);
+});
+
 test('mv and cp follow Linux defaults, ask with -i, share content, and refuse what rename would', async ({ page, request }) => {
   await terminal(page);
   await run(page, 'cp -r docs copy'); await run(page, 'mv a.md docs/');

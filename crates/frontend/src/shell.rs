@@ -9,7 +9,8 @@ use futures::future::LocalBoxFuture;
 use leptos::prelude::*;
 use serde_json::{Value, json};
 use terminal_worker_core::completion::{self, Candidate, Query};
-use terminal_worker_core::shell::{self as grammar, Delimiter};
+use terminal_worker_core::glob::{self, Part};
+use terminal_worker_core::shell::{self as grammar, Delimiter, Word};
 use terminal_worker_core::{Entry, find, permissions::mode_text, resolve, split_command, text};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -29,6 +30,9 @@ const PIPED_MAX: usize = 10_000_000;
 const XARGS_MAX: usize = 1000;
 /// How many commands one batch request runs, at most.
 const BATCH: usize = 100;
+/// How many directories one wildcard pattern lists, and how many paths it expands to, at most.
+const GLOB_LISTINGS: usize = 1000;
+const GLOB_PATHS: usize = 10_000;
 
 /// Commands the server runs, through web/app.js's accountCommand; ls and mkdir too, with
 /// options or several paths.
@@ -984,7 +988,7 @@ impl Shell {
         self.busy.set(true);
         self.cancelled.set(false);
         spawn_local(async move {
-            match grammar::pipeline(&command) {
+            match grammar::words(&command) {
                 Ok(stages) => self.pipeline(stages).await,
                 Err(e) => self.error(e),
             }
@@ -994,15 +998,21 @@ impl Shell {
             focus_input();
         });
     }
-    async fn pipeline(self, stages: Vec<Vec<String>>) {
+    async fn pipeline(self, stages: Vec<Vec<Word>>) {
         let last = stages.len().saturating_sub(1);
         let mut stdin = None;
-        for (index, args) in stages.into_iter().enumerate() {
+        for (index, words) in stages.into_iter().enumerate() {
+            // Wildcards expand as the stage starts, as a shell expands them.
+            let args = self.expand(words).await;
             if self.cancelled() {
                 break;
             }
             let piped = index < last;
-            match self.invoke(args, stdin.take(), piped).await {
+            let result = match args {
+                Ok(args) => self.invoke(args, stdin.take(), piped).await,
+                Err(e) => Err(e),
+            };
+            match result {
                 Ok(out) if piped => {
                     let mut text = out.stdout;
                     if text.len() > PIPED_MAX {
@@ -1033,6 +1043,87 @@ impl Shell {
                 }
             }
         }
+    }
+    /// The arguments `words` stand for: each word's wildcards expanded to the paths they match,
+    /// sorted, or the word as it is if they match none, as a shell leaves it.
+    async fn expand(self, words: Vec<Word>) -> Result<Vec<String>, String> {
+        let mut args = Vec::new();
+        for word in words {
+            let Some(pattern) = word.pattern else {
+                args.push(word.text);
+                continue;
+            };
+            let mut paths = self.glob(&pattern).await?;
+            if paths.is_empty() {
+                args.push(word.text);
+            } else {
+                paths.sort();
+                args.append(&mut paths);
+            }
+            if args.len() > GLOB_PATHS {
+                return Err(format!("{}: Argument list too long", args[0]));
+            }
+        }
+        Ok(args)
+    }
+    /// The paths `pattern` matches, as typed: relative ones stay relative. A directory that
+    /// cannot be listed matches nothing; a pattern ending in `/` matches directories.
+    async fn glob(self, pattern: &str) -> Result<Vec<String>, String> {
+        let parts = glob::parts(pattern);
+        let directories = pattern.ends_with('/');
+        let join = |typed: &str, name: &str| match typed {
+            "" => name.to_string(),
+            t if t.ends_with('/') => format!("{t}{name}"),
+            t => format!("{t}/{name}"),
+        };
+        let mut found = vec![if pattern.starts_with('/') { "/" } else { "" }.to_string()];
+        let mut listings = 0;
+        for (index, part) in parts.iter().enumerate() {
+            let last = index + 1 == parts.len();
+            // Before the first pattern, names need no looking up; after it, they must exist.
+            let looked_up = parts[..index]
+                .iter()
+                .any(|part| matches!(part, Part::Pattern(_)));
+            let mut next = Vec::new();
+            for typed in found {
+                if let (Part::Name(name), false) = (part, looked_up) {
+                    next.push(join(&typed, name));
+                    continue;
+                }
+                if self.cancelled() {
+                    return Ok(Vec::new());
+                }
+                listings += 1;
+                if listings > GLOB_LISTINGS {
+                    return Err(format!(
+                        "{pattern}: the pattern searches too many directories"
+                    ));
+                }
+                let directory = self.path(if typed.is_empty() { "." } else { &typed })?;
+                let Ok(entries) = listing(&directory).await else {
+                    continue;
+                };
+                for entry in entries {
+                    let matched = match part {
+                        Part::Name(name) => entry.name == *name,
+                        Part::Pattern(pattern) => glob::matches(pattern, &entry.name),
+                    };
+                    if matched && (entry.directory || last && !directories) {
+                        next.push(join(&typed, &entry.name));
+                    }
+                }
+            }
+            found = next;
+            if found.is_empty() {
+                break;
+            }
+        }
+        if directories {
+            for path in &mut found {
+                path.push('/');
+            }
+        }
+        Ok(found)
     }
     /// The tab is closing: stop its browser work at the next step, but leave its server jobs
     /// running.
