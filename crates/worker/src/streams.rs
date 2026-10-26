@@ -24,6 +24,15 @@ export function concatenate(next) {
   })();
   return readable;
 }
+")]
+extern "C" {
+    /// One stream of the streams `next` resolves to, in order, until it resolves to null.
+    pub fn concatenate(next: &js_sys::Function) -> web_sys::ReadableStream;
+}
+
+// A snippet of its own: wasm-bindgen 0.2.129 names a snippet in the Worker's imports once per
+// function the module imports from it directly, which esbuild warns of as a duplicate key.
+#[wasm_bindgen(inline_js = "
 export function fixedLength(body, length) {
   const { readable, writable } = new FixedLengthStream(length);
   body.pipeTo(writable).catch(() => {});
@@ -31,8 +40,6 @@ export function fixedLength(body, length) {
 }
 ")]
 extern "C" {
-    /// One stream of the streams `next` resolves to, in order, until it resolves to null.
-    pub fn concatenate(next: &js_sys::Function) -> web_sys::ReadableStream;
     /// `body`, which must be exactly `length` bytes, as a stream R2 accepts.
     #[wasm_bindgen(js_name = fixedLength)]
     pub fn fixed_length(body: &web_sys::ReadableStream, length: f64) -> web_sys::ReadableStream;
