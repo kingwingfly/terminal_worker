@@ -1,15 +1,17 @@
 // Start `wrangler dev` with the arguments given. Archive jobs run in a container, which needs a
 // Docker-compatible engine: where Docker is absent and Podman present, this starts Podman's API
-// service for the session and points wrangler at it.
+// service for the session and points wrangler at it, through a proxy that fixes up what Podman
+// would refuse (scripts/podman-proxy.mjs).
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { podmanProxy } from './podman-proxy.mjs';
 
 const has = command => spawnSync('sh', ['-c', `command -v ${command}`], { stdio: 'ignore' }).status === 0;
 const env = { ...process.env };
-let service;
+let service, proxy;
 if (!env.WRANGLER_DOCKER_HOST && !env.DOCKER_HOST && !has('docker') && has('podman')) {
   const socket = join(tmpdir(), `terminal-worker-podman-${process.getuid()}.sock`);
   // Another session's service may answer there already; a socket left from an ended one does not.
@@ -22,7 +24,9 @@ if (!env.WRANGLER_DOCKER_HOST && !env.DOCKER_HOST && !has('docker') && has('podm
     for (let i = 0; i < 100 && !existsSync(socket); i++) await new Promise(resolve => setTimeout(resolve, 100));
   }
   env.WRANGLER_DOCKER_BIN = join(dirname(fileURLToPath(import.meta.url)), 'podman-docker.sh');
-  env.WRANGLER_DOCKER_HOST = 'unix://' + socket;
+  const proxied = join(tmpdir(), `terminal-worker-podman-${process.getuid()}-${process.pid}.sock`);
+  proxy = podmanProxy(proxied, socket);
+  env.WRANGLER_DOCKER_HOST = 'unix://' + proxied;
   // Podman resolves only qualified image names: name the registry of wrangler's egress sidecar.
   if (!env.MINIFLARE_CONTAINER_EGRESS_IMAGE) {
     const miniflare = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../node_modules/miniflare/dist/src/index.js'), 'utf8');
@@ -32,7 +36,7 @@ if (!env.WRANGLER_DOCKER_HOST && !env.DOCKER_HOST && !has('docker') && has('podm
   console.log(`Containers run with Podman, through ${socket}`);
 }
 const wrangler = spawn('npx', ['wrangler', 'dev', ...process.argv.slice(2)], { stdio: 'inherit', env });
-const stop = signal => { wrangler.kill(signal); service?.kill(); };
+const stop = signal => { wrangler.kill(signal); service?.kill(); proxy?.close(); };
 process.on('SIGINT', () => stop('SIGINT'));
 process.on('SIGTERM', () => stop('SIGTERM'));
-wrangler.on('exit', code => { service?.kill(); process.exit(code ?? 0); });
+wrangler.on('exit', code => { service?.kill(); proxy?.close(); process.exit(code ?? 0); });
