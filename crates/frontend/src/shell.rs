@@ -3,6 +3,8 @@
 //! file and account commands; text filters, xargs and fd -x run here, as do browser
 //! interactions such as open and upload.
 
+mod commands;
+
 use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt, StreamExt};
@@ -11,13 +13,13 @@ use serde_json::{Value, json};
 use terminal_worker_core::completion::{self, Candidate, Query};
 use terminal_worker_core::glob::{self, Part};
 use terminal_worker_core::shell::{self as grammar, Delimiter, Word};
-use terminal_worker_core::{Entry, find, resolve, split_command, text};
-use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use terminal_worker_core::{Entry, cli, find, resolve, split_command, text};
+use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::{
-    account_command, authorize, cancel_uploads, choose_files, completion_focus, endpoint,
-    focus_input, listing, open_file, request, set_directory, upload_files,
+    account_command, cancel_uploads, choose_files, completion_focus, endpoint, focus_input,
+    listing, request, set_directory,
 };
 
 /// The most transcript lines kept, ...
@@ -36,47 +38,6 @@ const GLOB_PATHS: usize = 10_000;
 /// How many of a wildcard's lookups run at once.
 const GLOB_CONCURRENCY: usize = 8;
 
-/// Commands the server runs, through web/app.js's accountCommand; ls and mkdir too, with
-/// options or several paths.
-const SERVER: &[&str] = &[
-    "help",
-    "man",
-    "vim",
-    "touch",
-    "sudo",
-    "su",
-    "login",
-    "logout",
-    "exit",
-    "passwd",
-    "chmod",
-    "chown",
-    "useradd",
-    "usermod",
-    "userdel",
-    "groupadd",
-    "groupmod",
-    "groupdel",
-    "whoami",
-    "id",
-    "groups",
-    "users",
-    "rm",
-    "mv",
-    "cp",
-    "fd",
-    "zip",
-    "unzip",
-    "tar",
-    "ln",
-    "readlink",
-    "chgrp",
-    "getfacl",
-    "setfacl",
-    "getfattr",
-    "setfattr",
-    "faststart",
-];
 /// Server commands that xargs and fd -x may run many of in one request.
 const BATCHED: &[&str] = &[
     "touch", "rm", "mv", "cp", "chmod", "chown", "chgrp", "mkdir", "ls", "whoami", "id", "groups",
@@ -177,32 +138,68 @@ fn js_message(error: JsValue) -> String {
         .or_else(|| error.as_string())
         .unwrap_or_else(|| "Operation failed".into())
 }
-/// Commands for which -h is an option, as on Linux: chown, chgrp, getfattr and setfattr act on a
-/// link itself with it, tar follows links. Alone, it still asks for help.
-const H_OPTION: &[&str] = &["chown", "chgrp", "getfattr", "setfattr", "tar"];
-/// Whether `args` ask for help before `--`.
-fn wants_help(args: &[String]) -> bool {
-    // sudo COMMAND: COMMAND's -h is what counts.
-    let at = usize::from(
-        args.first().is_some_and(|a| a == "sudo")
-            && args.get(1).is_some_and(|a| !a.starts_with('-')),
-    );
-    let h_option = H_OPTION.contains(&args.get(at).map(String::as_str).unwrap_or_default());
-    args.iter()
-        .skip(1)
-        .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| arg == "--help" || arg == "-h" && (!h_option || args.len() - at == 2))
-}
 /// Whether `args` are mv or cp -i, under sudo or not, which ask before replacing a file: run
-/// one by one, never in a batch, however xargs or fd -x start them.
+/// one by one, never in a batch, however xargs or fd -x start them. As on Linux, the last of -i,
+/// -n and -f is what counts.
 fn asks(args: &[String]) -> bool {
     let args = &args[usize::from(args.first().is_some_and(|a| a == "sudo"))..];
-    matches!(args.first().map(String::as_str), Some("mv" | "cp"))
-        && args
-            .iter()
-            .skip(1)
-            .take_while(|a| a.as_str() != "--")
-            .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('i'))
+    match args.split_first() {
+        Some((name, rest)) if name == "cp" => {
+            cli::parse::<cli::files::Cp>(rest).is_ok_and(|cp| cp.interactive)
+        }
+        Some((name, rest)) if name == "mv" => {
+            cli::parse::<cli::files::Mv>(rest).is_ok_and(|mv| mv.interactive)
+        }
+        _ => false,
+    }
+}
+/// `args`, a command line clap accepts, as web/app.js reads it for the commands it runs itself,
+/// with their dialogs: as clap read them, options before operands and -- gone (sudo -ubob is
+/// sudo -u bob, vim -- f is vim f). Other commands go as typed, for the server to read.
+fn spelled(args: &[String]) -> Result<Vec<String>, String> {
+    use cli::{accounts, files, terminal};
+    let Some((name, rest)) = args.split_first() else {
+        return Ok(Vec::new());
+    };
+    let mut out = vec![name.clone()];
+    let mut option = |on: bool, option: &str, value: Option<String>| {
+        if on || value.is_some() {
+            out.push(option.into());
+        }
+        out.extend(value);
+    };
+    match name.as_str() {
+        "sudo" => {
+            let sudo = cli::parse::<accounts::Sudo>(rest)?;
+            option(false, "-u", sudo.user);
+            option(sudo.forget, "-k", None);
+            out.extend(spelled(&sudo.command)?);
+        }
+        "su" => out.extend(cli::parse::<accounts::Su>(rest)?.operands),
+        "login" => out.extend(cli::parse::<accounts::Login>(rest)?.user),
+        "passwd" => {
+            let passwd = cli::parse::<accounts::Passwd>(rest)?;
+            option(passwd.force, "--force", None);
+            out.extend(passwd.user);
+        }
+        // Signed out, app.js makes the account; signed in, the server, which reads it again.
+        "useradd" => {
+            let useradd = cli::parse::<accounts::Useradd>(rest)?;
+            option(useradd.force, "--force", None);
+            option(useradd.create_home, "-m", None);
+            option(false, "-d", useradd.home);
+            option(false, "-g", useradd.group);
+            option(false, "-G", useradd.groups);
+            if useradd.name.starts_with('-') {
+                out.push("--".into());
+            }
+            out.push(useradd.name);
+        }
+        "vim" => out.push(cli::parse::<files::Vim>(rest)?.file),
+        "man" => out.extend(cli::parse::<terminal::Man>(rest)?.command),
+        _ => out.extend(rest.iter().cloned()),
+    }
+    Ok(out)
 }
 /// A listing as text, as ls writes into a pipe: one name a line.
 fn listing_text(entries: &[Entry], long: bool) -> String {
@@ -347,6 +344,9 @@ impl Shell {
     /// Ask the server, through web/app.js, which handles sudo and the commands that need
     /// dialogs.
     async fn call(self, args: &[String]) -> Result<Value, String> {
+        // What clap would refuse goes no further, whether app.js or the server runs it.
+        cli::check(args)?;
+        let args = &spelled(args)?;
         let value = JsFuture::from(account_command(
             serde_wasm_bindgen::to_value(args).map_err(|e| e.to_string())?,
             &self.cwd.get_untracked(),
@@ -493,12 +493,13 @@ impl Shell {
         }
         decisions
     }
-    /// The jobs and unfinished uploads of this account, or `jobs cancel ID`.
-    async fn jobs(self, args: &[String]) -> Result<Output, String> {
+    /// The jobs and unfinished uploads of this account, or, given the ID of `jobs cancel ID`,
+    /// cancel that one.
+    async fn jobs(self, cancel: Option<&str>) -> Result<Output, String> {
         let value = request("/api/jobs", "GET").await?;
         let jobs = value["jobs"].as_array().cloned().unwrap_or_default();
         let uploads = value["uploads"].as_array().cloned().unwrap_or_default();
-        match args.get(1).map(String::as_str) {
+        match cancel {
             None => {
                 let mut text = String::new();
                 for job in &jobs {
@@ -532,8 +533,7 @@ impl Shell {
                 }
                 Ok(Output::text(text))
             }
-            Some("cancel") if args.len() == 3 => {
-                let wanted = args[2].as_str();
+            Some(wanted) => {
                 let starts = |v: &Value| v["id"].as_str().is_some_and(|id| id.starts_with(wanted));
                 if let Some(job) = jobs.iter().find(|j| starts(j)) {
                     let id = job["id"].as_str().unwrap_or_default();
@@ -551,7 +551,6 @@ impl Shell {
                     Err(format!("jobs: no job or upload {wanted}"))
                 }
             }
-            _ => Err("Usage: jobs [cancel ID]".into()),
         }
     }
     /// Run commands on the server, a batch a request, each in its own transaction.
@@ -613,7 +612,7 @@ impl Shell {
         if BATCHED.contains(&first[0].as_str())
             && commands
                 .iter()
-                .all(|c| c[0] == first[0] && !wants_help(c) && !asks(c))
+                .all(|c| c[0] == first[0] && !cli::wants_help(c) && !asks(c))
         {
             return self.batch(commands, trace).await;
         }
@@ -703,51 +702,22 @@ impl Shell {
         Ok(out)
     }
     async fn xargs(self, args: &[String], stdin: Option<String>) -> Result<Output, String> {
-        let mut delimiter = Delimiter::Blank;
-        let (mut most, mut replace, mut skip_empty, mut trace) = (XARGS_MAX, None, false, false);
-        let mut i = 1;
-        while i < args.len() && args[i].starts_with('-') {
-            let value = |i: usize| {
-                args.get(i + 1)
-                    .cloned()
-                    .ok_or_else(|| format!("xargs: {} needs a value", args[i]))
-            };
-            match args[i].as_str() {
-                "--" => {
-                    i += 1;
-                    break;
-                }
-                "-0" | "--null" => delimiter = Delimiter::Char('\0'),
-                "-r" | "--no-run-if-empty" => skip_empty = true,
-                "-t" | "--verbose" => trace = true,
-                "-d" => {
-                    delimiter = Delimiter::Char(parse_delimiter(&value(i)?)?);
-                    i += 1;
-                }
-                "-n" => {
-                    let n = value(i)?;
-                    most = n
-                        .parse()
-                        .ok()
-                        .filter(|n| *n > 0)
-                        .ok_or_else(|| format!("xargs: invalid number {n}"))?;
-                    i += 1;
-                }
-                "-I" => {
-                    replace = Some(value(i)?);
-                    delimiter = Delimiter::Line;
-                    i += 1;
-                }
-                other => {
-                    return Err(format!("xargs: unsupported option {other}; see man xargs"));
-                }
-            }
-            i += 1;
+        let xargs = cli::parse::<cli::text::Xargs>(&args[1..])?;
+        let mut delimiter = match (&xargs.delimiter, xargs.null) {
+            (Some(d), _) => Delimiter::Char(parse_delimiter(d)?),
+            (None, true) => Delimiter::Char('\0'),
+            (None, false) => Delimiter::Blank,
+        };
+        let most = xargs.max_args.map_or(XARGS_MAX, |n| n as usize);
+        let replace = xargs.replace;
+        if replace.is_some() {
+            delimiter = Delimiter::Line;
         }
-        let command: Vec<String> = if i < args.len() {
-            args[i..].to_vec()
-        } else {
+        let (skip_empty, trace) = (xargs.no_run_if_empty, xargs.verbose);
+        let command: Vec<String> = if xargs.command.is_empty() {
             vec!["echo".into()]
+        } else {
+            xargs.command
         };
         let items = grammar::xargs_items(&stdin.unwrap_or_default(), delimiter)?;
         if items.is_empty() && (skip_empty || replace.is_some()) {
@@ -785,11 +755,8 @@ impl Shell {
         let Some((all, template)) = search.exec else {
             return self.manage(args, true).await;
         };
-        let cut = args
-            .iter()
-            .position(|a| ["-x", "-X", "--exec", "--exec-batch"].contains(&a.as_str()))
-            .unwrap_or(args.len());
-        let value = self.call(&args[..cut]).await?;
+        // The server searches as the line says, leaving the command to this.
+        let value = self.call(args).await?;
         let found = self.output(&value, true)?;
         let results: Vec<String> =
             serde_json::from_value(value["results"].clone()).unwrap_or_default();
@@ -827,10 +794,15 @@ impl Shell {
     async fn interactive(self, args: &[String]) -> Result<Output, String> {
         let sudo = usize::from(args[0] == "sudo");
         let command = args[sudo].clone();
-        // The options again, for each replacement, less -i, which may come with others, as in -ri.
+        // The options again, for each replacement, long ones too (--archive), less -i, which may
+        // come with others, as in -ri; the -f after them overrides any -n.
         let mut options = Vec::new();
         for arg in args[sudo + 1..].iter().take_while(|a| a.as_str() != "--") {
-            if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 1 {
+            if arg.starts_with("--") {
+                if arg != "--interactive" {
+                    options.push(arg.clone());
+                }
+            } else if arg.starts_with('-') && arg.len() > 1 {
                 let rest: String = arg[1..].chars().filter(|c| *c != 'i').collect();
                 if !rest.is_empty() {
                     options.push(format!("-{rest}"));
@@ -884,157 +856,28 @@ impl Shell {
         piped: bool,
     ) -> LocalBoxFuture<'static, Result<Output, String>> {
         async move {
-            let Some(cmd) = args.first().cloned() else {
+            let Some(name) = args.first().cloned() else {
                 return Ok(Output::default());
             };
-            if wants_help(&args) {
-                return self.manage(&args, piped).await;
+            // Help is the tab's, made from the command's definition: nothing is asked of the
+            // server. Under sudo, it is the command sudo runs that is asked about.
+            if cli::wants_help(&args) {
+                let asked = match args.get(1) {
+                    Some(command) if name == "sudo" && !command.starts_with('-') => command,
+                    _ => &name,
+                };
+                if let Some(help) = cli::help(asked) {
+                    return Ok(Output::text(help + "\n"));
+                }
             }
-            let several = args.len() > 2 || args.get(1).is_some_and(|s| s.starts_with('-'));
-            match cmd.as_str() {
-                "echo" => {
-                    let newline = args.get(1).map(String::as_str) != Some("-n");
-                    let words = &args[if newline { 1 } else { 2 }.min(args.len())..];
-                    Ok(Output::text(format!(
-                        "{}{}",
-                        words.join(" "),
-                        if newline { "\n" } else { "" }
-                    )))
-                }
-                c if text::FILTERS.contains(&c) => self.filter(&args, stdin).await,
-                "xargs" => self.xargs(&args, stdin).await,
-                "fd" if args
-                    .iter()
-                    .any(|a| ["-x", "-X", "--exec", "--exec-batch"].contains(&a.as_str())) =>
-                {
-                    self.fd_exec(&args).await
-                }
-                _ if asks(&args) => self.interactive(&args).await,
-                "jobs" => self.jobs(&args).await,
-                c if SERVER.contains(&c) || (matches!(c, "ls" | "mkdir") && several) => {
-                    self.manage(&args, piped).await
-                }
-                _ => self.builtin(&args, piped).await,
+            match commands::find(&name) {
+                Some(command) => command.run(self, args, stdin, piped).await,
+                // What the server runs, or web/app.js with its dialogs.
+                None if cli::definition(&name).is_some() => self.manage(&args, piped).await,
+                None => Err(format!("Unknown command: {name}. Enter help for commands.")),
             }
         }
         .boxed_local()
-    }
-    /// The commands the page runs itself.
-    async fn builtin(self, args: &[String], piped: bool) -> Result<Output, String> {
-        let cmd = args[0].as_str();
-        if args.len() > 2 {
-            return Err("Only one path is accepted; quote paths containing spaces".into());
-        }
-        let arg = args.get(1).map(String::as_str);
-        let path = self.path(arg.unwrap_or("."))?;
-        match cmd {
-            "pwd" => Ok(Output::text(format!("{}\n", self.cwd.get_untracked()))),
-            "clear" => {
-                self.lines.set(Vec::new());
-                Ok(Output::default())
-            }
-            "ls" => {
-                let entries = listing(&path).await?;
-                if path == self.cwd.get_untracked() {
-                    self.entries.set(entries.clone());
-                }
-                if piped {
-                    Ok(Output::text(listing_text(&entries, false)))
-                } else if entries.is_empty() {
-                    Ok(Output::text("(empty directory)"))
-                } else {
-                    Ok(Output {
-                        view: Some(LogLine::Listing {
-                            entries,
-                            long: false,
-                        }),
-                        ..Default::default()
-                    })
-                }
-            }
-            "cd" => {
-                let path = if arg.is_none() {
-                    self.account.home.get_untracked()
-                } else {
-                    path
-                };
-                request(&format!("{}&enter=true", endpoint("stat", &path)), "GET").await?;
-                let result = listing(&path).await;
-                self.cwd.set(path.clone());
-                set_directory(&path);
-                match result {
-                    Ok(entries) => {
-                        self.entries.set(entries);
-                        self.directory_error.set(String::new());
-                    }
-                    Err(error) => {
-                        self.entries.set(Vec::new());
-                        self.directory_error.set(error);
-                    }
-                }
-                Ok(Output::default())
-            }
-            "mkdir" => {
-                if arg.is_none() {
-                    return Err("Usage: mkdir [-p] PATH...".into());
-                }
-                authorize(terminal_worker_core::parent(&path)).await?;
-                request(&endpoint("mkdir", &path), "POST").await?;
-                self.refresh().await?;
-                Ok(Output::text(format!("Created {path}")))
-            }
-            "open" => {
-                if arg.is_none() {
-                    return Err("Usage: open <FILE>".into());
-                }
-                let entry: Entry =
-                    serde_json::from_value(request(&endpoint("stat", &path), "GET").await?)
-                        .map_err(|e| e.to_string())?;
-                if entry.directory {
-                    return Err("This is a directory; use cd".into());
-                }
-                JsFuture::from(open_file(&path, &entry.kind))
-                    .await
-                    .map_err(|e| e.as_string().unwrap_or_else(|| "Open failed".into()))?;
-                Ok(Output::default())
-            }
-            "upload" => {
-                let files = self.chosen.try_update_value(Option::take).flatten();
-                let files = JsFuture::from(files.unwrap_or_else(choose_files))
-                    .await
-                    .map_err(js_message)?;
-                if js_sys::Array::from(&files).length() == 0 {
-                    return Ok(Output::default());
-                }
-                // A line that follows the upload, here rather than over the page.
-                let line = RwSignal::new(String::from("↑ starting"));
-                self.push(LogLine::Live(line));
-                let progress = Closure::<dyn Fn(String)>::new(move |text: String| line.set(text));
-                self.uploading.set(true);
-                let result = JsFuture::from(upload_files(
-                    &files,
-                    &path,
-                    progress.as_ref().unchecked_ref(),
-                ))
-                .await;
-                self.uploading.set(false);
-                drop(progress);
-                let results: Vec<String> = result
-                    .map_err(js_message)
-                    .inspect_err(|e| line.set(format!("✕ {e}")))?
-                    .dyn_into::<js_sys::Array>()
-                    .map(|a| a.iter().filter_map(|r| r.as_string()).collect())
-                    .unwrap_or_default();
-                let failed = results.iter().any(|r| r.starts_with('✕'));
-                line.set(results.join("\n"));
-                self.refresh().await?;
-                Ok(Output {
-                    failed,
-                    ..Output::default()
-                })
-            }
-            _ => Err(format!("Unknown command: {cmd}. Enter help for commands.")),
-        }
     }
 
     /// Run the pipeline `command`, typed into this tab.
@@ -1424,5 +1267,29 @@ impl Shell {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spelled;
+
+    #[test]
+    fn app_js_reads_its_commands_as_clap_read_them() {
+        let line = |text: &str| text.split(' ').map(String::from).collect::<Vec<_>>();
+        let spell = |text: &str| spelled(&line(text)).unwrap().join(" ");
+        assert_eq!(spell("sudo -ubob"), "sudo -u bob");
+        assert_eq!(spell("sudo -k"), "sudo -k");
+        assert_eq!(spell("vim -- -notes.md"), "vim -notes.md");
+        assert_eq!(spell("useradd -- ann"), "useradd ann");
+        assert_eq!(
+            spell("sudo useradd -m -G team,web -- -odd"),
+            "sudo useradd -m -G team,web -- -odd"
+        );
+        assert_eq!(spell("passwd bob --force"), "passwd --force bob");
+        assert_eq!(spell("su - bob"), "su - bob");
+        assert_eq!(spell("sudo passwd -- bob"), "sudo passwd bob");
+        // The server's commands go as typed.
+        assert_eq!(spell("sudo rm -rf -- -h"), "sudo rm -rf -- -h");
     }
 }

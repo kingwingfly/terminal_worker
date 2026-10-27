@@ -46,155 +46,127 @@ pub enum Kind {
     },
 }
 
-/// The options and operands of `args`, as short flags from `flags`, which may be combined
-/// (`-in`), and options with a value from `values` (`-n 5`, `-n5`). `--` ends options.
-fn options(
-    command: &str,
-    args: &[String],
-    flags: &str,
-    values: &str,
-) -> Result<(Vec<(char, Option<String>)>, Vec<String>), String> {
-    let mut found = Vec::new();
-    let mut operands = Vec::new();
-    let mut args = args.iter();
-    let mut end = false;
-    while let Some(arg) = args.next() {
-        if end || arg == "-" || !arg.starts_with('-') {
-            operands.push(arg.clone());
-            continue;
-        }
-        if arg == "--" {
-            end = true;
-            continue;
-        }
-        let mut letters = arg[1..].char_indices();
-        while let Some((at, letter)) = letters.next() {
-            if values.contains(letter) {
-                let rest = &arg[1 + at + letter.len_utf8()..];
-                let value = if rest.is_empty() {
-                    args.next()
-                        .cloned()
-                        .ok_or_else(|| format!("{command}: -{letter} needs a value"))?
-                } else {
-                    rest.to_string()
-                };
-                found.push((letter, Some(value)));
-                break;
-            } else if flags.contains(letter) {
-                found.push((letter, None));
-            } else if command != "grep" && letter.is_ascii_digit() && values.contains('n') {
-                // head -5 is head -n 5.
-                found.push(('n', Some(arg[1..].to_string())));
-                break;
-            } else {
-                return Err(format!(
-                    "{command}: unsupported option -{letter}; see man {command}"
-                ));
-            }
-        }
-    }
-    Ok((found, operands))
-}
 fn count(command: &str, value: &str) -> Result<usize, String> {
     value
         .parse()
         .map_err(|_| format!("{command}: invalid number of lines: {value}"))
 }
+/// head's or tail's -n: how many lines (10), and its sign, which counts from the other end:
+/// head -n -N, tail -n +N.
+fn lines(command: &str, value: Option<&str>) -> Result<(usize, Option<char>), String> {
+    let Some(value) = value else {
+        return Ok((10, None));
+    };
+    match value.strip_prefix(['+', '-']) {
+        Some(digits) => Ok((count(command, digits)?, value.chars().next())),
+        None => Ok((count(command, value)?, None)),
+    }
+}
 
-/// Parse the filter `command` with `args`.
+/// Parse the filter `command` with `args`, as its definition in [`crate::cli::text`] reads them.
 pub fn parse(command: &str, args: &[String]) -> Result<Filter, String> {
-    let has = |found: &[(char, Option<String>)], c: char| found.iter().any(|(f, _)| *f == c);
+    use crate::cli::{parse, text as cli};
     let (kind, files) = match command {
-        "cat" => {
-            let (_, files) = options(command, args, "", "")?;
-            (Kind::Cat, files)
-        }
+        "cat" => (Kind::Cat, parse::<cli::Cat>(args)?.files),
         "head" | "tail" => {
-            let (found, files) = options(command, args, "", "n")?;
-            // A sign counts from the other end: head -n -N, tail -n +N.
-            let (lines, sign) = match found.last() {
-                Some((_, Some(value))) => match value.strip_prefix(['+', '-']) {
-                    Some(digits) => (count(command, digits)?, value.chars().next()),
-                    None => (count(command, value)?, None),
-                },
-                _ => (10, None),
-            };
-            (
-                if command == "head" {
-                    Kind::Head {
-                        lines,
-                        all_but: sign == Some('-'),
+            // head -5 is head -n 5, as it always was.
+            // A -N that is -n's value (head -n -5, head --lines -5) is the value.
+            let mut spelled = Vec::new();
+            let mut ended = false;
+            for (i, arg) in args.iter().enumerate() {
+                match arg.strip_prefix('-') {
+                    Some(digits)
+                        if !ended
+                            && !digits.is_empty()
+                            && digits.bytes().all(|b| b.is_ascii_digit())
+                            && args
+                                .get(i.wrapping_sub(1))
+                                .is_none_or(|a| a != "-n" && a != "--lines") =>
+                    {
+                        spelled.extend(["-n".to_string(), digits.to_string()]);
                     }
-                } else {
-                    Kind::Tail {
-                        lines,
-                        from_start: sign == Some('+'),
+                    _ => {
+                        ended |= arg == "--";
+                        spelled.push(arg.clone());
                     }
-                },
-                files,
-            )
+                }
+            }
+            if command == "head" {
+                let head = parse::<cli::Head>(&spelled)?;
+                let (lines, sign) = lines(command, head.lines.as_deref())?;
+                let all_but = sign == Some('-');
+                (Kind::Head { lines, all_but }, head.files)
+            } else {
+                let tail = parse::<cli::Tail>(&spelled)?;
+                let (lines, sign) = lines(command, tail.lines.as_deref())?;
+                let from_start = sign == Some('+');
+                (Kind::Tail { lines, from_start }, tail.files)
+            }
         }
         "grep" => {
-            let (found, mut operands) = options(command, args, "ivncFE", "e")?;
-            let pattern = match found.iter().find(|(f, _)| *f == 'e') {
-                Some((_, Some(pattern))) => pattern.clone(),
-                _ if operands.is_empty() => {
-                    return Err("Usage: grep [-i] [-v] [-n] [-c] [-F] PATTERN [FILE...]".into());
-                }
-                _ => operands.remove(0),
-            };
-            let source = if has(&found, 'F') {
-                regex::escape(&pattern)
+            let grep = parse::<cli::Grep>(args)?;
+            let mut operands = grep.operands;
+            let patterns = if !grep.patterns.is_empty() {
+                grep.patterns
+            } else if operands.is_empty() {
+                return Err("grep: no PATTERN given; grep -h shows how to use it".into());
             } else {
-                pattern
+                vec![operands.remove(0)]
             };
+            // Several -e: a line matching any of them, as GNU grep selects.
+            let source = patterns
+                .iter()
+                .map(|pattern| {
+                    if grep.fixed {
+                        regex::escape(pattern)
+                    } else {
+                        format!("(?:{pattern})")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("|");
             let pattern = RegexBuilder::new(&source)
-                .case_insensitive(has(&found, 'i'))
+                .case_insensitive(grep.ignore_case)
                 .build()
                 .map_err(|e| format!("grep: invalid pattern: {e}"))?;
             (
                 Kind::Grep {
                     pattern,
-                    invert: has(&found, 'v'),
-                    number: has(&found, 'n'),
-                    count: has(&found, 'c'),
+                    invert: grep.invert,
+                    number: grep.number,
+                    count: grep.count,
                 },
                 operands,
             )
         }
         "wc" => {
-            let (found, files) = options(command, args, "lwc", "")?;
-            let any = !found.is_empty();
+            let wc = parse::<cli::Wc>(args)?;
+            let any = wc.lines || wc.words || wc.bytes;
             (
                 Kind::Wc {
-                    lines: !any || has(&found, 'l'),
-                    words: !any || has(&found, 'w'),
-                    bytes: !any || has(&found, 'c'),
+                    lines: !any || wc.lines,
+                    words: !any || wc.words,
+                    bytes: !any || wc.bytes,
                 },
-                files,
+                wc.files,
             )
         }
         "sort" => {
-            let (found, files) = options(command, args, "rnu", "")?;
+            let sort = parse::<cli::Sort>(args)?;
             (
                 Kind::Sort {
-                    reverse: has(&found, 'r'),
-                    numeric: has(&found, 'n'),
-                    unique: has(&found, 'u'),
+                    reverse: sort.reverse,
+                    numeric: sort.numeric,
+                    unique: sort.unique,
                 },
-                files,
+                sort.files,
             )
         }
         "uniq" => {
-            let (found, files) = options(command, args, "c", "")?;
-            if files.len() > 1 {
-                return Err("uniq: reads one input; write its output with a pipe".into());
-            }
+            let uniq = parse::<cli::Uniq>(args)?;
             (
-                Kind::Uniq {
-                    count: has(&found, 'c'),
-                },
-                files,
+                Kind::Uniq { count: uniq.count },
+                uniq.file.into_iter().collect(),
             )
         }
         _ => return Err(format!("{command} is not a filter")),
@@ -423,6 +395,10 @@ mod tests {
         );
         assert_eq!(run("head", &["-n", "-9"], &[("-", LINES)]).0, "");
         assert_eq!(run("head", &["-n", "+1"], &[("-", LINES)]).0, "beta\n");
+        assert_eq!(
+            run("head", &["--lines", "-4"], &[("-", LINES)]).0,
+            "beta\nalpha\n"
+        );
         assert!(parse("tail", &["-n".into(), "+x".into()]).is_err());
         assert_eq!(
             run("head", &["-n", "1"], &[("a", "1\n2\n"), ("b", "3")]).0,
@@ -457,6 +433,20 @@ mod tests {
             )
             .0,
             "x.txt:spéctrum 9\n"
+        );
+        // Several -e select a line matching any.
+        assert_eq!(
+            run("grep", &["-e", "beta", "-e", "Gamma"], &[("-", LINES)]).0,
+            "beta\nGamma\n"
+        );
+        assert_eq!(
+            run(
+                "grep",
+                &["-F", "-e", "a.b", "-e", "c|d"],
+                &[("-", "a.b\naxb\nc|d\nc\n")]
+            )
+            .0,
+            "a.b\nc|d\n"
         );
         assert!(parse("grep", &[]).is_err());
         assert!(parse("grep", &["(".into()]).is_err());

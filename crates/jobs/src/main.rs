@@ -1,4 +1,4 @@
-//! The archiver's HTTP server, in its container, for the ArchiveRunner Durable Object, which
+//! The job container's HTTP server, for the JobRunner Durable Object, which
 //! sends it one job's files and takes back what it makes, a request at a time:
 //!
 //! - `PUT /archive`: the archive to read; `POST /list[?unpack=1]`: its members, and their
@@ -17,9 +17,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use terminal_worker_archiver::faststart::{Outcome, faststart};
-use terminal_worker_archiver::{Input, VERSION, build, chunk_hashes, list};
 use terminal_worker_core::archive::Format;
+use terminal_worker_jobs::faststart::{Outcome, faststart};
+use terminal_worker_jobs::{Input, VERSION, build, chunk_hashes, list};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 type Reply = Response<Box<dyn Read + Send>>;
@@ -39,11 +39,11 @@ fn error(status: u16, message: impl std::fmt::Display) -> Reply {
     json_reply(status, json!({"error": message.to_string()}))
 }
 
-struct Archiver {
+struct Jobs {
     root: PathBuf,
     job: Option<String>,
 }
-impl Archiver {
+impl Jobs {
     fn dir(&self) -> PathBuf {
         self.root.join("job")
     }
@@ -272,14 +272,13 @@ fn send(path: &Path, offset: u64, length: Option<u64>) -> Reply {
 
 fn main() {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".into());
-    let root =
-        PathBuf::from(std::env::var("ARCHIVER_DATA").unwrap_or_else(|_| "/tmp/archiver".into()));
+    let root = PathBuf::from(std::env::var("JOBS_DATA").unwrap_or_else(|_| "/tmp/jobs".into()));
     let server = Server::http(format!("0.0.0.0:{port}")).expect("listen");
-    let mut archiver = Archiver { root, job: None };
-    eprintln!("archiver {VERSION} listening on {port}");
+    let mut jobs = Jobs { root, job: None };
+    eprintln!("jobs {VERSION} listening on {port}");
     // One job at a time, a request at a time: the runner sends them in order.
     for mut request in server.incoming_requests() {
-        let reply = archiver.handle(&mut request);
+        let reply = jobs.handle(&mut request);
         let _ = request.respond(reply);
     }
 }

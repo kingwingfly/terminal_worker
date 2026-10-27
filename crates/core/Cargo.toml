@@ -7,3 +7,6 @@ edition = "2024"
 serde.workspace = true
 # grep and fd patterns; Unicode-aware case folding, since paths are often not ASCII.
 regex = { version = "1.13", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
+# Every command's arguments, parsed as their GNU namesakes' are, and their -h and man pages, made
+# from the same definitions. No colour: errors and help go to the terminal as plain text.
+clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }

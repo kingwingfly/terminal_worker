@@ -22,8 +22,6 @@ pub struct Find {
     pub exec: Option<(bool, Vec<String>)>,
 }
 
-const USAGE: &str = "Usage: fd [-H] [-t f|d|l|x] [-e EXT] [-d N] [-g|-F] [-i|-s] [-p] [-a] [-0] [PATTERN] [PATH...] [-x|-X COMMAND...]";
-
 /// A glob as a regular expression matching all of a name: `*` and `?` within a name, `**`
 /// across directories.
 fn glob(pattern: &str) -> String {
@@ -61,81 +59,51 @@ fn glob(pattern: &str) -> String {
     out
 }
 
-/// Parse `fd`'s arguments.
+/// Parse `fd`'s arguments, as its definition in [`crate::cli::files`] reads them.
 pub fn parse(args: &[String]) -> Result<Find, String> {
-    let mut find = Find::default();
-    let (mut glob_mode, mut fixed, mut case) = (false, false, None);
-    let mut operands = Vec::new();
-    let mut args = args.iter();
-    let value = |args: &mut std::slice::Iter<String>, option: &str| {
-        args.next()
-            .cloned()
-            .ok_or_else(|| format!("fd: {option} needs a value"))
+    let fd = crate::cli::parse::<crate::cli::files::Fd>(args)?;
+    let mut find = Find {
+        full_path: fd.full_path,
+        hidden: fd.hidden,
+        max_depth: fd.max_depth,
+        absolute: fd.absolute,
+        null: fd.print0,
+        ..Find::default()
     };
-    let mut end = false;
-    while let Some(arg) = args.next() {
-        if end || !arg.starts_with('-') || arg == "-" {
-            operands.push(arg.clone());
-            continue;
-        }
-        match arg.as_str() {
-            "--" => end = true,
-            "-H" | "--hidden" => find.hidden = true,
-            "-g" | "--glob" => glob_mode = true,
-            "-F" | "--fixed-strings" => fixed = true,
-            "-i" | "--ignore-case" => case = Some(false),
-            "-s" | "--case-sensitive" => case = Some(true),
-            "-p" | "--full-path" => find.full_path = true,
-            "-a" | "--absolute-path" => find.absolute = true,
-            "-0" | "--print0" => find.null = true,
-            "-t" | "--type" => {
-                let kind = value(&mut args, arg)?;
-                match kind.as_str() {
-                    "f" | "file" => find.types.push('f'),
-                    "d" | "directory" => find.types.push('d'),
-                    "l" | "symlink" => find.types.push('l'),
-                    "x" | "executable" => find.types.push('x'),
-                    _ => return Err(format!("fd: unsupported type {kind}; use f, d, l or x")),
-                }
-            }
-            "-e" | "--extension" => find.extensions.push(
-                value(&mut args, arg)?
-                    .trim_start_matches('.')
-                    .to_lowercase(),
-            ),
-            "-d" | "--max-depth" => {
-                let depth = value(&mut args, arg)?;
-                find.max_depth = Some(
-                    depth
-                        .parse()
-                        .map_err(|_| format!("fd: invalid depth {depth}"))?,
-                );
-            }
-            "-x" | "--exec" | "-X" | "--exec-batch" => {
-                let template: Vec<String> = args
-                    .by_ref()
-                    .take_while(|a| a.as_str() != ";")
-                    .cloned()
-                    .collect();
-                if template.is_empty() {
-                    return Err(format!("fd: {arg} needs a command"));
-                }
-                find.exec = Some((matches!(arg.as_str(), "-X" | "--exec-batch"), template));
-            }
-            _ => return Err(format!("fd: unsupported option {arg}\n{USAGE}")),
-        }
+    for kind in &fd.types {
+        find.types.push(match kind.as_str() {
+            "f" | "file" => 'f',
+            "d" | "directory" => 'd',
+            "l" | "symlink" => 'l',
+            _ => 'x',
+        });
     }
-    let mut operands = operands.into_iter();
-    if let Some(pattern) = operands.next().filter(|p| !p.is_empty()) {
-        let source = if glob_mode {
+    find.extensions = fd
+        .extensions
+        .iter()
+        .map(|e| e.trim_start_matches('.').to_lowercase())
+        .collect();
+    find.exec = match (fd.exec, fd.exec_batch) {
+        (Some(each), _) => Some((false, each)),
+        (_, Some(all)) => Some((true, all)),
+        _ => None,
+    };
+    if let Some(pattern) = fd.pattern.filter(|p| !p.is_empty()) {
+        let source = if fd.glob {
             glob(&pattern)
-        } else if fixed {
+        } else if fd.fixed {
             regex::escape(&pattern)
         } else {
             pattern.clone()
         };
         // Smart case: a pattern without capitals ignores case.
-        let sensitive = case.unwrap_or_else(|| pattern.chars().any(char::is_uppercase));
+        let sensitive = if fd.case_sensitive {
+            true
+        } else if fd.ignore_case {
+            false
+        } else {
+            pattern.chars().any(char::is_uppercase)
+        };
         find.pattern = Some(
             RegexBuilder::new(&source)
                 .case_insensitive(!sensitive)
@@ -143,7 +111,7 @@ pub fn parse(args: &[String]) -> Result<Find, String> {
                 .map_err(|e| format!("fd: invalid pattern: {e}"))?,
         );
     }
-    find.roots = operands.collect();
+    find.roots = fd.paths;
     Ok(find)
 }
 

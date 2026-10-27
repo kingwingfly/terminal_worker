@@ -1,6 +1,8 @@
 //! zip, unzip and tar: what each is asked to do, and where an archive's members may go. The
-//! archives themselves are read and written in a container (crates/archiver).
+//! archives themselves are read and written in a container (crates/jobs).
 use serde::{Deserialize, Serialize};
+
+use crate::cli;
 
 use crate::resolve;
 
@@ -74,23 +76,121 @@ pub enum Job {
 
 /// `faststart [--] FILE`
 pub fn faststart_args(args: &[String]) -> Result<Job, String> {
-    let mut operands = Vec::new();
-    let mut end = false;
-    for arg in args {
-        match arg.as_str() {
-            "--" if !end => end = true,
-            flag if !end && flag.starts_with('-') && flag.len() > 1 => {
-                return Err(format!(
-                    "faststart: unsupported option {flag}; see man faststart"
-                ));
+    let faststart = cli::parse::<cli::archives::Faststart>(args)?;
+    Ok(Job::Faststart {
+        file: faststart.file,
+    })
+}
+
+/// zip's arguments: `zip [-r] [-y] [-q] [--] ARCHIVE PATH...`. As Info-ZIP does, a name without
+/// an extension gets .zip.
+pub fn zip_args(args: &[String]) -> Result<Job, String> {
+    let zip = cli::parse::<cli::archives::Zip>(args)?;
+    let mut archive = zip.archive;
+    if !archive.rsplit('/').next().unwrap_or_default().contains('.') {
+        archive.push_str(".zip");
+    }
+    Ok(Job::Create {
+        format: Format::Zip,
+        archive,
+        paths: zip.paths,
+        recursive: zip.recursive,
+        verbose: !zip.quiet,
+        directory: None,
+        links: zip.links,
+    })
+}
+
+/// unzip's arguments: `unzip [-l] [-o|-n] [-q] [-d DIR] [--] ARCHIVE [MEMBER...]`.
+pub fn unzip_args(args: &[String]) -> Result<Job, String> {
+    let unzip = cli::parse::<cli::archives::Unzip>(args)?;
+    Ok(if unzip.list {
+        Job::List {
+            zip: true,
+            archive: unzip.archive,
+            verbose: true,
+        }
+    } else {
+        Job::Extract {
+            zip: true,
+            archive: unzip.archive,
+            directory: unzip.directory,
+            existing: if unzip.overwrite {
+                Existing::Replace
+            } else if unzip.never {
+                Existing::Skip
+            } else {
+                Existing::Ask
+            },
+            members: unzip.members,
+            verbose: !unzip.quiet,
+        }
+    })
+}
+
+/// tar's arguments, as GNU tar takes them: bundled (`-czf a.tgz`), long (`--file=a.tgz`), or old
+/// style (`czf a.tgz`), whose options' values follow it in order (`cfC a.tar dir`).
+pub fn tar_args(args: &[String]) -> Result<Job, String> {
+    let mut spelled = Vec::new();
+    let mut rest = args.iter();
+    if let Some(first) = args
+        .first()
+        .filter(|a| !a.starts_with('-') && !a.is_empty())
+    {
+        rest.next();
+        for letter in first.chars() {
+            spelled.push(format!("-{letter}"));
+            if matches!(letter, 'f' | 'C') {
+                spelled.push(
+                    rest.next()
+                        .cloned()
+                        .ok_or(format!("tar: -{letter} needs a value"))?,
+                );
             }
-            _ => operands.push(arg.clone()),
         }
     }
-    match operands.as_slice() {
-        [file] => Ok(Job::Faststart { file: file.clone() }),
-        _ => Err("Usage: faststart [--] FILE (an MP4, M4V, MOV or M4A file, which it replaces with itself made faststart)".into()),
+    spelled.extend(rest.cloned());
+    let tar = cli::parse::<cli::archives::Tar>(&spelled)?;
+    let archive = tar.file.ok_or_else(|| {
+        "tar: name the archive with -f; this terminal has no tape drive".to_string()
+    })?;
+    if tar.create {
+        if tar.paths.is_empty() {
+            return Err("tar: refusing to create an empty archive; name what to put in it".into());
+        }
+        // -C is where the paths are found, and what their names are relative to, as GNU tar
+        // works in it.
+        return Ok(Job::Create {
+            format: tar_format(&archive, tar.gzip),
+            archive,
+            paths: tar.paths,
+            recursive: true,
+            verbose: tar.verbose,
+            directory: tar.directory,
+            links: !tar.dereference,
+        });
     }
+    if tar.extract {
+        return Ok(Job::Extract {
+            zip: false,
+            archive,
+            directory: tar.directory,
+            existing: if tar.keep_old_files {
+                Existing::Keep
+            } else if tar.skip_old_files {
+                Existing::Skip
+            } else {
+                Existing::Replace
+            },
+            members: tar.paths,
+            verbose: tar.verbose,
+        });
+    }
+    Ok(Job::List {
+        zip: false,
+        archive,
+        verbose: tar.verbose,
+    })
 }
 
 /// The format a new archive named `name` gets: gzipped tar for .tgz and .tar.gz names.
@@ -102,223 +202,6 @@ fn tar_format(name: &str, gzip: bool) -> Format {
         Format::Tar
     }
 }
-
-/// `zip [-r] [-q] [-v] [--] ARCHIVE PATH...`
-pub fn zip_args(args: &[String]) -> Result<Job, String> {
-    let (mut recursive, mut verbose, mut links) = (false, true, false);
-    let mut operands = Vec::new();
-    let mut end = false;
-    for arg in args {
-        match arg.as_str() {
-            "--" if !end => end = true,
-            flags if !end && flags.starts_with('-') && flags.len() > 1 => {
-                for flag in flags[1..].chars() {
-                    match flag {
-                        'r' | 'R' => recursive = true,
-                        'y' => links = true,
-                        'q' => verbose = false,
-                        'v' => verbose = true,
-                        _ => return Err(format!("zip: unsupported option -{flag}; see man zip")),
-                    }
-                }
-            }
-            _ => operands.push(arg.clone()),
-        }
-    }
-    if operands.len() < 2 {
-        return Err("Usage: zip [-r] [-y] [-q] ARCHIVE.zip PATH...".into());
-    }
-    let mut archive = operands.remove(0);
-    // As Info-ZIP does, a name without an extension gets .zip.
-    if !archive.rsplit('/').next().unwrap_or_default().contains('.') {
-        archive.push_str(".zip");
-    }
-    Ok(Job::Create {
-        format: Format::Zip,
-        archive,
-        paths: operands,
-        recursive,
-        verbose,
-        directory: None,
-        links,
-    })
-}
-
-/// `unzip [-l] [-o|-n] [-q] [-d DIR] [--] ARCHIVE [MEMBER...]`
-pub fn unzip_args(args: &[String]) -> Result<Job, String> {
-    let (mut list, mut verbose, mut existing) = (false, true, Existing::Ask);
-    let mut directory = None;
-    let mut operands = Vec::new();
-    let mut args = args.iter();
-    let mut end = false;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--" if !end => end = true,
-            "-d" if !end => {
-                directory = Some(args.next().cloned().ok_or("unzip: -d needs a directory")?)
-            }
-            flags if !end && flags.starts_with('-') && flags.len() > 1 => {
-                for flag in flags[1..].chars() {
-                    match flag {
-                        'l' => list = true,
-                        'o' => existing = Existing::Replace,
-                        'n' => existing = Existing::Skip,
-                        'q' => verbose = false,
-                        _ => {
-                            return Err(format!(
-                                "unzip: unsupported option -{flag}; see man unzip"
-                            ));
-                        }
-                    }
-                }
-            }
-            _ => operands.push(arg.clone()),
-        }
-    }
-    if operands.is_empty() {
-        return Err("Usage: unzip [-l] [-o|-n] [-q] [-d DIR] ARCHIVE.zip [MEMBER...]".into());
-    }
-    let archive = operands.remove(0);
-    Ok(if list {
-        Job::List {
-            zip: true,
-            archive,
-            verbose: true,
-        }
-    } else {
-        Job::Extract {
-            zip: true,
-            archive,
-            directory,
-            existing,
-            members: operands,
-            verbose,
-        }
-    })
-}
-
-/// `tar -c|-x|-t [-z] [-v] -f ARCHIVE [-C DIR] [-k|--skip-old-files|--overwrite] [PATH...]`,
-/// with bundled flags (`-czf`) and old-style ones (`czf`), whose values follow in order.
-pub fn tar_args(args: &[String]) -> Result<Job, String> {
-    let mut mode = None;
-    let (mut gzip, mut verbose, mut existing) = (false, false, Existing::Replace);
-    let mut links = true;
-    let (mut file, mut directory) = (None, None);
-    let mut operands = Vec::new();
-    let mut rest: std::collections::VecDeque<String> = args.iter().cloned().collect();
-    let set_mode = |mode: &mut Option<char>, m: char| {
-        if mode.is_some_and(|old| old != m) {
-            return Err("tar: use one of -c, -x and -t".to_string());
-        }
-        *mode = Some(m);
-        Ok(())
-    };
-    let mut first = true;
-    let mut end = false;
-    while let Some(arg) = rest.pop_front() {
-        let old_style = first && !arg.starts_with('-') && !arg.is_empty();
-        first = false;
-        if end {
-            operands.push(arg);
-            continue;
-        }
-        if let Some(long) = arg.strip_prefix("--") {
-            let (name, value) = match long.split_once('=') {
-                Some((n, v)) => (n, Some(v.to_string())),
-                None => (long, None),
-            };
-            let mut value = || {
-                value
-                    .clone()
-                    .or_else(|| rest.pop_front())
-                    .ok_or(format!("tar: --{name} needs a value"))
-            };
-            match name {
-                "" => end = true,
-                "create" => set_mode(&mut mode, 'c')?,
-                "extract" | "get" => set_mode(&mut mode, 'x')?,
-                "list" => set_mode(&mut mode, 't')?,
-                "gzip" | "gunzip" | "ungzip" => gzip = true,
-                "verbose" => verbose = true,
-                "dereference" => links = false,
-                "keep-old-files" => existing = Existing::Keep,
-                "skip-old-files" => existing = Existing::Skip,
-                "overwrite" => existing = Existing::Replace,
-                "file" => file = Some(value()?),
-                "directory" => directory = Some(value()?),
-                _ => return Err(format!("tar: unsupported option --{name}; see man tar")),
-            }
-            continue;
-        }
-        let flags = match arg.strip_prefix('-') {
-            Some(flags) if !flags.is_empty() => flags.to_string(),
-            _ if old_style => arg.clone(),
-            _ => {
-                operands.push(arg);
-                continue;
-            }
-        };
-        for flag in flags.chars() {
-            match flag {
-                'c' | 'x' | 't' => set_mode(&mut mode, flag)?,
-                'z' => gzip = true,
-                'v' => verbose = true,
-                'h' => links = false,
-                'k' => existing = Existing::Keep,
-                'f' | 'C' => {
-                    let value = rest
-                        .pop_front()
-                        .ok_or(format!("tar: -{flag} needs a value"))?;
-                    if flag == 'f' {
-                        file = Some(value);
-                    } else {
-                        directory = Some(value);
-                    }
-                }
-                _ => return Err(format!("tar: unsupported option -{flag}; see man tar")),
-            }
-        }
-    }
-    let usage = "Usage: tar -c|-x|-t [-z] [-v] [-h] -f ARCHIVE [-C DIR] [PATH...]";
-    let archive = file.ok_or_else(|| {
-        format!("tar: name the archive with -f; this terminal has no tape drive\n{usage}")
-    })?;
-    match mode {
-        Some('c') => {
-            if operands.is_empty() {
-                return Err(
-                    "tar: refusing to create an empty archive; name what to put in it".into(),
-                );
-            }
-            // -C is where the paths are found, and what their names are relative to, as GNU
-            // tar works in it.
-            Ok(Job::Create {
-                format: tar_format(&archive, gzip),
-                archive,
-                paths: operands,
-                recursive: true,
-                verbose,
-                directory,
-                links,
-            })
-        }
-        Some('x') => Ok(Job::Extract {
-            zip: false,
-            archive,
-            directory,
-            existing,
-            members: operands,
-            verbose,
-        }),
-        Some(_) => Ok(Job::List {
-            zip: false,
-            archive,
-            verbose,
-        }),
-        None => Err(format!("tar: use one of -c, -x and -t\n{usage}")),
-    }
-}
-
 /// Where the member `name` of an archive goes in `directory`, or why it is skipped. A leading
 /// `/` is removed, as Info-ZIP and GNU tar remove it; the second value says whether one was.
 pub fn member_path(directory: &str, name: &str) -> Result<(String, bool), String> {

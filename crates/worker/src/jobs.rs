@@ -1,6 +1,6 @@
-//! Archive jobs, as the authority sees them: zip, unzip and tar start one, whose work an
-//! ArchiveRunner Durable Object does with a container, asking the authority, as the job's
-//! account, for each file it reads or writes.
+//! Jobs, as the authority sees them: zip, unzip, tar and faststart start one, whose work a
+//! JobRunner Durable Object does with a container, asking the authority, as the job's account,
+//! for each file it reads or writes.
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -11,9 +11,6 @@ use terminal_worker_core::{MAX_FILE, kind};
 
 use crate::commands::{self, command_path};
 use crate::db::{Db, Job};
-
-/// The commands that start jobs.
-pub const ARCHIVERS: [&str; 4] = ["zip", "unzip", "tar", "faststart"];
 
 /// An archive a job reads.
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -52,11 +52,18 @@ test('pipes join filters, fd finds what may be listed, and xargs and fd -x run c
   expect(await output(page, 'cat x.md missing.md | wc -l')).toBe('0');
   await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText('cat: missing.md');
   await run(page, 'ls || pwd'); await expect(last(page)).toContainText('not supported');
+  // Options as getopt reads them: given again, attached, or long; echo has no --.
+  expect(await output(page, 'echo -- hi')).toBe('-- hi');
+  expect(await output(page, 'grep -e TODO -e done docs/c.txt | wc -l')).toBe('3');
+  expect(await output(page, 'echo a b c | xargs -n1 echo')).toBe('a\nb\nc');
+  expect(await output(page, 'fd -e md -Hx echo {/} | sort')).toBe('a.md\nb.md\nd.md\nspéctrum notes.md');
+  expect(await output(page, 'fd -x echo {} \\; tmp | sort')).toBe('x.tmp\ny.tmp');
+  await run(page, 'rm -rf -f x.tmp');
   await run(page, 'fd -e tmp | xargs rm');
   await expect.poll(async () => (await (await request.get('/api/ls?path=' + encodeURIComponent(base))).json()).entries.map(e => e.name)).toEqual(['.hidden', 'docs', 'a.md']);
   // xargs with nothing to do still runs once, as GNU xargs does, unless -r.
-  await run(page, 'fd -e none | xargs rm'); await expect(last(page)).toContainText('Usage: rm');
-  expect(await output(page, 'fd -e none | xargs -r rm')).not.toContain('Usage');
+  await run(page, 'fd -e none | xargs rm'); await expect(last(page)).toContainText('rm: missing PATH');
+  expect(await output(page, 'fd -e none | xargs -r rm')).not.toContain('missing');
 });
 
 test('wildcards expand to sorted paths as bash expands them, and rm -rf * empties a directory', async ({ page, request }) => {
@@ -146,6 +153,11 @@ test('mv and cp follow Linux defaults, ask with -i, share content, and refuse wh
   await page.locator('#command').fill('y'); await page.locator('#command').press('Enter');
   await expect(last(page)).toContainText("renamed '" + base + "/docs/a.md' -> '" + base + "/copy/b.md'");
   expect(await (await request.get(file(base + '/copy/b.md'))).text()).toBe('alpha\nbeta\n');
+  // Long options, and one given again, are kept for the replacement.
+  await run(page, 'cp -f --interactive docs/b.md copy/b.md'); await expect(page.locator('.terminal-panel:not([hidden]) .busy')).toHaveText('Answer ↵');
+  await page.locator('#command').fill('y'); await page.locator('#command').press('Enter');
+  await expect(page.locator('.terminal-panel:not([hidden]) .busy')).toHaveText('↵');
+  expect(await (await request.get(file(base + '/copy/b.md'))).text()).toBe('one\ntwo\nthree\n');
   for (const [line, message] of [['mv docs docs/inner', 'into itself'], ['cp docs docs-flat', '-r not specified'], ['mv . elsewhere', 'current directory'], ['cp -r copy copy/again', 'into itself'], ['mv /home elsewhere', 'home']]) {
     await run(page, line); await expect(last(page)).toContainText(message);
   }

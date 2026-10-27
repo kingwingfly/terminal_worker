@@ -35,7 +35,7 @@ test('manual, large terminal, collapsible layouts, prompt/listing colors, icons 
  await expect(page.locator('.command-echo .prompt-user').last()).toHaveText('guest');
  await run(page,'man chmod');await expect(page.locator('.manual h1')).toHaveText('chmod — change permissions');await expect(page.locator('.manual')).toContainText('o+r');
  // Pages have sections; options are a table.
- await expect(page.locator('.manual h2')).toHaveText(['Options','Permissions','Examples','See also']);await expect(page.locator('.manual table td').first()).toHaveText('-R');
+ await expect(page.locator('.manual h2')).toHaveText(['Options','Permissions','Examples','See also']);await expect(page.locator('.manual table td').first()).toHaveText('-R, --recursive');
  const before=await page.getByRole('combobox').inputValue();await page.keyboard.type('xyz');expect(await page.getByRole('combobox').inputValue()).toBe(before);
  await page.getByRole('button',{name:'Close preview'}).click();
  await page.locator('h1').first().click();await page.keyboard.type('pwd');await expect(page.getByRole('combobox')).toHaveValue('pwd');await page.keyboard.press('Enter');await expect(page.locator('.transcript pre').last()).toHaveText('/');

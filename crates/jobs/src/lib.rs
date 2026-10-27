@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use terminal_worker_core::archive::{ENTRIES_MAX, EXPANDED_MAX, Format};
 
-/// The archiver's version, recorded with each archive built, since another version may build
+/// The job container's version, recorded with each archive built, since another version may build
 /// different bytes.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The deflate level, fixed for the same reason.
@@ -394,8 +394,7 @@ mod tests {
     struct Scratch(std::path::PathBuf);
     impl Scratch {
         fn new(name: &str) -> Self {
-            let dir =
-                std::env::temp_dir().join(format!("archiver-test-{name}-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("jobs-test-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(dir.join("in")).unwrap();
             Scratch(dir)

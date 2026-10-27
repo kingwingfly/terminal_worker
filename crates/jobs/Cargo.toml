@@ -1,5 +1,5 @@
 [package]
-name = "terminal-worker-archiver"
+name = "terminal-worker-jobs"
 version = "0.1.0"
 edition = "2024"
 description = "Reads and writes zip and tar archives for the terminal, in its container"

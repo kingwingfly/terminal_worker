@@ -93,6 +93,6 @@ test('touch integrates with completion, help, preview and editing extensionless 
   await run(page,'vim README');await expect(page.locator('.cm-content')).toBeVisible();await page.locator('.cm-content').fill('hello terminal');await page.keyboard.press('Control+s');await expect(page.locator('#editor-status')).toHaveText('Saved');await page.keyboard.press('Escape');
   await run(page,'touch README');await expect(page.locator('.transcript pre').last()).toContainText('content unchanged');
   await run(page,'open README');await expect(page.locator('.text-preview')).toHaveText('hello terminal');await page.getByRole('button',{name:'Close preview'}).click();
-  await run(page,'touch -h');await expect(page.locator('.transcript pre').last()).toContainText('touch [-c] [--] FILE...');
+  await run(page,'touch -h');await expect(page.locator('.transcript pre').last()).toContainText('Usage: touch [OPTIONS] FILE...');
  }finally{await f.cleanup();}
 });

@@ -1,4 +1,4 @@
-# The archiver's image builds from the repository root; it needs only the Rust workspace.
+# The job container's image builds from the repository root; it needs only the Rust workspace.
 .git
 .wrangler
 .dev.vars
