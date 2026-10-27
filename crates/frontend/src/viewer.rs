@@ -3,12 +3,13 @@
 //! returns, to release the preview: its views, its workers' documents and its listeners. The
 //! manual renders through `window.terminalPreview.markdown(text, path)`.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use gloo_net::http::{Method, RequestBuilder};
 use leptos::{ev, html, mount::mount_to, prelude::*, task::spawn_local};
 use terminal_worker_preview::language;
-use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 use web_sys::{
     Blob, BlobPropertyBag, CanvasRenderingContext2d, Element, HtmlCanvasElement, HtmlElement,
@@ -18,6 +19,33 @@ use web_sys::{
 use crate::preview::{self, ARCHIVE_MAX, DiffLine, Kind, TEXT_MAX, file_path, file_url};
 use crate::search::Searchable;
 use crate::workers;
+
+#[wasm_bindgen]
+extern "C" {
+    /// Open `path` in the viewer, from a link in the file it shows, which Back returns to.
+    #[wasm_bindgen(js_namespace = terminal, js_name = follow)]
+    fn follow_link(path: &str, kind: &str) -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = terminal, js_name = place)]
+    fn saved_place(path: &str) -> JsValue;
+    #[wasm_bindgen(js_namespace = terminal, js_name = setPlace)]
+    fn save_place(path: &str, value: JsValue);
+}
+
+/// Where the preview of `path` was left, as web/app.js keeps it: `{"slide": [column, row]}`,
+/// `{"page": n, "zoom": z}`, and so on; null if nowhere.
+fn place(path: &str) -> serde_json::Value {
+    js_sys::JSON::stringify(&saved_place(path))
+        .ok()
+        .and_then(|text| text.as_string())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+/// Keep `value`, merged with what is kept, as where the preview of `path` is.
+fn set_place(path: &str, value: serde_json::Value) {
+    if let Ok(value) = js_sys::JSON::parse(&value.to_string()) {
+        save_place(path, value);
+    }
+}
 
 /// The most bytes of a PDF opened, as many as an upload has.
 const PDF_MAX: usize = 100_000_000;
@@ -160,7 +188,7 @@ fn render(preview: Preview, path: String) -> AnyView {
                 Some(url) => media("audio", url, &path),
                 None => no_preview(),
             },
-            Kind::Pdf => view! { <PdfView data=Arc::new(data) /> }.into_any(),
+            Kind::Pdf => view! { <PdfView data=Arc::new(data) path /> }.into_any(),
             Kind::Markdown { html, source } => {
                 view! { <MarkdownView html source path /> }.into_any()
             }
@@ -281,7 +309,7 @@ fn follow(event: ev::MouseEvent) {
     event.prevent_default();
     let kind = terminal_worker_core::kind(&path);
     spawn_local(async move {
-        let _ = JsFuture::from(crate::open_file(&path, kind)).await;
+        let _ = JsFuture::from(follow_link(&path, kind)).await;
     });
 }
 
@@ -356,7 +384,9 @@ const AS_DOCUMENT: &str =
 /// A Markdown file, as a document, or as slides.
 #[component]
 fn MarkdownView(html: String, source: String, path: String) -> impl IntoView {
-    let as_slides = RwSignal::new(false);
+    let as_slides = RwSignal::new(place(&path)["slides"] == true);
+    let kept = path.clone();
+    Effect::new(move || set_place(&kept, serde_json::json!({ "slides": as_slides.get() })));
     let label = move || {
         if as_slides.get() {
             "View as a document"
@@ -393,6 +423,30 @@ fn MarkdownView(html: String, source: String, path: String) -> impl IntoView {
     }
 }
 
+/// The looks slides can take, for every deck: each a value of `.slides[data-theme]`, and its name.
+const SLIDE_THEMES: [(&str, &str); 4] = [
+    ("light", "Light"),
+    ("dark", "Dark"),
+    ("sepia", "Sepia"),
+    ("night", "Night"),
+];
+const SLIDE_THEME: &str = "terminal-slide-theme";
+/// The slide theme chosen last in this browser, or Light.
+fn slide_theme() -> String {
+    window()
+        .local_storage()
+        .ok()
+        .flatten()
+        .and_then(|storage| storage.get_item(SLIDE_THEME).ok().flatten())
+        .filter(|theme| SLIDE_THEMES.iter().any(|(value, _)| value == theme))
+        .unwrap_or_else(|| "light".into())
+}
+fn set_slide_theme(theme: &str) {
+    if let Some(storage) = window().local_storage().ok().flatten() {
+        let _ = storage.set_item(SLIDE_THEME, theme);
+    }
+}
+
 /// Whether keys are the slides', rather than another dialog's or a text field's.
 fn keys_for_slides() -> bool {
     let document = document();
@@ -414,7 +468,25 @@ fn keys_for_slides() -> bool {
 #[component]
 fn Slides(source: String, path: String) -> impl IntoView {
     let deck = StoredValue::new(preview::slides(&source, &path));
-    let position = RwSignal::new((0, 0));
+    // The slide it was left at, if the deck still has it.
+    let left = place(&path)["slide"]
+        .as_array()
+        .and_then(|at| {
+            Some((
+                at.first()?.as_u64()? as usize,
+                at.get(1)?.as_u64()? as usize,
+            ))
+        })
+        .filter(|&(column, row)| {
+            deck.with_value(|deck| deck.get(column).is_some_and(|rows| row < rows.len()))
+        });
+    let position = RwSignal::new(left.unwrap_or((0, 0)));
+    Effect::new(move || {
+        let (column, row) = position.get();
+        set_place(&path, serde_json::json!({ "slide": [column, row] }));
+    });
+    let theme = RwSignal::new(slide_theme());
+    Effect::new(move || set_slide_theme(&theme.get()));
     let node = NodeRef::<html::Div>::new();
     let go = move |right: isize, down: isize| {
         position.update(|(column, row)| {
@@ -457,14 +529,26 @@ fn Slides(source: String, path: String) -> impl IntoView {
         for entry in entries.iter() {
             let entry: ResizeObserverEntry = entry.unchecked_into();
             let size = entry.content_rect();
-            // Full screen, the bar floats over the slides rather than taking room from them.
-            let bar = if document().fullscreen_element().is_some() {
-                0.0
-            } else {
-                56.0
-            };
+            let target = entry.target();
+            // The room the bar takes, measured: none when it floats over the slides, as it does
+            // full screen.
+            let bar = target
+                .query_selector(".slides-bar")
+                .ok()
+                .flatten()
+                .filter(|bar| {
+                    window()
+                        .get_computed_style(bar)
+                        .ok()
+                        .flatten()
+                        .and_then(|style| style.get_property_value("position").ok())
+                        .is_none_or(|position| position != "absolute")
+                })
+                .map_or(0.0, |bar| {
+                    f64::from(bar.unchecked_into::<HtmlElement>().offset_height())
+                });
             let scale = (size.width() / SLIDE_SIZE.0).min((size.height() - bar) / SLIDE_SIZE.1);
-            let style = entry.target().unchecked_into::<HtmlElement>().style();
+            let style = target.unchecked_into::<HtmlElement>().style();
             let _ = style.set_property("--scale", &scale.max(0.1).to_string());
         }
     });
@@ -516,7 +600,7 @@ fn Slides(source: String, path: String) -> impl IntoView {
         }
     };
     view! {
-        <div class="slides" node_ref=node>
+        <div class="slides" data-theme=move || theme.get() node_ref=node>
             {move || {
                 // Read here, where it is tracked: a component's children are built untracked.
                 let html = slide();
@@ -532,20 +616,44 @@ fn Slides(source: String, path: String) -> impl IntoView {
                 <span role="status">{counter}</span>
                 {button("Slide below", DOWN, 0, 1)}
                 {button("Next slide", NEXT, 1, 0)}
+                <select class="slides-theme" aria-label="Slide theme" prop:value=move || theme.get() on:change=move |e| theme.set(event_target_value(&e))>
+                    {SLIDE_THEMES.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}
+                </select>
             </div>
         </div>
     }
 }
 
-/// A PDF, a page at a time, as wide as the viewer, its pages drawn by a worker.
+/// The most pixels wide a PDF page is drawn: past that, the memory pages take outgrows what is
+/// seen of them.
+const PDF_PIXELS: f64 = 2000.0;
+/// How far the view zooms out and in, from the stage's width.
+const PDF_ZOOM: (f64, f64) = (0.5, 3.0);
+
+/// A PDF as one document that scrolls. Every page has its place, at its size, from the start;
+/// a worker draws the pages near the view, one at a time, and those far from it are let go,
+/// so that a long document takes the memory of a few pages. The toolbar says which page is in
+/// view, goes to the one before or after it, and zooms.
 #[component]
-fn PdfView(data: Arc<Vec<u8>>) -> impl IntoView {
-    let canvas = NodeRef::<html::Canvas>::new();
+fn PdfView(data: Arc<Vec<u8>>, path: String) -> impl IntoView {
     let pages = RwSignal::new(Vec::<(f64, f64)>::new());
-    let page = RwSignal::new(0usize);
-    let rendering = RwSignal::new(true);
-    let status = RwSignal::new("Loading PDF...".to_string());
+    let failure = RwSignal::new(None::<String>);
+    // Where it was left: its page and zoom.
+    let left = place(&path);
+    let current = RwSignal::new(0usize);
+    let left_at = left["page"].as_u64().unwrap_or(0) as usize;
+    let zoom = RwSignal::new(
+        left["zoom"]
+            .as_f64()
+            .unwrap_or(1.0)
+            .clamp(PDF_ZOOM.0, PDF_ZOOM.1),
+    );
     let document = StoredValue::new(None::<workers::Pdf>);
+    let stage = NodeRef::<html::Div>::new();
+    // The pages near the view, and the width in pixels each one is drawn at.
+    let near = StoredValue::new(BTreeSet::<usize>::new());
+    let drawn = StoredValue::new(BTreeMap::<usize, u32>::new());
+    let drawing = StoredValue::new(false);
     spawn_local(async move {
         match workers::open_pdf(&data).await {
             Ok((pdf, sizes)) => {
@@ -556,93 +664,265 @@ fn PdfView(data: Arc<Vec<u8>>) -> impl IntoView {
                 pages.try_set(sizes);
             }
             Err(e) => {
-                status.try_set(format!("Could not open PDF: {e}"));
-                rendering.try_set(false);
+                failure.try_set(Some(format!("Could not open PDF: {e}")));
             }
         }
     });
-    // Each page as it is chosen, once the canvas and the document are there. The page and the
-    // pages are read first: an effect follows only what its last run read.
+    let frame = move |index: usize| -> Option<HtmlElement> {
+        stage
+            .get_untracked()?
+            .query_selector(&format!(".pdf-frame[data-index=\"{index}\"]"))
+            .ok()
+            .flatten()
+            .map(JsCast::unchecked_into)
+    };
+    let canvas = move |index: usize| -> Option<HtmlCanvasElement> {
+        frame(index)?
+            .query_selector("canvas")
+            .ok()
+            .flatten()
+            .map(JsCast::unchecked_into)
+    };
+    let release = move |index: usize| {
+        if let Some(canvas) = canvas(index) {
+            canvas.set_width(0);
+            canvas.set_height(0);
+        }
+        drawn.update_value(|drawn| {
+            drawn.remove(&index);
+        });
+    };
+    // Draw what is near and not drawn at its width, nearest the page in view first, until
+    // nothing is left; one drawing at a time, as the pages come and go meanwhile.
+    let draw = move || {
+        if drawing.get_value() {
+            return;
+        }
+        drawing.set_value(true);
+        spawn_local(async move {
+            let ratio = window().device_pixel_ratio().min(2.0);
+            while let Some(pdf) = document.try_get_value().flatten() {
+                let wanted = near.with_value(|near| {
+                    near.iter()
+                        .filter_map(|&index| {
+                            let width = frame(index)?.client_width();
+                            let pixels = (f64::from(width) * ratio).min(PDF_PIXELS).round() as u32;
+                            (pixels > 0 && drawn.with_value(|d| d.get(&index) != Some(&pixels)))
+                                .then_some((index, pixels))
+                        })
+                        .min_by_key(|(index, _)| index.abs_diff(current.get_untracked()))
+                });
+                let Some((index, pixels)) = wanted else {
+                    break;
+                };
+                let image = workers::render_pdf(pdf, index, pixels).await;
+                if !near
+                    .try_with_value(|near| near.contains(&index))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                match image.and_then(|image| paint(canvas(index), &image)) {
+                    Ok(()) => drawn.update_value(|drawn| {
+                        drawn.insert(index, pixels);
+                    }),
+                    Err(e) => {
+                        failure.set(Some(format!("PDF rendering failed: {e}")));
+                        break;
+                    }
+                }
+            }
+            let _ = drawing.try_set_value(false);
+        });
+    };
+    // Which pages are near the view, within a screen of it.
+    let seen = Closure::<dyn FnMut(js_sys::Array)>::new(move |entries: js_sys::Array| {
+        for entry in entries.iter() {
+            let entry: web_sys::IntersectionObserverEntry = entry.unchecked_into();
+            let Some(index) = entry
+                .target()
+                .get_attribute("data-index")
+                .and_then(|index| index.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            if entry.is_intersecting() {
+                near.update_value(|near| {
+                    near.insert(index);
+                });
+            } else {
+                near.update_value(|near| {
+                    near.remove(&index);
+                });
+                release(index);
+            }
+        }
+        draw();
+    });
+    let seen = StoredValue::new_local(Some(seen));
+    let observer = StoredValue::new_local(None::<web_sys::IntersectionObserver>);
     Effect::new(move || {
-        let index = page.get();
-        let size = pages.with(|pages| pages.get(index).copied());
         let count = pages.with(Vec::len);
-        let (Some(canvas), Some(pdf), Some((width, height))) =
-            (canvas.get(), document.get_value(), size)
-        else {
+        let Some(stage) = stage.get() else {
             return;
         };
-        rendering.set(true);
-        spawn_local(async move {
-            let drawn = draw_page(&canvas, pdf, index, (width, height)).await;
-            if rendering.try_set(false).is_none() {
-                status.set(match drawn {
-                    Ok(()) => format!("{} / {count}", index + 1),
-                    Err(e) => format!("PDF rendering failed: {e}"),
-                });
+        if count == 0 || observer.with_value(Option::is_some) {
+            return;
+        }
+        let options = web_sys::IntersectionObserverInit::new();
+        options.set_root(Some(&stage));
+        options.set_root_margin("100% 0px");
+        let Some(Ok(watching)) = seen.with_value(|seen| {
+            seen.as_ref().map(|seen| {
+                web_sys::IntersectionObserver::new_with_options(
+                    seen.as_ref().unchecked_ref(),
+                    &options,
+                )
+            })
+        }) else {
+            return;
+        };
+        if let Ok(frames) = stage.query_selector_all(".pdf-frame") {
+            for index in 0..frames.length() {
+                if let Some(frame) = frames.item(index) {
+                    watching.observe(frame.unchecked_ref());
+                }
             }
-        });
+        }
+        observer.set_value(Some(watching));
+        let _ = stage.focus();
+        // Back to the page it was left at, once the pages are laid out.
+        let page = left_at.min(count - 1);
+        if page > 0 {
+            request_animation_frame(move || {
+                if let Some(frame) = frame(page) {
+                    frame.scroll_into_view();
+                    current.set(page);
+                }
+            });
+        }
+    });
+    Effect::new(move || {
+        let (page, level) = (current.get(), zoom.get());
+        if pages.with(|pages| !pages.is_empty()) {
+            set_place(&path, serde_json::json!({ "page": page, "zoom": level }));
+        }
+    });
+    // A new zoom draws the pages in view at their new width, and keeps the page in view.
+    Effect::new(move |previous: Option<f64>| {
+        let level = zoom.get();
+        if previous.is_some_and(|previous| previous != level) {
+            if let Some(frame) = frame(current.get_untracked()) {
+                frame.scroll_into_view();
+            }
+            draw();
+        }
+        level
     });
     on_cleanup(move || {
+        if let Some(Some(observer)) = observer.try_get_value() {
+            observer.disconnect();
+        }
+        let _ = seen.try_update_value(Option::take);
         if let Some(Some(pdf)) = document.try_get_value() {
             workers::close_pdf(pdf);
         }
     });
-    let last = move || page.get() + 1 >= pages.with(Vec::len);
+    // The page in view: the last one whose top is above a third of the stage.
+    let scrolled = move |_| {
+        let Some(stage) = stage.get_untracked() else {
+            return;
+        };
+        let line = stage.scroll_top() + stage.client_height() / 3;
+        let count = pages.with_untracked(Vec::len);
+        let page = (0..count)
+            .take_while(|&index| frame(index).is_some_and(|frame| frame.offset_top() <= line))
+            .last()
+            .unwrap_or(0);
+        if current.get_untracked() != page {
+            current.set(page);
+        }
+    };
+    let go = move |page: usize| {
+        if let Some(frame) = frame(page) {
+            frame.scroll_into_view();
+            current.set(page);
+        }
+    };
+    let count = move || pages.with(Vec::len);
+    let zoom_by = move |factor: f64| {
+        zoom.update(|zoom| *zoom = (*zoom * factor).clamp(PDF_ZOOM.0, PDF_ZOOM.1));
+    };
     view! {
-        <div class="pdf-toolbar">
-            <button
-                disabled=move || rendering.get() || page.get() == 0
-                on:click=move |_| page.update(|page| *page = page.saturating_sub(1))
+        <div class="pdf-view">
+            <div class="pdf-toolbar">
+                <button
+                    aria-label="Previous page"
+                    disabled=move || current.get() == 0
+                    on:click=move |_| go(current.get_untracked().saturating_sub(1))
+                >
+                    "↑"
+                </button>
+                <span role="status">
+                    {move || {
+                        failure
+                            .get()
+                            .unwrap_or_else(|| match count() {
+                                0 => "Loading PDF...".into(),
+                                count => format!("{} / {count}", current.get() + 1),
+                            })
+                    }}
+                </span>
+                <button
+                    aria-label="Next page"
+                    disabled=move || { current.get() + 1 >= count() }
+                    on:click=move |_| go(current.get_untracked() + 1)
+                >
+                    "↓"
+                </button>
+                <span class="pdf-zoom">
+                    <button aria-label="Zoom out" disabled=move || { zoom.get() <= PDF_ZOOM.0 } on:click=move |_| zoom_by(1.0 / 1.25)>"−"</button>
+                    <button aria-label="Fit width" on:click=move |_| zoom.set(1.0)>{move || format!("{:.0}%", zoom.get() * 100.0)}</button>
+                    <button aria-label="Zoom in" disabled=move || { zoom.get() >= PDF_ZOOM.1 } on:click=move |_| zoom_by(1.25)>"+"</button>
+                </span>
+            </div>
+            <div
+                class="pdf-stage"
+                tabindex="0"
+                node_ref=stage
+                style=move || format!("--pdf-zoom:{}", zoom.get())
+                on:scroll=scrolled
             >
-                "← Previous page"
-            </button>
-            <span role="status">{move || status.get()}</span>
-            <button
-                disabled=move || rendering.get() || last()
-                on:click=move |_| page.update(|page| *page += 1)
-            >
-                "Next page →"
-            </button>
-        </div>
-        <div class="pdf-stage">
-            <canvas class="pdf-page" node_ref=canvas hidden=move || pages.with(Vec::is_empty)></canvas>
+                {move || {
+                    pages
+                        .get()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (width, height))| {
+                            view! {
+                                <div class="pdf-frame" data-index=index style=format!("aspect-ratio:{width}/{height}")>
+                                    <canvas class="pdf-page" aria-label=format!("PDF page {}", index + 1)></canvas>
+                                </div>
+                            }
+                        })
+                        .collect_view()
+                }}
+            </div>
         </div>
     }
 }
 
-/// Draw the page `index` of `pdf`, of `size` in points, into `canvas`: as wide as the viewer
-/// shows it, at most twice its size, as sharp as the screen, at most twice CSS pixels.
-async fn draw_page(
-    canvas: &HtmlCanvasElement,
-    pdf: workers::Pdf,
-    index: usize,
-    (width, _): (f64, f64),
-) -> Result<(), String> {
-    let room = canvas
-        .closest("#viewer-content")
-        .ok()
-        .flatten()
-        .map_or(800.0, |content| f64::from(content.client_width()) - 40.0);
-    let scale = (room / width).clamp(0.3, 2.0);
-    let ratio = window().device_pixel_ratio().min(2.0);
-    let pixels = (width * scale * ratio).round().max(1.0) as u32;
-    let image = workers::render_pdf(pdf, index, pixels).await?;
+/// Paint `image`, a page as the worker drew it, into `canvas`, which the page's frame sizes.
+fn paint(canvas: Option<HtmlCanvasElement>, image: &web_sys::ImageData) -> Result<(), String> {
+    let canvas = canvas.ok_or("the page is gone")?;
     canvas.set_width(image.width());
     canvas.set_height(image.height());
-    let style = HtmlElement::style(canvas);
-    let _ = style.set_property("width", &format!("{}px", f64::from(image.width()) / ratio));
-    let _ = style.set_property(
-        "height",
-        &format!("{}px", f64::from(image.height()) / ratio),
-    );
-    let _ = canvas.set_attribute("aria-label", &format!("PDF page {}", index + 1));
     let context: CanvasRenderingContext2d = canvas
         .get_context("2d")
         .map_err(js_error)?
         .ok_or("no 2D context")?
         .unchecked_into();
-    context.put_image_data(&image, 0.0, 0.0).map_err(js_error)
+    context.put_image_data(image, 0.0, 0.0).map_err(js_error)
 }
 
 /// `bytes`, in the largest unit they make at least one of.

@@ -3,21 +3,21 @@
 //! file and account commands; text filters, xargs and fd -x run here, as do browser
 //! interactions such as open and upload.
 
-use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
+use futures::{FutureExt, StreamExt};
 use leptos::prelude::*;
 use serde_json::{Value, json};
 use terminal_worker_core::completion::{self, Candidate, Query};
 use terminal_worker_core::glob::{self, Part};
 use terminal_worker_core::shell::{self as grammar, Delimiter, Word};
 use terminal_worker_core::{Entry, find, permissions::mode_text, resolve, split_command, text};
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::{
-    account_command, authorize, cancel_uploads, completion_focus, endpoint, focus_input, listing,
-    open_file, request, set_directory, upload,
+    account_command, authorize, cancel_uploads, choose_files, completion_focus, endpoint,
+    focus_input, listing, open_file, request, set_directory, upload_files,
 };
 
 /// The most transcript lines kept, ...
@@ -33,6 +33,8 @@ const BATCH: usize = 100;
 /// How many filesystem lookups one wildcard pattern makes, and paths it expands to, at most.
 const GLOB_LOOKUPS: usize = 1000;
 const GLOB_PATHS: usize = 10_000;
+/// How many of a wildcard's lookups run at once.
+const GLOB_CONCURRENCY: usize = 8;
 
 /// Commands the server runs, through web/app.js's accountCommand; ls and mkdir too, with
 /// options or several paths.
@@ -49,6 +51,8 @@ const BATCHED: &[&str] = &[
 #[derive(Clone)]
 pub enum LogLine {
     Text(String),
+    /// Text that changes as a command goes on, such as an upload's progress.
+    Live(RwSignal<String>),
     Command {
         user: String,
         cwd: String,
@@ -113,6 +117,8 @@ pub struct Shell {
     cancelled: RwSignal<bool>,
     /// ... which, for an upload, cancels it.
     uploading: RwSignal<bool>,
+    /// The files the next upload sends: chosen as the command started, or dropped.
+    chosen: StoredValue<Option<js_sys::Promise>, LocalStorage>,
     /// Whether the tab was closed: its browser work stops, but not its server jobs.
     detached: RwSignal<bool>,
     /// The answer a running command waits for, if any.
@@ -163,6 +169,14 @@ fn listing_text(entries: &[Entry], long: bool) -> String {
         })
         .collect()
 }
+/// `name` in the directory `typed`, as typed: `""` stands for the working directory.
+fn joined(typed: &str, name: &str) -> String {
+    match typed {
+        "" => name.to_string(),
+        t if t.ends_with('/') => format!("{t}{name}"),
+        t => format!("{t}/{name}"),
+    }
+}
 /// `-d`'s delimiter: one character, or an escape such as `\n`.
 fn parse_delimiter(value: &str) -> Result<char, String> {
     match value {
@@ -202,6 +216,7 @@ impl Shell {
             completion_offset: RwSignal::new(0),
             cancelled: RwSignal::new(false),
             uploading: RwSignal::new(false),
+            chosen: StoredValue::new_local(None),
             detached: RwSignal::new(false),
             prompt: StoredValue::new(None),
             asking: RwSignal::new(false),
@@ -940,12 +955,39 @@ impl Shell {
                 Ok(Output::default())
             }
             "upload" => {
+                let files = self.chosen.try_update_value(Option::take).flatten();
+                let files = JsFuture::from(files.unwrap_or_else(choose_files))
+                    .await
+                    .map_err(js_message)?;
+                if js_sys::Array::from(&files).length() == 0 {
+                    return Ok(Output::default());
+                }
+                // A line that follows the upload, here rather than over the page.
+                let line = RwSignal::new(String::from("↑ starting"));
+                self.push(LogLine::Live(line));
+                let progress = Closure::<dyn Fn(String)>::new(move |text: String| line.set(text));
                 self.uploading.set(true);
-                let result = JsFuture::from(upload(&path)).await;
+                let result = JsFuture::from(upload_files(
+                    &files,
+                    &path,
+                    progress.as_ref().unchecked_ref(),
+                ))
+                .await;
                 self.uploading.set(false);
-                result.map_err(|_| "Upload failed")?;
+                drop(progress);
+                let results: Vec<String> = result
+                    .map_err(js_message)
+                    .inspect_err(|e| line.set(format!("✕ {e}")))?
+                    .dyn_into::<js_sys::Array>()
+                    .map(|a| a.iter().filter_map(|r| r.as_string()).collect())
+                    .unwrap_or_default();
+                let failed = results.iter().any(|r| r.starts_with('✕'));
+                line.set(results.join("\n"));
                 self.refresh().await?;
-                Ok(Output::default())
+                Ok(Output {
+                    failed,
+                    ..Output::default()
+                })
             }
             _ => Err(format!("Unknown command: {cmd}. Enter help for commands.")),
         }
@@ -975,6 +1017,13 @@ impl Shell {
             self.log("Passwords cannot be command arguments; use passwd [USER] and enter the password in the dialog.");
             return;
         }
+        // Phones open a file chooser only while the tap or key that asked is fresh, before any
+        // request is awaited: an upload line chooses its files now.
+        if split_command(&command).is_ok_and(|words| words.first().is_some_and(|w| w == "upload"))
+            && self.chosen.with_value(Option::is_none)
+        {
+            self.chosen.set_value(Some(choose_files()));
+        }
         self.reset_completion();
         self.input.set(String::new());
         self.push(LogLine::Command {
@@ -997,6 +1046,32 @@ impl Shell {
             crate::persist();
             focus_input();
         });
+    }
+    /// The previous command in the history, or with `up` false the next, into the command line.
+    pub fn recall(self, up: bool) {
+        self.reset_completion();
+        let len = self.history.with_untracked(Vec::len);
+        let index = self.history_index.get_untracked();
+        let index = if up {
+            index.saturating_sub(1)
+        } else {
+            (index + 1).min(len)
+        };
+        self.history_index.set(index);
+        self.input.set(
+            self.history
+                .with_untracked(|h| h.get(index).cloned().unwrap_or_default()),
+        );
+    }
+    /// Upload `files`, dropped on the page, as the upload command does, into this tab's directory.
+    pub fn upload_dropped(self, files: JsValue) {
+        if self.busy.get_untracked() {
+            self.error("A command is running in this tab; drop the files again when it ends");
+            return;
+        }
+        self.chosen
+            .set_value(Some(js_sys::Promise::resolve(&files)));
+        self.run("upload".into());
     }
     async fn pipeline(self, stages: Vec<Vec<Word>>) {
         let last = stages.len().saturating_sub(1);
@@ -1067,72 +1142,94 @@ impl Shell {
         Ok(args)
     }
     /// The paths `pattern` matches, as typed: relative ones stay relative. A directory that
-    /// cannot be listed matches nothing; a pattern ending in `/` matches directories.
+    /// cannot be listed matches nothing; a pattern ending in `/` matches directories. The
+    /// lookups for one part of the pattern run a few at a time.
     async fn glob(self, pattern: &str) -> Result<Vec<String>, String> {
         let parts = glob::parts(pattern);
+        // Brackets that close no set: a name, which the word stands for as it is.
+        if !parts.iter().any(|part| matches!(part, Part::Pattern(_))) {
+            return Ok(Vec::new());
+        }
         let directories = pattern.ends_with('/');
-        let join = |typed: &str, name: &str| match typed {
-            "" => name.to_string(),
-            t if t.ends_with('/') => format!("{t}{name}"),
-            t => format!("{t}/{name}"),
-        };
         let mut found = vec![if pattern.starts_with('/') { "/" } else { "" }.to_string()];
         let mut lookups = 0;
+        // Before the first pattern, names need no looking up; after it, they must exist.
+        let mut looked_up = false;
         for (index, part) in parts.iter().enumerate() {
             let last = index + 1 == parts.len();
-            // Before the first pattern, names need no looking up; after it, they must exist.
-            let looked_up = parts[..index]
-                .iter()
-                .any(|part| matches!(part, Part::Pattern(_)));
-            let mut next = Vec::new();
-            for typed in found {
-                if let (Part::Name(name), false) = (part, looked_up) {
-                    next.push(join(&typed, name));
-                    continue;
-                }
-                if self.cancelled() {
-                    return Ok(Vec::new());
-                }
-                let navigation =
-                    matches!(part, Part::Name(name) if matches!(name.as_str(), "." | ".."));
-                lookups += if navigation { 2 } else { 1 };
-                if lookups > GLOB_LOOKUPS {
-                    return Err(format!("{pattern}: the pattern searches too many paths"));
-                }
-                let directory = self.path(if typed.is_empty() { "." } else { &typed })?;
-                if let Part::Name(name) = part {
-                    // Literal names need search permission, not a listing. Dot components
-                    // are not listing entries; check traversal before resolving them away.
-                    if navigation
-                        && request(&(endpoint("stat", &directory) + "&enter=true"), "GET")
-                            .await
-                            .is_err()
-                    {
-                        continue;
-                    }
-                    let target = join(&typed, name);
-                    let path = self.path(&target)?;
-                    if let Ok(entry) = request(&endpoint("stat", &path), "GET").await
-                        && (entry["directory"] == true || last && !directories)
-                    {
-                        next.push(target);
-                    }
-                    continue;
-                }
-                let Ok(entries) = listing(&directory).await else {
-                    continue;
-                };
-                for entry in entries {
-                    let matched = match part {
-                        Part::Name(name) => entry.name == *name,
-                        Part::Pattern(pattern) => glob::matches(pattern, &entry.name),
-                    };
-                    if matched && (entry.directory || last && !directories) {
-                        next.push(join(&typed, &entry.name));
-                    }
-                }
+            let navigation =
+                matches!(part, Part::Name(name) if matches!(name.as_str(), "." | ".."));
+            // Except `..`, which leaves a directory: it needs search permission there, even
+            // before the first pattern, since resolving it removes that directory from the path.
+            if let Part::Name(name) = part
+                && !looked_up
+                && name != ".."
+            {
+                found = found.iter().map(|typed| joined(typed, name)).collect();
+                continue;
             }
-            found = next;
+            lookups += found.len() * if navigation && looked_up { 2 } else { 1 };
+            if lookups > GLOB_LOOKUPS {
+                return Err(format!("{pattern}: the pattern searches too many paths"));
+            }
+            let lookup = move |typed: String| async move {
+                if self.cancelled() {
+                    return Vec::new();
+                }
+                // A path this terminal cannot name (a backslash, too deep) matches nothing.
+                let Ok(directory) = self.path(if typed.is_empty() { "." } else { &typed }) else {
+                    return Vec::new();
+                };
+                match part {
+                    Part::Name(name) => {
+                        // Literal names need search permission, not a listing. Dot components
+                        // are not listing entries; check traversal before resolving them away.
+                        if navigation
+                            && request(&(endpoint("stat", &directory) + "&enter=true"), "GET")
+                                .await
+                                .is_err()
+                        {
+                            return Vec::new();
+                        }
+                        let target = joined(&typed, name);
+                        if !looked_up {
+                            return vec![target];
+                        }
+                        let Ok(path) = self.path(&target) else {
+                            return Vec::new();
+                        };
+                        match request(&endpoint("stat", &path), "GET").await {
+                            Ok(entry) if entry["directory"] == true || last && !directories => {
+                                vec![target]
+                            }
+                            _ => Vec::new(),
+                        }
+                    }
+                    Part::Pattern(pattern) => match listing(&directory).await {
+                        Ok(entries) => entries
+                            .into_iter()
+                            .filter(|entry| {
+                                glob::matches(pattern, &entry.name)
+                                    && (entry.directory || last && !directories)
+                            })
+                            .map(|entry| joined(&typed, &entry.name))
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    },
+                }
+            };
+            found = futures::stream::iter(found)
+                .map(lookup)
+                .buffered(GLOB_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .flatten()
+                .collect();
+            looked_up |= matches!(part, Part::Pattern(_));
+            if self.cancelled() {
+                return Ok(Vec::new());
+            }
             if found.is_empty() {
                 break;
             }

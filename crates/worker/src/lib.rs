@@ -18,6 +18,21 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if !path.starts_with("/api/") {
         return env.assets("ASSETS")?.fetch_request(req).await;
     }
+    // The page's line for changes: a WebSocket, which carries the session cookie, so only this
+    // site may open one; its reply goes back as the authority made it.
+    if path == "/api/events" {
+        if req.headers().get("Origin")?.as_deref()
+            != Some(req.url()?.origin().ascii_serialization().as_str())
+        {
+            return error_response("Change events must originate from this site", 403);
+        }
+        return env
+            .durable_object("AUTHORITY")?
+            .id_from_name("filesystem")?
+            .get_stub()?
+            .fetch_with_request(req)
+            .await;
+    }
     let result = async {
         if !matches!(req.method(), Method::Get | Method::Head)
             && req.headers().get("Origin")?.as_deref()

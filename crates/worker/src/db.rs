@@ -62,6 +62,15 @@ thread_local! {
     static FAILED: RefCell<Option<String>> = const { RefCell::new(None) };
     /// Whether a transaction left R2 objects to delete or a deadline to keep, for the alarm.
     static ALARM: Cell<bool> = const { Cell::new(false) };
+    /// The directories whose listings the running transaction changed, ...
+    static CHANGING: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+    /// ... and those committed transactions changed, for the pages that show them.
+    static CHANGED: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+}
+
+/// The directories whose listings committed transactions changed since this was last asked.
+pub fn take_changes() -> BTreeSet<String> {
+    CHANGED.take()
 }
 
 /// Whether the alarm should run soon, clearing the request.
@@ -99,13 +108,18 @@ pub fn transact<T: 'static>(
             return JsValue::from_str("transaction ran twice");
         };
         FAILED.with(|f| f.borrow_mut().take());
+        CHANGING.take();
         let mut db = Db { sql: sql.clone() };
         let (value, commit) = work(&mut db);
         *slot.borrow_mut() = Some(value);
+        let changing = CHANGING.take();
         match FAILED.with(|f| f.borrow_mut().take()) {
             Some(error) => JsValue::from_str(&error),
             None if !commit => JsValue::from_str(ROLLBACK),
-            None => JsValue::UNDEFINED,
+            None => {
+                CHANGED.with(|changed| changed.borrow_mut().extend(changing));
+                JsValue::UNDEFINED
+            }
         }
     });
     let storage: &JsValue = storage.as_raw().as_ref();
@@ -239,6 +253,16 @@ fn int(value: impl TryInto<i64>) -> SqlStorageValue {
 fn text(value: &str) -> SqlStorageValue {
     value.into()
 }
+/// Note that the listing of the directory holding `path` changes.
+fn changes(path: &str) {
+    if path != "/" {
+        CHANGING.with(|changing| {
+            changing
+                .borrow_mut()
+                .insert(terminal_worker_core::parent(path).to_string())
+        });
+    }
+}
 fn parent_of(path: &str) -> &str {
     if path == "/" {
         ""
@@ -347,6 +371,10 @@ impl Db {
         )
     }
     pub fn add_chunk(&mut self, file: &str, index: u64, key: &str, sha256: Option<&str>, now: u64) {
+        // How much of it can be read shows where it is listed.
+        for path in self.showing(file) {
+            changes(&path);
+        }
         self.run(
             "INSERT INTO chunks(file, idx, key, sha256) VALUES(?, ?, ?, ?)",
             vec![text(file), int(index), text(key), sha256.into()],
@@ -357,6 +385,9 @@ impl Db {
         );
     }
     pub fn finish_file(&mut self, file: &str) {
+        for path in self.showing(file) {
+            changes(&path);
+        }
         self.run(
             "UPDATE files SET state = 'complete' WHERE id = ?",
             vec![text(file)],
@@ -670,6 +701,7 @@ impl Store for Db {
         rows.into_iter().map(NodeRow::pair).collect()
     }
     fn set_node(&mut self, path: &str, node: &Node) {
+        changes(path);
         let old = self
             .rows::<NodeRow>(&format!("{NODE} WHERE path = ?"), vec![text(path)])
             .pop()
@@ -692,6 +724,7 @@ impl Store for Db {
         }
     }
     fn delete_node(&mut self, path: &str) {
+        changes(path);
         let old = self
             .rows::<NodeRow>(&format!("{NODE} WHERE path = ?"), vec![text(path)])
             .pop()

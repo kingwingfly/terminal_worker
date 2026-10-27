@@ -28,18 +28,12 @@ pub fn parts(pattern: &str) -> Vec<Part> {
         .collect()
 }
 
-/// Whether `pattern` has a wildcard that is not escaped.
+/// Whether `pattern` has a wildcard that is not escaped. A `[` that closes no set is none, as
+/// in bash: such a part is a name, which needs search permission rather than a listing.
 pub fn has_wildcards(pattern: &str) -> bool {
-    let mut escaped = false;
-    for c in pattern.chars() {
-        match c {
-            _ if escaped => escaped = false,
-            '\\' => escaped = true,
-            '*' | '?' | '[' => return true,
-            _ => {}
-        }
-    }
-    false
+    tokens(pattern)
+        .iter()
+        .any(|token| !matches!(token, Token::Char(_)))
 }
 
 /// `pattern` with its escapes removed: the text a word without wildcards stands for.
@@ -230,6 +224,11 @@ mod tests {
         );
         assert!(has_wildcards("x[1]"));
         assert!(!has_wildcards("x\\[1\\]"));
+        assert!(!has_wildcards("x["));
+        assert_eq!(
+            parts("d*/x["),
+            [Part::Pattern("d*".into()), Part::Name("x[".into())]
+        );
         assert_eq!(unescape("x\\[1\\]"), "x[1]");
     }
 }

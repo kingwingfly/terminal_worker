@@ -21,9 +21,14 @@ test('manual, large terminal, collapsible layouts, prompt/listing colors, icons 
   for(let i=0;i<2;i++){
    const toggle=page.getByRole('button',{name:'Toggle file panel'});await toggle.click();await expect(page.getByRole('region',{name:'File manager',exact:true})).toBeHidden();await expect(page.getByRole('region',{name:'Terminal',exact:true})).toBeVisible();
    expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
-   await toggle.click();await expect(page.getByRole('region',{name:'File manager',exact:true})).toBeVisible();await page.getByRole('button',{name:'Toggle workspace layout'}).click();
+   await toggle.click();await expect(page.getByRole('region',{name:'File manager',exact:true})).toBeVisible();
+   // Phones keep the files above the terminal: no side-by-side switch there.
+   const layout=page.getByRole('button',{name:'Toggle workspace layout'});if(width>650)await layout.click();else await expect(layout).toBeHidden();
   }
  }
+ // A phone shows the terminal as an app: the command line on the screen, the account on one line.
+ const box=await page.getByRole('combobox').boundingBox();expect(box.y+box.height).toBeLessThanOrEqual(1000);
+ expect(await page.locator('.lock').evaluate(e=>e.getBoundingClientRect().height<60)).toBe(true);
  await page.setViewportSize({width:1440,height:1000});
  await run(page,'ls');await expect(page.locator('.listing-output .entry-directory').first()).toBeVisible();await expect(page.locator('.listing-output svg').first()).toBeVisible();
  expect(await page.locator('.entry-directory').first().evaluate(e=>getComputedStyle(e).color)).not.toBe(await page.locator('.entry-file').first().evaluate(e=>getComputedStyle(e).color));
@@ -66,7 +71,10 @@ test('PDF pages and PNG/JPEG/WebP previews load through protected file APIs',asy
    expect((await request.put(file(base+'/image.'+ext),{headers,data:Buffer.from(bytes)})).status()).toBe(201);
    await run(page,'open '+base+'/image.'+ext);await expect.poll(()=>page.locator('.media-frame img').evaluate(e=>e.naturalWidth)).toBe(8);await page.getByRole('button',{name:'Close preview'}).click();
   }
-  await run(page,'open '+base+'/sample.pdf');await expect(page.locator('.pdf-page')).toBeVisible();await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('1 / 2');
-  await page.getByRole('button',{name:'Next page →'}).click();await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('2 / 2');await page.getByRole('button',{name:'Close preview'}).click();await expect(page.locator('#viewer')).toBeHidden();
+  // A PDF scrolls as one document, its pages drawn as they come near, and opens where it was left.
+  await run(page,'open '+base+'/sample.pdf');await expect(page.getByLabel('PDF page 1')).toBeVisible();await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('1 / 2');
+  await expect.poll(()=>page.locator('.pdf-page').evaluateAll(pages=>pages.filter(p=>p.width>0).length)).toBe(2);
+  await page.getByRole('button',{name:'Next page'}).click();await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('2 / 2');await page.getByRole('button',{name:'Close preview'}).click();await expect(page.locator('#viewer')).toBeHidden();
+  await run(page,'open '+base+'/sample.pdf');await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('2 / 2');await page.getByRole('button',{name:'Close preview'}).click();
  }finally{await request.delete(file(base)+'&recursive=true',{headers});}
 });

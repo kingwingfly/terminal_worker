@@ -1,16 +1,6 @@
 //! The shell's grammar beyond one command: pipelines, the items xargs reads, and the commands
 //! fd -x and -X run. Nothing here runs anything.
 
-/// The stages of the pipeline `input`, each its words, quoted as [`crate::split_command`]
-/// quotes them. An unquoted `|` separates stages; the shell's other operators are refused
-/// rather than taken as words.
-pub fn pipeline(input: &str) -> Result<Vec<Vec<String>>, String> {
-    Ok(words(input)?
-        .into_iter()
-        .map(|stage| stage.into_iter().map(|word| word.text).collect())
-        .collect())
-}
-
 /// A word of a command line: its text, and, if it has wildcards outside quotes, the pattern
 /// it expands to the paths of, as [`crate::glob`] reads patterns.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,8 +9,9 @@ pub struct Word {
     pub pattern: Option<String>,
 }
 
-/// The stages of the pipeline `input`, as [`pipeline`] splits it, each its words with their
-/// patterns.
+/// The stages of the pipeline `input`, each its words with their patterns, quoted as
+/// [`crate::split_command`] quotes them. An unquoted `|` separates stages; the shell's other
+/// operators are refused rather than taken as words.
 pub fn words(input: &str) -> Result<Vec<Vec<Word>>, String> {
     let mut stages = Vec::new();
     let mut words = Vec::new();
@@ -48,12 +39,15 @@ pub fn words(input: &str) -> Result<Vec<Vec<Word>>, String> {
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
         if escaped {
-            literal(c, &mut word, &mut pattern);
+            // A backslash and a newline join two lines.
+            if c != '\n' {
+                literal(c, &mut word, &mut pattern);
+                active = true;
+            }
             escaped = false;
-            active = true;
             continue;
         }
-        if c == '\\' && quote != Some('\'') {
+        if c == '\\' && crate::escapes(quote, chars.peek().copied()) {
             escaped = true;
             continue;
         }
@@ -282,6 +276,14 @@ pub fn exec_all(template: &[String], paths: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// The words of each stage of `input`, as text.
+    fn pipeline(input: &str) -> Result<Vec<Vec<String>>, String> {
+        Ok(words(input)?
+            .into_iter()
+            .map(|stage| stage.into_iter().map(|word| word.text).collect())
+            .collect())
+    }
+
     #[test]
     fn pipelines_split_on_unquoted_bars_only() {
         assert_eq!(
@@ -331,6 +333,12 @@ mod tests {
             ]
         );
         let texts: Vec<_> = stage.iter().map(|w| w.text.as_str()).collect();
+        // A backslash kept in double quotes is a character of the name, as a quoted * is.
+        let word = &words(r#"ls "x\*"*"#).unwrap()[0][1];
+        assert_eq!(word.text, r"x\**");
+        let pattern = word.pattern.as_deref().unwrap();
+        assert!(crate::glob::matches(pattern, r"x\*.md"));
+        assert!(!crate::glob::matches(pattern, "x*.md"));
         assert_eq!(
             texts,
             ["rm", "-rf", "*", "a*", "b?", "c*", "d[1]*", "plain"]

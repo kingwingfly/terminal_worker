@@ -12,14 +12,8 @@ export const ready = fetch('/terminal-config.json').then(async response => {
 const $ = id => document.getElementById(id);
 const fileUrl = path => '/api/file?path=' + encodeURIComponent(path);
 // Previews render in Rust (crates/frontend/src/viewer.rs), through window.terminalPreview.
-let directory = '/', noticeTimer, opener, viewerVersion = 0, releasePreview;
+let directory = '/', opener, viewerVersion = 0, releasePreview;
 const changed = () => window.dispatchEvent(new Event('terminal:changed'));
-// A message at the edge of the screen; with `cancel`, a button that calls it.
-function notice(message, duration = 7000, cancel) {
-  clearTimeout(noticeTimer); const element = $('notice'); element.textContent = message;
-  if (cancel) { const button = document.createElement('button'); button.type = 'button'; button.className = 'notice-cancel'; button.textContent = 'Cancel'; button.onclick = cancel; element.append(' ', button); }
-  element.classList.add('visible'); if (duration) noticeTimer = setTimeout(() => element.classList.remove('visible'), duration);
-}
 async function api(url, options) {
   const response = await fetch(url, options);
   if (!response.ok) { let error; try { error = (await response.json()).error; } catch {} const failure = new Error(error || `Request failed (${response.status})`); failure.status = response.status; throw failure; }
@@ -69,7 +63,29 @@ function askCredentials({ title, description, username, chooseUser = false, newP
     dialog.showModal(); (currentPassword ? $('current-password') : password).focus();
   });
 }
+// What others change, as it happens: the authority tells this page which directories changed
+// that its account may list (/api/events), and the tabs that show one list it again. A burst of
+// changes comes as one. Pings keep proxies and tunnels from closing a quiet line; a line that
+// drops opens again, and what was missed meanwhile is listed again.
+let events, eventsRetry = 0, pendingDirs = new Set(), pendingTimer;
+function listen() {
+  events?.close();
+  const socket = events = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/events`);
+  let ping;
+  socket.onopen = () => { if (eventsRetry) changed(); eventsRetry = 0; ping = setInterval(() => socket.send('ping'), 30000); };
+  socket.onmessage = event => {
+    let dirs; try { dirs = JSON.parse(event.data).changed; } catch { return; }
+    if (!Array.isArray(dirs)) return;
+    dirs.forEach(dir => pendingDirs.add(dir));
+    clearTimeout(pendingTimer);
+    pendingTimer = setTimeout(() => { const detail = [...pendingDirs]; pendingDirs = new Set(); window.dispatchEvent(new CustomEvent('terminal-remote', { detail })); }, 250);
+  };
+  socket.onclose = () => { clearInterval(ping); if (events === socket) setTimeout(listen, Math.min(30000, 1000 * 2 ** eventsRetry++)); };
+}
+listen();
 async function identityChanged() {
+  // A new account hears of what it may list: the line opens again with its session.
+  listen();
   // A private preview must not survive switching to a less privileged account.
   if ($('viewer').open) await closeViewer();
   changed();
@@ -111,7 +127,8 @@ async function accountCommand(args, cwd) {
     if (args.length > 2) throw new Error('Usage: man [COMMAND]');
     const { manual } = await import('./manual.mjs');
     const text = manual(args[1]); const version = await cleanupViewer(); if (version !== viewerVersion) return {};
-    $('viewer-title').textContent = args[1] ? 'man · ' + args[1] : 'Terminal Worker · Manual'; $('download').hidden = true;
+    trail.length = 0; showTrail();
+    viewerTitle(args[1] ? 'man · ' + args[1] : 'Terminal Worker · Manual'); $('download').hidden = true;
     const article = document.createElement('article'); article.className = 'markdown manual'; article.innerHTML = window.terminalPreview.markdown(text, '/'); $('viewer-content').replaceChildren(article);
     if (!$('viewer').open) { opener = document.activeElement; $('viewer').showModal(); }
     return {};
@@ -167,15 +184,16 @@ async function accountCommand(args, cwd) {
   changed(); return result;
 }
 let uploading = null;
-// Upload `files` into `path`, one after another, in chunks that resume if interrupted; Cancel
-// stops the batch and removes the unfinished file.
-async function uploadFiles(files, path) {
-  if (!files.length) return;
-  if (uploading) { notice('An upload is already in progress; please wait'); return; }
+// Upload `files` into `path`, one after another, in chunks that resume if interrupted;
+// `progress` hears how each goes. Settles with a line per file. Cancelling (cancelUploads) stops
+// the batch and removes the unfinished file.
+async function uploadFiles(files, path, progress) {
+  if (!files.length) return [];
+  if (uploading) throw new Error('An upload is already in progress in another tab; wait for it, or cancel it there');
   const controller = uploading = new AbortController();
   const results = [];
   try {
-    if (!await unlock(path)) return;
+    if (!await unlock(path)) return [];
     const rust = window.terminalUploads;
     for (const file of files) {
       if (controller.signal.aborted) { results.push(`✕ ${file.name}: Upload cancelled`); continue; }
@@ -183,41 +201,73 @@ async function uploadFiles(files, path) {
         if (!rust.uploadable(file.name)) throw new Error('Unsupported file type');
         if (file.size > rust.maxFile) throw new Error(`Exceeds the ${rust.maxFile / 1e9} GB limit`);
         if (/\.(mp4|m4v|mov|m4a)$/i.test(file.name)) {
-          notice(`Checking faststart for ${file.name}...`, 0);
+          progress(`↑ ${file.name} · checking faststart`);
           const result = await inspectFaststart(file);
           if (!result.faststart) throw new Error('moov follows mdat. First run ffmpeg -i input.mp4 -c copy -movflags +faststart output.mp4');
         }
         const destination = (path === '/' ? '' : path.replace(/\/$/, '')) + '/' + file.name;
         const done = await uploadFile(file, destination, { signal: controller.signal,
-          progress: state => { notice(`↑ ${file.name} · ${state}`, 0, () => controller.abort()); if (!state.startsWith('hashing')) changed(); } });
+          progress: state => { progress(`↑ ${file.name} · ${state}`); if (!state.startsWith('hashing')) changed(); } });
         results.push(`✓ ${file.name}${done.resumed ? ' (resumed)' : ''}`);
       } catch (error) { results.push(`✕ ${file.name}: ${error instanceof Cancelled ? 'Upload cancelled' : error.message}`); }
     }
-    notice(results.join('\n'), results.some(r => r.startsWith('✕')) ? 25000 : 7000);
-  } catch (error) { notice(error.message); }
-  finally { uploading = null; changed(); }
+    return results;
+  } finally { uploading = null; changed(); }
 }
 // Cancel the uploads in progress, if any; whether there were.
 function cancelUploads() { if (!uploading) return false; uploading.abort(); return true; }
-// Choose files and upload them into `path`; settles when the uploads end, or the chooser closes.
-async function upload(path) {
-  if (!await unlock(path)) return;
-  const input = document.createElement('input'); input.type = 'file'; input.multiple = true;
-  await new Promise(resolve => {
-    input.onchange = () => uploadFiles([...input.files], path).finally(resolve);
-    input.oncancel = resolve;
-    input.click();
+// Open the file chooser now, while the tap or the key that asked for it lets a page open one:
+// phones refuse once a request has been awaited. Settles with the files chosen; none if closed.
+const chooser = Object.assign(document.createElement('input'), { type: 'file', multiple: true });
+let choosing = null;
+function chooseFiles() {
+  choosing?.([]);
+  return new Promise(resolve => {
+    choosing = files => { choosing = null; chooser.onchange = chooser.oncancel = null; resolve(files); };
+    chooser.value = '';
+    chooser.onchange = () => choosing?.([...chooser.files]);
+    chooser.oncancel = () => choosing?.([]);
+    chooser.click();
   });
 }
 let depth = 0;
 window.addEventListener('dragenter', e => { if (e.dataTransfer?.types.includes('Files')) { e.preventDefault(); depth++; $('dropzone').hidden = false; } });
 window.addEventListener('dragover', e => { if (e.dataTransfer?.types.includes('Files')) e.preventDefault(); });
 window.addEventListener('dragleave', () => { if (--depth <= 0) { depth = 0; $('dropzone').hidden = true; } });
-window.addEventListener('drop', e => { e.preventDefault(); depth = 0; $('dropzone').hidden = true; if (e.dataTransfer?.files.length) uploadFiles([...e.dataTransfer.files], directory); });
+// Dropped files go to the active tab, which uploads them as its upload command would.
+window.addEventListener('drop', e => { e.preventDefault(); depth = 0; $('dropzone').hidden = true; if (e.dataTransfer?.files.length) window.dispatchEvent(new CustomEvent('terminal-files', { detail: [...e.dataTransfer.files] })); });
 
+// Where each file's preview was left, by path, kept in this browser for the last 200 files, so
+// that opening one again continues there: the page code records how far it was scrolled and
+// played; slides and PDFs record their slide, page and zoom (viewer.rs).
+const PLACES = 'terminal-places';
+function places() { try { return JSON.parse(localStorage.getItem(PLACES) || '[]'); } catch { return []; } }
+function place(path) { return places().find(([p]) => p === path)?.[1] ?? null; }
+function setPlace(path, value) {
+  try {
+    const list = places(), old = list.find(([p]) => p === path)?.[1];
+    localStorage.setItem(PLACES, JSON.stringify([[path, { ...old, ...value }], ...list.filter(([p]) => p !== path)].slice(0, 200)));
+  } catch {}
+}
+// The file the viewer shows, and those it showed before, as links led from one to the next:
+// Back returns to them. A file opened from the terminal starts afresh.
+let shown = null;
+const trail = [];
+function showTrail() { $('viewer-back').hidden = !trail.length; $('viewer-back').title = trail.length ? `Back to ${trail.at(-1).path}` : ''; }
+async function follow(path, kind) { if (shown) trail.push(shown); return open(path, kind, true); }
+$('viewer-back').onclick = () => { const previous = trail.pop(); if (previous) void open(previous.path, previous.kind, true); };
+// The viewer's title. A path too long for the bar loses its start, not its file name: the title
+// overflows right to left (style.css), and <bdi> keeps the path's own order.
+function viewerTitle(text) { const title = document.createElement('bdi'); title.textContent = text; $('viewer-title').replaceChildren(title); }
 async function cleanupViewer() {
   const version = ++viewerVersion;
   const releases = [];
+  if (shown) {
+    const media = $('viewer-content').querySelector('video,audio');
+    setPlace(shown.path, { scroll: $('viewer-content').scrollTop, ...(media && media.currentTime > 1 ? { time: media.currentTime } : {}) });
+    // Kept once: the dialog's close cleans up again, after the content is gone.
+    shown = null;
+  }
   for (const frame of $('viewer-content').querySelectorAll('iframe')) {
     try { releases.push(frame.contentWindow?.signal?.dispose?.()); } catch (error) { console.warn('Failed to release game audio', error); }
   }
@@ -242,6 +292,18 @@ async function closeViewer() {
   if (version === viewerVersion) $('viewer').close();
 }
 $('viewer').addEventListener('cancel', event => { event.preventDefault(); void closeViewer(); });
+// Escape closes a dialog, and nothing else. Left to the browser, Safari also leaves its full-screen
+// window, so the page takes the key and asks the dialog to cancel, which each one handles as its
+// own Escape (the viewer closes, the editor asks about unsaved changes). Keys handled inside a
+// dialog first, as the preview search's and the editor's, are left alone.
+document.addEventListener('keydown', event => {
+  // A preview shown full screen leaves that first, as the browser does with Escape.
+  if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || document.fullscreenElement) return;
+  const dialog = document.querySelector('dialog[open]');
+  if (!dialog) return;
+  event.preventDefault();
+  if (dialog.dispatchEvent(new Event('cancel', { cancelable: true }))) dialog.close();
+});
 $('viewer').addEventListener('close', async () => {
   const returnFocus = opener;
   // Start exiting before removing a fullscreen child (e.g. a video or iframe),
@@ -283,7 +345,8 @@ function showChrome() {
   }, 2000);
 }
 const fullscreen = () => document.fullscreenElement === $('viewer-surface');
-$('viewer-surface').addEventListener('pointermove', () => { if (fullscreen()) showChrome(); });
+// A tap moves no pointer: pointerdown shows them on touch screens.
+for (const type of ['pointermove', 'pointerdown']) $('viewer-surface').addEventListener(type, () => { if (fullscreen()) showChrome(); });
 $('viewer-surface').addEventListener('focusin', event => { if (fullscreen() && event.target.closest(bars)) showChrome(); });
 document.addEventListener('fullscreenchange', () => {
   const active = !!document.fullscreenElement;
@@ -294,12 +357,14 @@ document.addEventListener('fullscreenchange', () => {
   else { clearTimeout(chromeTimer); $('viewer-surface').classList.remove('chrome'); }
 });
 window.addEventListener('message', event => { if (event.origin === location.origin && event.source === $('viewer-content').querySelector('iframe')?.contentWindow && event.data === 'close-game') closeViewer(); });
-async function open(path, kind) {
+async function open(path, kind, followed = false) {
+  if (!followed) trail.length = 0;
   const version = await cleanupViewer();
   if (version !== viewerVersion) return;
+  shown = { path, kind }; showTrail();
   const content = $('viewer-content'), dialog = $('viewer');
   $('download').hidden = false;
-  $('viewer-title').textContent = path; $('download').href = fileUrl(path); $('download').download = path.split('/').pop();
+  viewerTitle(path); $('download').href = fileUrl(path); $('download').download = path.split('/').pop();
   if (!dialog.open) { opener = document.activeElement; dialog.showModal(); }
   content.textContent = 'Loading...';
   try {
@@ -318,12 +383,18 @@ async function open(path, kind) {
     // The preview mounts only while the viewer still shows this file.
     content.dataset.version = String(version);
     const release = await window.terminalPreview.show(content, path, kind, String(version));
-    if (version === viewerVersion) releasePreview = release; else release();
+    if (version === viewerVersion) releasePreview = release; else return release();
+    // Back where it was left.
+    const saved = place(path);
+    if (saved?.scroll) requestAnimationFrame(() => { content.scrollTop = saved.scroll; });
+    const media = content.querySelector('video,audio');
+    if (media && saved?.time) media.addEventListener('loadedmetadata', () => { if (saved.time < media.duration - 1) media.currentTime = saved.time; }, { once: true });
   } catch (error) { if (version === viewerVersion) { content.textContent = error.message; content.classList.add('viewer-error'); } }
 }
 // Leptos updates the DOM asynchronously. Observe committed output, then scroll
 // at the next layout frame instead of measuring the previous command's height.
-// Every tab's transcript follows its output; a tab shown again scrolls to its end.
+// Every tab's transcript follows its output; a tab shown again scrolls to its end, as does one
+// that the on-screen keyboard shrinks.
 const observedTranscripts = new WeakSet();
 function observeTranscript() {
   for (const log of document.querySelectorAll('.transcript')) {
@@ -332,11 +403,29 @@ function observeTranscript() {
     if (!observedTranscripts.has(log)) {
       observedTranscripts.add(log);
       new MutationObserver(scroll).observe(log, { childList: true, subtree: true, characterData: true });
+      new ResizeObserver(scroll).observe(log);
     }
     scroll();
   }
 }
-window.terminal = { config: () => configuration.branding, open, unlock, upload, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
+// Phones: the app takes the part of the screen that is visible, which the on-screen keyboard
+// shrinks, so that the command line stays above it (--app-height and --app-top, style.css); while
+// the keyboard is open, the page is marked .keyboard, and the header and the files make room.
+if (window.visualViewport) {
+  const viewport = window.visualViewport;
+  let tallest = 0, width = 0;
+  const fit = () => {
+    const root = document.documentElement;
+    if (viewport.width !== width) { width = viewport.width; tallest = 0; }
+    tallest = Math.max(tallest, viewport.height);
+    root.style.setProperty('--app-height', `${viewport.height}px`);
+    root.style.setProperty('--app-top', `${viewport.offsetTop}px`);
+    root.classList.toggle('keyboard', viewport.height < tallest * 0.8);
+    if (document.activeElement?.classList.contains('command-input')) document.activeElement.scrollIntoView({ block: 'nearest' });
+  };
+  viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
+}
+window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, unlock, chooseFiles, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]')) return;
@@ -349,6 +438,27 @@ window.terminal = { config: () => configuration.branding, open, unlock, upload, 
   observeTranscript();
   restoreTerminalFocus();
 } };
+
+// A file name keeps to one line; one that does not fit slides to show the rest (style.css). Each
+// gets how far it overflows, measured as the list changes, a pane is shown or hidden, or the
+// window resizes.
+let namesFrame;
+function measureNames() {
+  cancelAnimationFrame(namesFrame);
+  namesFrame = requestAnimationFrame(() => {
+    for (const name of document.querySelectorAll('.files .filename')) {
+      const overflow = name.scrollWidth - name.clientWidth;
+      if (overflow > 2) {
+        name.dataset.overflow = '';
+        name.style.setProperty('--overflow', `-${overflow}px`);
+        name.style.setProperty('--duration', `${Math.max(3, overflow / 40)}s`);
+      } else delete name.dataset.overflow;
+    }
+  });
+}
+new MutationObserver(changes => { if (changes.some(change => change.target.closest?.('.files') || change.attributeName)) measureNames(); })
+  .observe($('app'), { childList: true, subtree: true, characterData: true, attributeFilter: ['data-files', 'data-terminal', 'data-layout'] });
+window.addEventListener('resize', measureNames);
 
 // Dialog focus restoration and Leptos updates may finish after the command promise.
 // Wait for the browser's next layout; never steal focus from another open modal.

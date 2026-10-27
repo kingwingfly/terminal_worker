@@ -69,21 +69,32 @@ pub fn fuzzy_score(needle: &str, name: &str) -> Option<(u8, usize, usize, usize)
     best
 }
 
-/// Unlike the command parser, tolerate an unfinished quote/escape at the end.
-fn partial_words(input: &str) -> Vec<String> {
+/// Unlike the command parser, tolerate an unfinished quote/escape at the end. Each word comes
+/// with how to type it again: quoted by [`quote_word`], or, if it has wildcards outside quotes,
+/// as it was typed, so that they still expand and quoted ones stay literal.
+fn partial_words(input: &str) -> (Vec<String>, Vec<String>) {
     let mut words = Vec::new();
+    let mut typed = Vec::new();
     let mut word = String::new();
     let mut quote = None;
     let mut escaped = false;
     let mut active = false;
-    for c in input.chars() {
+    let mut wild = false;
+    let mut start = 0;
+    for (i, c) in input.char_indices() {
+        if !active && !c.is_whitespace() {
+            start = i;
+        }
         if escaped {
-            word.push(c);
+            // A backslash and a newline join two lines.
+            if c != '\n' {
+                word.push(c);
+            }
             escaped = false;
             active = true;
             continue;
         }
-        if c == '\\' && quote != Some('\'') {
+        if c == '\\' && crate::escapes(quote, input[i + 1..].chars().next()) {
             escaped = true;
             active = true;
             continue;
@@ -99,17 +110,27 @@ fn partial_words(input: &str) -> Vec<String> {
             active = true;
         } else if c.is_whitespace() {
             if active {
+                typed.push(retyped(&word, std::mem::take(&mut wild), &input[start..i]));
                 words.push(std::mem::take(&mut word));
                 active = false;
             }
         } else {
             word.push(c);
+            wild |= matches!(c, '*' | '?' | '[');
             active = true;
         }
     }
     // The empty final argument in `open ` is meaningful.
+    typed.push(retyped(
+        &word,
+        wild,
+        if active { &input[start..] } else { "" },
+    ));
     words.push(word);
-    words
+    (words, typed)
+}
+fn retyped(word: &str, wild: bool, raw: &str) -> String {
+    if wild { raw.into() } else { quote_word(word) }
 }
 fn quote(path: &str) -> String {
     format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
@@ -184,12 +205,14 @@ fn nested(words: &[String]) -> Option<usize> {
 
 pub fn query(input: &str) -> Query {
     let (before, stage) = last_stage(input);
-    query_words(before.trim_end(), &partial_words(stage), before.is_empty())
+    let (words, typed) = partial_words(stage);
+    query_words(before.trim_end(), &words, &typed, before.is_empty())
 }
 
-/// Complete `words`, a command and its arguments, typed after `context` on the line. Only the
-/// line's first command, alone, may also complete as a path to open or enter.
-fn query_words(context: &str, words: &[String], first: bool) -> Query {
+/// Complete `words`, a command and its arguments, typed after `context` on the line, each of
+/// them typed again as `typed` says. Only the line's first command, alone, may also complete as
+/// a path to open or enter.
+fn query_words(context: &str, words: &[String], typed: &[String], first: bool) -> Query {
     let after = |head: &str| match (context.is_empty(), head.is_empty()) {
         (true, _) => head.to_string(),
         (false, true) => context.to_string(),
@@ -223,11 +246,8 @@ fn query_words(context: &str, words: &[String], first: bool) -> Query {
         }
     }
     if let Some(at) = nested(words) {
-        let head = words[..at]
-            .iter()
-            .map(|w| quote_word(w))
-            .collect::<Vec<_>>();
-        return query_words(&after(&head.join(" ")), &words[at..], false);
+        let head = typed[..at].join(" ");
+        return query_words(&after(&head), &words[at..], &typed[at..], false);
     }
     let (head, raw) = if auto_open {
         (String::new(), command)
@@ -245,25 +265,17 @@ fn query_words(context: &str, words: &[String], first: bool) -> Query {
         if index >= words.len() {
             return Query::None;
         }
-        let head = words[..index]
-            .iter()
-            .chain(&words[index..words.len() - 1])
-            .map(|w| quote_word(w))
-            .collect::<Vec<_>>()
-            .join(" ");
-        (head, words.last().unwrap().as_str())
+        (
+            typed[..words.len() - 1].join(" "),
+            words.last().unwrap().as_str(),
+        )
     } else if PATH_OPERANDS.contains(&command) && words.len() > 1 {
         let last = words.last().unwrap();
         let ended = words[1..words.len() - 1].iter().any(|w| w == "--");
         if last.starts_with('-') && !ended {
             return Query::None;
         }
-        let head = words[..words.len() - 1]
-            .iter()
-            .map(|w| quote_word(w))
-            .collect::<Vec<_>>()
-            .join(" ");
-        (head, last.as_str())
+        (typed[..words.len() - 1].join(" "), last.as_str())
     } else if ONE_PATH.contains(&command) && words.len() == 2 {
         (command.to_string(), words[1].as_str())
     } else {
@@ -447,6 +459,17 @@ mod tests {
                 split_command(&hits[0].value).unwrap(),
                 ["rm", "-r", "--", "media/spéctrum \"calibration\".txt"]
             );
+        }
+        // Earlier wildcards keep their meaning: unquoted ones still expand, quoted ones do not.
+        for (input, head) in [
+            ("rm -rf *.tmp d[1]'*' do", "rm -rf *.tmp d[1]'*'"),
+            ("cp '*.md' \"a?\" do", "cp \"*.md\" \"a?\""),
+            ("fd -e md -x cp {} *.bak do", "fd -e md -x cp {} *.bak"),
+        ] {
+            let Query::Paths(q) = query(input) else {
+                panic!("{input}")
+            };
+            assert_eq!(q.head, head, "{input}");
         }
         let Query::Paths(q) = query("rm ") else {
             panic!()

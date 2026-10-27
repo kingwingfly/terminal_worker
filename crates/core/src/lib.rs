@@ -138,20 +138,35 @@ pub fn parent(path: &str) -> &str {
     }
 }
 
+/// Whether a backslash escapes `next`, the character after it, within `quote`, as bash reads a
+/// line: outside quotes it escapes anything; within double quotes only `$`, `` ` ``, `"`, `\`
+/// and a newline, and is itself before anything else; within single quotes nothing.
+pub(crate) fn escapes(quote: Option<char>, next: Option<char>) -> bool {
+    match quote {
+        None => true,
+        Some('"') => matches!(next, Some('$' | '`' | '"' | '\\' | '\n')),
+        Some(_) => false,
+    }
+}
+
 pub fn split_command(input: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote = None;
     let mut escaped = false;
     let mut active = false;
-    for c in input.chars() {
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
         if escaped {
-            word.push(c);
+            // A backslash and a newline join two lines.
+            if c != '\n' {
+                word.push(c);
+                active = true;
+            }
             escaped = false;
-            active = true;
             continue;
         }
-        if c == '\\' && quote != Some('\'') {
+        if c == '\\' && escapes(quote, chars.peek().copied()) {
             escaped = true;
             continue;
         }
@@ -289,6 +304,26 @@ mod tests {
         assert_eq!(split_command("open 'a b.md'").unwrap(), ["open", "a b.md"]);
         assert_eq!(split_command("mkdir a\\ b").unwrap(), ["mkdir", "a b"]);
         assert!(split_command("open 'a").is_err());
+    }
+    #[test]
+    fn backslashes_read_as_bash_reads_them() {
+        for (line, word) in [
+            // Within double quotes, a backslash escapes only $ ` " \ and a newline.
+            (r#""a\b""#, r"a\b"),
+            (r#""\d+""#, r"\d+"),
+            (r#""\$x\`\"\\""#, r#"$x`"\"#),
+            (r#""\*""#, r"\*"),
+            // Outside quotes it escapes anything; within single quotes nothing.
+            (r"a\ b\\c", r"a b\c"),
+            (r"'a\b\'", r"a\b\"),
+            // A backslash and a newline join lines, in double quotes too.
+            ("a\\\nb", "ab"),
+            ("\"a\\\nb\"", "ab"),
+        ] {
+            assert_eq!(split_command(line).unwrap(), [word], "{line}");
+        }
+        assert!(split_command(r#""a\"#).is_err());
+        assert!(split_command("a\\").is_err());
     }
     #[test]
     fn rm_requires_an_explicit_path_and_known_options() {

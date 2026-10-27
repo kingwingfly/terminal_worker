@@ -77,6 +77,14 @@ test('wildcards expand to sorted paths as bash expands them, and rm -rf * emptie
   // Quoted or escaped wildcards are literal; a pattern that matches nothing stays as typed.
   expect(await output(page, `echo '*' \\*.md "?.md" *.none`)).toBe('* *.md ?.md *.none');
   expect(await output(page, 'cat docs/*.md docs/*.txt | wc -l')).toBe('6');
+  // Backslashes read as bash reads them: in double quotes they escape only $ ` " \ and a newline.
+  expect(await output(page, String.raw`echo "a\b" 'c\d' e\\f "\$\"\\"`)).toBe('a\\b c\\d e\\f $"\\');
+  expect(await output(page, String.raw`grep -c "\w+ now" docs/c.txt`)).toBe('1');
+  // Completing a later path keeps an earlier wildcard unquoted, so that it still expands.
+  const input = page.getByRole('combobox', { name: 'Terminal command' });
+  await input.fill('rm *.tmp do'); await input.press('Tab');
+  await expect(input).toHaveValue('rm *.tmp "docs/"');
+  await input.press('Escape');
   await run(page, 'rm *.tmp');
   await expect.poll(() => names('')).toEqual(['.hidden', 'a.md', 'docs']);
   // rm -rf * leaves hidden names, as bash does; in an empty directory it does nothing.
@@ -105,9 +113,15 @@ test('wildcard suffixes use search permission and quoted bracket characters stay
   expect(await output(page, 'echo d*/../a.md')).toBe('docs/../a.md');
   expect(await output(page, 'echo d*/missing.md')).toBe('d*/missing.md');
   expect(await output(page, 'echo d*/*.md')).toBe('d*/*.md');
+  expect(await output(page, 'echo docs/../a*')).toBe('docs/../a.md');
+  // A [ that closes no set is a name, which search permission finds.
+  expect((await request.put(file(base + '/docs/x['), { headers, data: ' ' })).status()).toBe(201);
+  expect(await output(page, 'echo d*/x[')).toBe('docs/x[');
   expect((await command(request, ['chmod', '700', base + '/docs'])).ok()).toBe(true);
   expect(await output(page, 'echo d*/b.md')).toBe('d*/b.md');
   expect(await output(page, 'echo d*/../a.md')).toBe('d*/../a.md');
+  // Leaving a directory needs search permission in it, before a pattern as after one.
+  expect(await output(page, 'echo docs/../a*')).toBe('docs/../a*');
 });
 
 test('mv and cp follow Linux defaults, ask with -i, share content, and refuse what rename would', async ({ page, request }) => {

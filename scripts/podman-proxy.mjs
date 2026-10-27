@@ -18,11 +18,20 @@ export function podmanProxy(listen, upstream) {
       if (body) { delete headers['transfer-encoding']; headers['content-length'] = Buffer.byteLength(body); }
       const forwarded = http.request({ socketPath: upstream, method: req.method, path: req.url, headers }, reply => {
         res.writeHead(reply.statusCode, reply.rawHeaders);
+        // A stream cut short (Podman stopped, a container killed while attached) ends the
+        // reply rather than throwing an unhandled error.
+        reply.on('error', () => res.destroy());
         reply.pipe(res);
       });
-      forwarded.on('error', error => { if (!res.headersSent) res.writeHead(502); res.end(String(error)); });
+      forwarded.on('error', error => {
+        if (res.headersSent || res.destroyed) res.destroy();
+        else { res.writeHead(502); res.end(String(error)); }
+      });
+      // A client that goes away (a long poll such as /wait aborted) releases Podman's side too.
+      res.on('close', () => { if (!res.writableFinished) forwarded.destroy(); });
       if (body) forwarded.end(body); else req.pipe(forwarded);
     };
+    req.on('error', () => res.destroy());
     if (req.method !== 'POST' || !creates.test(req.url)) return send();
     const parts = [];
     req.on('data', part => parts.push(part));

@@ -110,8 +110,40 @@ test('Rust previews: highlighted code, diagrams, maths, links within the filesys
   await close(page);
 
   await run(page,'open '+base+'/one.pdf');await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('1 / 1');await expect(page.locator('.pdf-page')).toBeVisible();
-  await expect(page.getByRole('button',{name:'Next page →'})).toBeDisabled();await close(page);
+  await expect(page.getByRole('button',{name:'Next page'})).toBeDisabled();await close(page);
   expect(loaded).toContain('preview_pdf');
   expect(errors).toEqual([]);
+ }finally{await request.delete(file(base)+'&recursive=true',{headers});}
+});
+
+test('a link opens another file with a way back; slides, PDFs and text open where they were left; slide themes',async({page,request})=>{
+ const base='/viewer-'+Date.now();await request.post('/api/login',{headers,data:{password}});await request.post('/api/mkdir?path='+base,{headers});
+ try{
+  const files={'deck.slides.md':'# One\n\n[notes](notes.md)\n\n---\n\n# Two\n\n---\n\n# Three\n','notes.md':'# Notes\n\nReached by a link.\n','long.txt':'line\n'.repeat(400)};
+  for(const [name,text] of Object.entries(files))expect((await request.put(file(base+'/'+name),{headers,data:Buffer.from(text)})).status()).toBe(201);
+  await page.goto('/');
+  const status=page.locator('.slides-bar [role=status]'),theme=page.getByRole('combobox',{name:'Slide theme'});
+  await run(page,'open '+base+'/deck.slides.md');await expect(page.locator('.slides .slide')).toContainText('One');
+  // Slides look like a presentation, light by default, in a theme chosen for every deck.
+  await expect(page.locator('.slides')).toHaveAttribute('data-theme','light');await expect(theme).toHaveValue('light');
+  await theme.selectOption('sepia');await expect(page.locator('.slides')).toHaveAttribute('data-theme','sepia');
+  // A link opens its file in the viewer, and Back returns, to the slide it was on.
+  await expect(page.locator('#viewer-back')).toBeHidden();
+  await page.locator('.slides a',{hasText:'notes'}).click();
+  await expect(page.locator('#viewer-title')).toHaveText(base+'/notes.md');await expect(page.locator('.markdown h1')).toHaveText('Notes');
+  await page.getByRole('button',{name:'Back'}).click();
+  await expect(page.locator('#viewer-title')).toHaveText(base+'/deck.slides.md');await expect(page.locator('#viewer-back')).toBeHidden();await expect(status).toHaveText('1 / 3');
+  // Opened again, the deck continues at its slide, in its theme.
+  await page.keyboard.press('ArrowRight');await page.keyboard.press('ArrowRight');await expect(status).toHaveText('3 / 3');
+  await close(page);
+  await run(page,'open '+base+'/deck.slides.md');await expect(status).toHaveText('3 / 3');await expect(theme).toHaveValue('sepia');
+  await close(page);
+  // Text opens scrolled where it was left.
+  await run(page,'open '+base+'/long.txt');await expect(page.locator('.text-preview')).toBeVisible();
+  await page.locator('#viewer-content').evaluate(content=>{content.scrollTop=2000;});
+  await close(page);
+  await run(page,'open '+base+'/long.txt');await expect(page.locator('.text-preview')).toBeVisible();
+  await expect.poll(()=>page.locator('#viewer-content').evaluate(content=>content.scrollTop)).toBeGreaterThan(1500);
+  await close(page);
  }finally{await request.delete(file(base)+'&recursive=true',{headers});}
 });

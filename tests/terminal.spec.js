@@ -80,8 +80,10 @@ test('drag/drop uploads images and faststart videos; rejects tail-moov before st
     const transfer = await page.evaluateHandle(({ name, bytes }) => {
       const dt = new DataTransfer(); dt.items.add(new File([new Uint8Array(bytes)], name)); return dt;
     }, { name, bytes });
+    // Dropped files upload in the active tab, as its upload command does.
+    await expect(page.locator('.busy')).toHaveText('↵');
     await page.dispatchEvent('body', 'drop', { dataTransfer: transfer });
-    if (name === 'tail-moov.mp4') await expect(page.locator('#notice')).toContainText('moov follows mdat');
+    if (name === 'tail-moov.mp4') await expect(page.locator('.transcript')).toContainText('✕ tail-moov.mp4: moov follows mdat');
     else await expect(page.locator('.filename').filter({ hasText: name })).toBeVisible();
     await transfer.dispose();
   }

@@ -23,8 +23,10 @@ extern "C" {
     fn unlock(path: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = accountCommand)]
     fn account_command(args: JsValue, cwd: &str) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal)]
-    fn upload(path: &str) -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = terminal, js_name = chooseFiles)]
+    fn choose_files() -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = terminal, js_name = uploadFiles)]
+    fn upload_files(files: &JsValue, path: &str, progress: &js_sys::Function) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = cancelUploads)]
     fn cancel_uploads() -> bool;
     #[wasm_bindgen(js_namespace = terminal, js_name = setDirectory)]
@@ -117,6 +119,7 @@ fn upload_progress(entry: &Entry) -> Option<String> {
 fn render_line(line: LogLine) -> AnyView {
     match line {
         LogLine::Text(text) => view! { <pre class="output-line">{text}</pre> }.into_any(),
+        LogLine::Live(text) => view! { <pre class="output-line">{move || text.get()}</pre> }.into_any(),
         LogLine::Command { user, cwd, command } => {
             let symbol = if user == "root" { " # " } else { " $ " };
             view! { <pre class="command-echo"><span class="prompt-user">{user}</span><span class="prompt-separator">":"</span><span class="prompt-path">{cwd}</span><span class="prompt-symbol">{symbol}</span><span class="prompt-command">{command}</span></pre> }.into_any()
@@ -192,9 +195,20 @@ fn restore() -> (Vec<(String, Vec<String>)>, usize) {
 fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
     let id = shell.id;
     let current = move || active.get() == id;
+    // iOS corrects what is typed unless told not to, with an attribute Leptos does not name.
+    let command_input = NodeRef::<leptos::html::Input>::new();
+    Effect::new(move || {
+        if let Some(input) = command_input.get() {
+            let _ = input.set_attribute("autocorrect", "off");
+        }
+    });
     view! {
         <section class="terminal-panel" aria-label="Terminal" hidden=move || !current()>
-        <div class="transcript" role="log" aria-live="polite">{move || shell.lines.get().into_iter().map(render_line).collect_view()}</div>
+        // A tap on the transcript, as on a phone, goes to the command line, unless it selects text.
+        <div class="transcript" role="log" aria-live="polite" on:click=move |_| {
+            let selecting = web_sys::window().and_then(|w| w.get_selection().ok().flatten()).is_some_and(|s| !s.is_collapsed());
+            if !selecting { focus_input(); }
+        }>{move || shell.lines.get().into_iter().map(render_line).collect_view()}</div>
         <Show when=move || shell.completion.get().is_some() || !shell.completion_status.get().is_empty()>
             <div class="completion-pager">
                 <p class="completion-hint" role="status">{move || shell.completion.get().map(|s| format!("{} / {} · Tab next · Shift+Tab previous · → accept · Esc cancel", s.selected+1, s.candidates.len())).unwrap_or_else(|| shell.completion_status.get())}</p>
@@ -211,7 +225,7 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
         </Show>
         <form class="command-line" on:submit=move |event| { event.prevent_default(); shell.run(shell.input.get_untracked()); }>
             <label for=move || current().then_some("command")><span class="prompt-user">{move || shell.account.username.get()}</span><span class="prompt-separator">":"</span><span class="prompt-path">{move || shell.cwd.get()}</span><span class="prompt-symbol">{move || if shell.asking.get() { " ?" } else if shell.account.username.get() == "root" { " #" } else { " $" }}</span></label>
-            <input id=move || current().then_some("command") class="command-input" aria-label="Terminal command" autocomplete="off" spellcheck="false" prop:value=move || shell.input.get()
+            <input id=move || current().then_some("command") class="command-input" aria-label="Terminal command" autocomplete="off" spellcheck="false" autocapitalize="off" enterkeyhint="go" prop:value=move || shell.input.get()
                 role="combobox" aria-autocomplete="list" aria-controls=move || current().then_some("completions")
                 aria-expanded=move || shell.completion.get().is_some().to_string()
                 aria-activedescendant=move || shell.completion.get().map(|s| format!("completion-{id}-{}", s.selected))
@@ -228,18 +242,21 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
                         "Escape" => { e.prevent_default(); shell.cancel_completion(); },
                         "ArrowRight" if shell.completion.get_untracked().is_some() => { e.prevent_default(); shell.accept_completion(); },
                         "ArrowUp" | "ArrowDown" if shell.completion.get_untracked().is_some() => { e.prevent_default(); shell.complete(e.key() == "ArrowUp"); },
-                        "ArrowUp" | "ArrowDown" => {
-                            e.prevent_default();
-                            shell.reset_completion();
-                            let len = shell.history.with_untracked(Vec::len);
-                            let i = if e.key() == "ArrowUp" { shell.history_index.get_untracked().saturating_sub(1) } else { (shell.history_index.get_untracked()+1).min(len) };
-                            shell.history_index.set(i);
-                            shell.input.set(shell.history.with_untracked(|h| h.get(i).cloned().unwrap_or_default()));
-                        }, _ => {},
+                        "ArrowUp" | "ArrowDown" => { e.prevent_default(); shell.recall(e.key() == "ArrowUp"); },
+                        _ => {},
                     }
-                }/>
+                }
+                node_ref=command_input/>
             <span class="busy">{move || if shell.asking.get() { "Answer ↵" } else if shell.busy.get() { "Working..." } else { "↵" }}</span>
         </form>
+        // The keys a phone's keyboard lacks. Pressing one keeps the focus, and the keyboard, where
+        // they are.
+        <div class="touch-keys" aria-label="Terminal keys" on:pointerdown=move |e| e.prevent_default()>
+            <button type="button" aria-label="Tab: complete" on:click=move |_| { focus_input(); shell.complete(false); }>"Tab"</button>
+            <button type="button" aria-label="Previous command" on:click=move |_| { focus_input(); if shell.completion.get_untracked().is_some() { shell.complete(true) } else { shell.recall(true) } }>"↑"</button>
+            <button type="button" aria-label="Next command" on:click=move |_| { focus_input(); if shell.completion.get_untracked().is_some() { shell.complete(false) } else { shell.recall(false) } }>"↓"</button>
+            <button type="button" aria-label="Ctrl+C: stop" class="touch-stop" on:click=move |_| { focus_input(); shell.interrupt(); }>"^C"</button>
+        </div>
         </section>
     }
 }
@@ -257,6 +274,16 @@ fn App() -> impl IntoView {
     let description = branding["description"].as_str().unwrap_or("").to_owned();
     let layout = RwSignal::new(None::<bool>);
     let files_visible = RwSignal::new(true);
+    let terminal_visible = RwSignal::new(true);
+    // Either pane may be hidden, never both: hiding one shows the other.
+    let toggle = move |this: RwSignal<bool>, other: RwSignal<bool>| {
+        if this.get_untracked() {
+            this.set(false);
+            other.set(true);
+        } else {
+            this.set(true);
+        }
+    };
     let account = Account {
         writable: RwSignal::new(false),
         username: RwSignal::new("guest".into()),
@@ -358,6 +385,30 @@ fn App() -> impl IntoView {
         .add_event_listener_with_callback("terminal:changed", listener.as_ref().unchecked_ref())
         .unwrap();
     listener.forget();
+    // Directories others changed, which tabs showing them list again.
+    let remote = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
+        let dirs: Vec<String> = serde_wasm_bindgen::from_value(e.detail()).unwrap_or_default();
+        for shell in tabs.get_untracked() {
+            if dirs.contains(&shell.cwd.get_untracked()) {
+                spawn_local(async move {
+                    let _ = shell.refresh().await;
+                });
+            }
+        }
+    });
+    window
+        .add_event_listener_with_callback("terminal-remote", remote.as_ref().unchecked_ref())
+        .unwrap();
+    remote.forget();
+    // Files dropped on the page upload in the active tab.
+    let dropped =
+        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
+            current.get_untracked().upload_dropped(e.detail());
+        });
+    window
+        .add_event_listener_with_callback("terminal-files", dropped.as_ref().unchecked_ref())
+        .unwrap();
+    dropped.forget();
     // Alt+T opens a tab, Alt+W closes it, Alt+1…9 switch; browsers keep Ctrl+T and Ctrl+W.
     let keys =
         Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
@@ -398,14 +449,20 @@ fn App() -> impl IntoView {
         <main class="terminal-shell">
             <header><div class="wordmark"><span class="signal"></span>{title}<span class="subtitle">{subtitle}</span></div>
                 <button class="lock" on:click=move |_| current.get_untracked().run(if account.writable.get_untracked() { "logout".into() } else { "login".into() })>
-                    {move || if account.writable.get() { format!("● {} · Sign out", account.username.get()) } else { "○ guest · Sign in".into() }}
+                    // Kept to one line: a long name shortens, the action stays.
+                    <span class="lock-name">{move || if account.writable.get() { format!("● {}", account.username.get()) } else { "○ guest".into() }}</span>
+                    <span class="lock-action">{move || if account.writable.get() { " · Sign out" } else { " · Sign in" }}</span>
                 </button>
             </header>
             <section class="intro"><span class="eyebrow">"PUBLIC ARCHIVE / 001"</span><h1>{heading}</h1><p>{description}</p></section>
             <section class="workspace" aria-label="File terminal"
                 data-files=move || if files_visible.get() { "visible" } else { "hidden" }
+                data-terminal=move || if terminal_visible.get() { "visible" } else { "hidden" }
                 data-layout=move || match layout.get() { Some(true) => "columns", Some(false) => "rows", None => "auto" }>
-                <div class="workspace-toolbar"><button class="files-toggle" aria-label="Toggle file panel" aria-expanded=move || files_visible.get().to_string() on:click=move |_| files_visible.update(|value|*value=!*value)>{move || if files_visible.get() { "◂ Hide files" } else { "▸ Show files" }}</button>
+                <div class="workspace-toolbar"><div class="pane-toggles">
+                    <button class="files-toggle" aria-label="Toggle file panel" aria-expanded=move || files_visible.get().to_string() on:click=move |_| toggle(files_visible, terminal_visible)>{move || if files_visible.get() { "◂ Hide files" } else { "▸ Show files" }}</button>
+                    <button class="terminal-toggle" aria-label="Toggle terminal" aria-expanded=move || terminal_visible.get().to_string() on:click=move |_| toggle(terminal_visible, files_visible)>{move || if terminal_visible.get() { "◂ Hide terminal" } else { "▸ Show terminal" }}</button>
+                </div>
                     <button class="layout-toggle" aria-label="Toggle workspace layout" title="Toggle workspace layout"
                         on:click=move |_| {
                             let horizontal = layout.get_untracked().unwrap_or_else(|| {
@@ -426,7 +483,7 @@ fn App() -> impl IntoView {
                     {move || current.get().entries.get().into_iter().map(|entry| {
                         let command = format!("{} \"{}\"", if entry.directory { "cd" } else { "open" }, entry.path.replace('"', "\\\""));
                         let size = if entry.directory { String::new() } else { upload_progress(&entry).unwrap_or_else(|| format!("{:.1} KB", entry.size as f64 / 1000.0)) };
-                        view! { <button class="file" data-kind=if entry.directory { "directory".to_string() } else { entry.kind.clone() } title=format!("{} {}:{}", terminal_worker_core::permissions::mode_text(entry.mode, entry.directory), entry.owner, entry.group) on:click=move |_| current.get_untracked().run(command.clone())><span class="file-kind">{file_icon(&entry.kind, entry.directory)}</span><span class="filename">{entry.name}{if entry.directory { "/" } else { "" }}</span><span class="file-size">{size}</span></button> }
+                        view! { <button class="file" data-kind=if entry.directory { "directory".to_string() } else { entry.kind.clone() } title=format!("{} {}:{}", terminal_worker_core::permissions::mode_text(entry.mode, entry.directory), entry.owner, entry.group) on:click=move |_| current.get_untracked().run(command.clone())><span class="file-kind">{file_icon(&entry.kind, entry.directory)}</span><span class="filename"><span class="filename-text">{entry.name}{if entry.directory { "/" } else { "" }}</span></span><span class="file-size">{size}</span></button> }
                     }).collect_view()}
                     <p class="directory-error" role="status">{move || current.get().directory_error.get()}</p>
                     <Show when=move || current.get().entries.get().is_empty() && current.get().directory_error.get().is_empty()><p class="empty">"This directory is empty. Drop files here or use mkdir to create a directory."</p></Show>

@@ -2,7 +2,7 @@ use crate::db::{self, transact};
 use crate::{api, auth, jobs};
 use std::cell::Cell;
 use std::collections::BTreeSet;
-use terminal_worker_core::permissions::{GUEST, Node, Store, User};
+use terminal_worker_core::permissions::{EXEC, GUEST, Node, READ, Store, User};
 use worker::*;
 
 /// The R2 object that marks the bucket as managed by an authority, so that a lost authority is
@@ -28,9 +28,24 @@ impl DurableObject for TerminalAuthority {
     }
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         self.ready().await?;
+        if req.path() == "/api/events" {
+            return self.listen(&req);
+        }
         let reply = api::handle(&mut req, &self.env, &self.state).await?;
         self.schedule().await?;
+        self.broadcast();
         reply.response()
+    }
+    async fn websocket_message(&self, _: WebSocket, _: WebSocketIncomingMessage) -> Result<()> {
+        // Pages only listen; their pings are answered without waking this object.
+        Ok(())
+    }
+    async fn websocket_close(&self, ws: WebSocket, _: usize, _: String, _: bool) -> Result<()> {
+        let _ = ws.close(Some(1000), Some("closed"));
+        Ok(())
+    }
+    async fn websocket_error(&self, _: WebSocket, _: Error) -> Result<()> {
+        Ok(())
     }
     async fn alarm(&self) -> Result<Response> {
         self.ready().await?;
@@ -73,6 +88,8 @@ impl DurableObject for TerminalAuthority {
                 ((), true)
             })?;
         }
+        // Uploads it let expire leave their directories.
+        self.broadcast();
         db::take_alarm();
         if let Some(due) = transact(&self.state, |db| (db.next_due(), false))? {
             let delay = (due.saturating_sub(auth::now()) * 1000).max(1000);
@@ -85,6 +102,69 @@ impl DurableObject for TerminalAuthority {
     }
 }
 impl TerminalAuthority {
+    /// A page that listens for changes: a WebSocket, which keeps the session that opened it, so
+    /// that it hears only of directories its account may list. Hibernation keeps idle ones free.
+    fn listen(&self, req: &Request) -> Result<Response> {
+        if !req
+            .headers()
+            .get("Upgrade")?
+            .is_some_and(|upgrade| upgrade.eq_ignore_ascii_case("websocket"))
+        {
+            return Response::error("Expected a WebSocket", 426);
+        }
+        let pair = WebSocketPair::new()?;
+        self.state.accept_web_socket(&pair.server);
+        pair.server.serialize_attachment(auth::token_key(req))?;
+        if self.state.get_websocket_auto_response().is_none()
+            && let Ok(ping) = worker::worker_sys::WebSocketRequestResponsePair::new("ping", "pong")
+        {
+            self.state.set_websocket_auto_response(&ping);
+        }
+        Response::from_websocket(pair.client)
+    }
+    /// Tell the listening pages which directories changed, each only those its account may
+    /// list, so that they show what others did as it happens.
+    fn broadcast(&self) {
+        let changed = db::take_changes();
+        if changed.is_empty() {
+            return;
+        }
+        let sockets = self.state.get_websockets();
+        if sockets.is_empty() {
+            return;
+        }
+        let keys: Vec<Option<String>> = sockets
+            .iter()
+            .map(|ws| {
+                ws.deserialize_attachment::<Option<String>>()
+                    .ok()
+                    .flatten()
+                    .flatten()
+            })
+            .collect();
+        let visible = transact(&self.state, move |db| {
+            let visible: Vec<Vec<String>> = keys
+                .iter()
+                .map(|key| {
+                    let who = auth::identity(db, key.as_deref());
+                    changed
+                        .iter()
+                        .filter(|dir| db.access(&who, dir, READ | EXEC).is_ok())
+                        .cloned()
+                        .collect()
+                })
+                .collect();
+            (visible, false)
+        });
+        let Ok(visible) = visible else {
+            return;
+        };
+        for (ws, dirs) in sockets.iter().zip(visible) {
+            if !dirs.is_empty() {
+                let _ = ws.send_with_str(serde_json::json!({ "changed": dirs }).to_string());
+            }
+        }
+    }
     /// Run the alarm soon if a transaction left garbage or a deadline; it reschedules itself.
     async fn schedule(&self) -> Result<()> {
         if db::take_alarm() {

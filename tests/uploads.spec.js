@@ -113,13 +113,15 @@ test('the browser resumes an interrupted upload from the chunks already sent, an
   });
   const choose = async () => { const chooser = page.waitForEvent('filechooser'); await page.getByRole('button', { name: '↑ Upload files' }).click(); await (await chooser).setFiles({ name: 'data.log', mimeType: 'application/octet-stream', buffer: bytes }); };
   await choose();
-  await expect(page.locator('#notice')).toContainText('choose the same file again to resume', { timeout: 30_000 });
+  // Progress and results show in the tab that uploads, not over the page.
+  const transcript = page.locator('.terminal-panel:not([hidden]) .transcript');
+  await expect(transcript).toContainText('choose the same file again to resume', { timeout: 30_000 });
   expect(sent.sort()).toEqual([0, 1]);
   offline = false;
   await expect(page.locator('.filename').filter({ hasText: 'data.log' })).toBeVisible();
   sent.length = 0;
   await choose();
-  await expect(page.locator('#notice')).toContainText('✓ data.log (resumed)', { timeout: 30_000 });
+  await expect(transcript).toContainText('✓ data.log (resumed)', { timeout: 30_000 });
   expect(sent).toEqual([2]);
   const stored = await page.request.get(file(folder + '/data.log'), { headers: { 'Accept-Encoding': 'identity' } });
   expect(Buffer.compare(await stored.body(), bytes)).toBe(0);
@@ -128,9 +130,9 @@ test('the browser resumes an interrupted upload from the chunks already sent, an
   await page.route('**/api/uploads/chunk?**', async route => { await new Promise(r => setTimeout(r, 1500)); return route.continue(); });
   const chooser = page.waitForEvent('filechooser'); await page.getByRole('button', { name: '↑ Upload files' }).click();
   await (await chooser).setFiles({ name: 'other.log', mimeType: 'application/octet-stream', buffer: bytes.subarray(0, CHUNK + 5) });
-  await expect(page.locator('#notice .notice-cancel')).toBeVisible({ timeout: 15_000 });
-  await page.locator('#notice .notice-cancel').click();
-  await expect(page.locator('#notice')).toContainText('other.log: Upload cancelled', { timeout: 15_000 });
+  await expect(transcript).toContainText('↑ other.log', { timeout: 15_000 });
+  await page.locator('#command').press('Control+c');
+  await expect(transcript).toContainText('✕ other.log: Upload cancelled', { timeout: 15_000 });
   await expect.poll(async () => (await (await page.request.get(ls(folder))).json()).entries.map(e => e.name)).toEqual(['data.log']);
   await page.unroute('**/api/uploads/chunk?**');
   await page.request.delete(file(folder) + '&recursive=true', { headers: { Origin: origin } });

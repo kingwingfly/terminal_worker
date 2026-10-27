@@ -117,6 +117,9 @@ export async function uploadFile(file, destination, { progress = () => {}, signa
       await fetch('/api/uploads?id=' + encodeURIComponent(upload.id), { method: 'DELETE' }).catch(() => {});
       remember(key, null); throw new Cancelled();
     }
+    // The upload is gone on the server: someone removed the file, cancelled the upload, or it
+    // expired. There is nothing to resume.
+    if ((failure || error).status === 409) { remember(key, null); throw new Error('stopped: the file was removed, or its upload cancelled, elsewhere'); }
     throw new Error((failure || error).message + '; choose the same file again to resume');
   } finally { signal.removeEventListener('abort', abort); }
   const done = await json(await fetch('/api/uploads/complete?id=' + encodeURIComponent(upload.id), { method: 'POST' }));
