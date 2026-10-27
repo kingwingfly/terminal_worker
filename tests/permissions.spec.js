@@ -175,6 +175,18 @@ test('cp and mv tell nothing of a destination below a directory the caller may n
    const reply=await command(alice,[cmd,home+'/one.txt',home+'/two.txt',dest]);
    expect(reply.status(),dest).toBe(403);expect((await reply.json()).error).toContain('cannot traverse /root');
   }
+  // Nor below one deep in a merge: cp -ri is refused alike whether the file there is or not, and
+  // names nothing it would ask about.
+  const dst='/acl-merge-'+f.a,hidden=dst+'/src/private';
+  await ok(await alice.post('/api/mkdir?path='+encodeURIComponent(home+'/src/private')));
+  await ok(await alice.put(file(home+'/src/private/probe.txt'),{data:'probe'}),201);
+  await ok(await command(root,['mkdir','-p',hidden]));await ok(await command(root,['chmod','777',dst,dst+'/src']));await ok(await command(root,['chmod','700',hidden]));
+  for (const leaf of [true,false]) {
+   if (leaf) await ok(await root.put(file(hidden+'/probe.txt'),{data:'kept'}),201); else await ok(await root.delete(file(hidden+'/probe.txt')));
+   const reply=await command(alice,['cp','-ri',home+'/src',dst]);const body=await reply.json();
+   expect(reply.status(),String(leaf)).toBe(403);expect(body.error).toContain('cannot traverse '+hidden);expect(body.existing).toBeUndefined();
+  }
+  await command(root,['rm','-r',dst]);
  } finally {await command(root,['rm','-r','/root/acl-hidden-'+f.a]);await f.cleanup();}
 });
 

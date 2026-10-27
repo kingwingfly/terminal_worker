@@ -161,7 +161,7 @@ test('Ctrl+C stops an extraction between files, and a closed tab leaves its job 
 test('extracting nothing ends at once and says why; modes are those archived, 000 too; long listings come whole', async ({ page, request }) => {
   const put = async (name, data) => expect((await request.put(file(base + '/' + name), { headers, data })).status()).toBe(201);
   await put('empty.zip', zipOf([])); await put('empty.tar', tarOf([])); await put('one.zip', zipOf([['a.txt', 'a']]));
-  await put('modes.tar', tarOf([['normal.txt', 'new', 0o644], ['private.txt', 'new', 0], ['private-dir', '', 0, true]]));
+  await put('modes.tar', tarOf([['normal.txt', 'new', 0o644], ['private.txt', 'new', 0], ['private-dir', '', 0, true], ['open', '', 0o755, true], ['closed', '', 0o755, true]]));
   await put('many.zip', zipOf(Array.from({ length: 700 }, (_, i) => [String(i).padStart(4, '0') + '.txt', 'x'])));
   await terminal(page);
   // Each ends once, rather than plan again and again.
@@ -174,15 +174,18 @@ test('extracting nothing ends at once and says why; modes are those archived, 00
   await ends('tar -xf modes.tar -C none private.txt nothing.txt');
   await expect(transcript(page)).toContainText('tar: nothing.txt: Not found in archive');
   expect(await transcript(page).evaluate(e => e.textContent.split('zipfile is empty').length - 1)).toBe(1);
-  // The modes archived, less group and other write; 644 for a file a zip says none of.
-  await run(page, 'mkdir dest');
+  // The modes archived, less group and other write, also for files and directories that were
+  // there; 644 for a file a zip says none of.
+  await run(page, 'mkdir dest dest/open dest/closed');
+  for (const [dir, mode] of [['open', '777'], ['closed', '700']]) expect((await request.post('/api/command', { headers, data: { args: ['chmod', mode, base + '/dest/' + dir] } })).ok()).toBe(true);
   expect((await request.put(file(base + '/dest/normal.txt'), { headers, data: 'old' })).status()).toBe(201);
   expect((await request.post('/api/command', { headers, data: { args: ['chmod', '755', base + '/dest/normal.txt'] } })).ok()).toBe(true);
   await ends('tar -xf modes.tar -C dest'); await ends('unzip -q one.zip -d dest');
   const modes = Object.fromEntries((await ls(request, base + '/dest')).map(e => [e.name, e.mode]));
-  expect(modes).toEqual({ 'normal.txt': 0o644, 'private.txt': 0, 'private-dir': 0, 'a.txt': 0o644 });
+  expect(modes).toEqual({ 'normal.txt': 0o644, 'private.txt': 0, 'private-dir': 0, 'open': 0o755, 'closed': 0o755, 'a.txt': 0o644 });
   const guest = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { 'CF-Connecting-IP': 'archive-guest-' + base } });
   expect((await guest.get(file(base + '/dest/private.txt'))).status()).toBe(401);
+  expect((await guest.put(file(base + '/dest/open/guest.txt'), { headers: { Origin: origin }, data: 'x' })).status()).toBe(401);
   await guest.dispose();
   // A job's output comes page after page, to its end.
   await ends('unzip -l many.zip | wc -l');

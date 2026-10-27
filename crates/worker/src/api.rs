@@ -624,7 +624,9 @@ fn job_reply(
             Reply::ok(json!({"size": f.size, "chunk_size": f.chunk_size, "chunks": chunks}))
         }
         (Method::Post, "/internal/job/exists") => {
+            // What each path is, and its mode.
             let mut existing = serde_json::Map::new();
+            let mut modes = serde_json::Map::new();
             for path in body["paths"]
                 .as_array()
                 .into_iter()
@@ -640,9 +642,10 @@ fn job_reply(
                         path.into(),
                         json!(if node.directory { "directory" } else { "file" }),
                     );
+                    modes.insert(path.into(), json!(node.mode));
                 }
             }
-            Reply::ok(json!({"existing": existing}))
+            Reply::ok(json!({"existing": existing, "modes": modes}))
         }
         (Method::Post, "/internal/job/mkdir") => {
             let path = body["path"].as_str().unwrap_or_default();

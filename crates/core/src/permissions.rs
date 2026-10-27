@@ -450,6 +450,11 @@ pub trait Store {
             }
             let target = format!("{dst}{}", &path[src.len()..]);
             resolve("/", &target)?;
+            // Only where `who` may look is it told what is there, also deep in a merge: in a
+            // directory this copy creates, nothing is.
+            if !created.contains(parent(&target)) {
+                self.traverse(who, &target)?;
+            }
             match self.node(&target) {
                 Some(existing) if existing.directory && source.directory => {}
                 Some(existing) if existing.directory || source.directory => {
@@ -1049,6 +1054,28 @@ mod tests {
             c.copy(&alice(), "/home/alice", "/home/alice/inner", true, true)
                 .is_err()
         );
+        // A merge says nothing of what lies below a directory bob may not search: there or not,
+        // the copy is refused alike, and nothing is skipped or written.
+        c.set_node("/tmp/docs/private", &Node::directory(0, 0, 0o700));
+        c.set_node("/home/alice/docs", &Node::directory(1000, 1000, 0o755));
+        c.set_node(
+            "/home/alice/docs/private",
+            &Node::directory(1000, 1000, 0o755),
+        );
+        for leaf in [true, false] {
+            if leaf {
+                c.set_node("/tmp/docs/private/probe.md", &file(0, 0o644, "probe"));
+                c.set_node("/home/alice/docs/private/probe.md", &file(1000, 0o644, "p"));
+            } else {
+                c.delete_node("/tmp/docs/private/probe.md");
+            }
+            for replace in [true, false] {
+                assert_eq!(
+                    c.copy(&bob, "/home/alice/docs", "/tmp/docs", true, replace),
+                    Err("Permission denied: cannot traverse /tmp/docs/private".to_string())
+                );
+            }
+        }
     }
     #[test]
     fn ids_and_accounts() {

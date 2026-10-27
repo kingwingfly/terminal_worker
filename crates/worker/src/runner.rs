@@ -686,13 +686,50 @@ impl ArchiveRunner {
                 return Ok(Step::More);
             }
         }
-        // Directories get their modes last, deepest first, so that none stops its own filling.
-        for row in self.rows("SELECT idx, name, size, mode, kind, target, action FROM plan WHERE action = 'mkdir' ORDER BY length(target) DESC", vec![])? {
+        // Directories get their modes last, deepest first, so that none stops its own filling:
+        // those that were there before too, whatever mode they had. One that is not there, or
+        // not where the job may look, failed to be made, and said so.
+        let directories = self.rows("SELECT idx, name, size, mode, kind, target, action FROM plan WHERE action = 'mkdir' ORDER BY length(target) DESC", vec![])?;
+        let paths: Vec<&String> = directories.iter().map(|row| &row.target).collect();
+        let found = self
+            .ask(
+                Method::Post,
+                &format!("/internal/job/exists?id={id}"),
+                Some(json!({"paths": paths})),
+            )
+            .await?;
+        for row in &directories {
             let mode = extracted_mode(row.mode, true);
-            if mode != 0o755 {
-                self.call(Method::Post, &format!("/internal/job/chmod?id={id}"), Some(json!({"path": row.target, "mode": mode})))
-                    .await?;
+            let Some(had) = found["modes"][&row.target].as_u64() else {
+                continue;
+            };
+            if had == u64::from(mode) {
+                continue;
             }
+            let (status, reply) = self
+                .call(
+                    Method::Post,
+                    &format!("/internal/job/chmod?id={id}"),
+                    Some(json!({"path": row.target, "mode": mode})),
+                )
+                .await?;
+            if status >= 400 {
+                errors += 1;
+                lines.err(format!(
+                    "{cmd}: {}: Cannot change mode to {}: {}",
+                    row.target,
+                    &mode_text(mode as u16, true)[1..],
+                    reply["error"].as_str().unwrap_or("not permitted")
+                ));
+            }
+        }
+        if !lines.0.is_empty() {
+            self.update(
+                id,
+                lines,
+                Some(json!({"done": done, "total": total, "errors": errors})),
+            )
+            .await?;
         }
         Ok(Step::Done)
     }
