@@ -1,5 +1,5 @@
 //! zip, unzip and tar: what each is asked to do, and where an archive's members may go. The
-//! archives themselves are read and written in a container (crates/archiver).
+//! archives themselves are read and written in a container (crates/jobs).
 use serde::{Deserialize, Serialize};
 
 use crate::cli;

@@ -3827,7 +3827,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "terminal-worker-archiver"
+name = "terminal-worker-core"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "regex",
+ "serde",
+]
+
+[[package]]
+name = "terminal-worker-jobs"
 version = "0.1.0"
 dependencies = [
  "flate2",
@@ -3838,15 +3847,6 @@ dependencies = [
  "terminal-worker-core",
  "tiny_http",
  "zip",
-]
-
-[[package]]
-name = "terminal-worker-core"
-version = "0.1.0"
-dependencies = [
- "clap",
- "regex",
- "serde",
 ]
 
 [[package]]

@@ -28,7 +28,7 @@ Open **http://127.0.0.1:8787**. `npm run dev` and direct `wrangler dev` both use
 
 `setup` creates `.dev.vars` and `.local-password` only when credentials do not exist. Both are gitignored. `ADMIN_PASSWORD` bootstraps root only during the first database initialization; later changes use `passwd`. Changing `.dev.vars` does not reset an existing root password. `SESSION_SECRET` is a password-hash pepper: preserve it when restoring data.
 
-`npm run dev` runs `scripts/dev.mjs`, which starts `wrangler dev` with its arguments. Where Docker is missing and Podman present, it starts Podman's API service for the session and points wrangler at it, through `scripts/podman-docker.sh` (a shim for the Docker flags Podman's builder lacks) and `scripts/podman-proxy.mjs` (which removes the memory swappiness workerd asks for in every container; crun refuses it on cgroup v2 wherever cgroups apply, as in a systemd user session: `cannot set memory swappiness with cgroupv2`), with cgroups managed by Podman itself when there is no systemd user session. Rootless Podman needs subordinate ID ranges for your user in `/etc/subuid` and `/etc/subgid` (for example `sudo usermod --add-subuids 165536-231071 --add-subgids 165536-231071 $USER`, then `podman system migrate`). The first start builds the archiver image, pulling `rust:1-alpine`; later starts reuse it. With Podman, start through `npm run dev`, not `npx wrangler dev`: wrangler alone, even with `WRANGLER_DOCKER_BIN=podman`, passes `podman build` flags it rejects (`unknown flag: --provenance`) and finds no Docker socket. To pass wrangler options, add them after `--`, as in `npm run dev -- --persist-to /tmp/state`.
+`npm run dev` runs `scripts/dev.mjs`, which starts `wrangler dev` with its arguments. Where Docker is missing and Podman present, it starts Podman's API service for the session and points wrangler at it, through `scripts/podman-docker.sh` (a shim for the Docker flags Podman's builder lacks) and `scripts/podman-proxy.mjs` (which removes the memory swappiness workerd asks for in every container; crun refuses it on cgroup v2 wherever cgroups apply, as in a systemd user session: `cannot set memory swappiness with cgroupv2`), with cgroups managed by Podman itself when there is no systemd user session. Rootless Podman needs subordinate ID ranges for your user in `/etc/subuid` and `/etc/subgid` (for example `sudo usermod --add-subuids 165536-231071 --add-subgids 165536-231071 $USER`, then `podman system migrate`). The first start builds the job container's image, pulling `rust:1-alpine`; later starts reuse it. With Podman, start through `npm run dev`, not `npx wrangler dev`: wrangler alone, even with `WRANGLER_DOCKER_BIN=podman`, passes `podman build` flags it rejects (`unknown flag: --provenance`) and finds no Docker socket. To pass wrangler options, add them after `--`, as in `npm run dev -- --persist-to /tmp/state`.
 
 Rebuild frontend changes with `npm run build:web` (currently `npm run build` builds the same frontend). Wrangler watches Worker/core Rust sources. If newly generated lazy chunks return 404, restart your local Wrangler process after the build. Avoid concurrent Worker builds into the same `crates/worker/build` directory.
 
@@ -223,7 +223,7 @@ tar -czf notes.tgz notes        tar -xvf notes.tgz -C restored  tar -tf notes.tg
 - A new archive appears at once and can be read while it is written. `zip` does not update an existing archive; `tar -c` replaces one.
 - Jobs go on when their tab or the page closes; `jobs` lists them, with unfinished uploads, and `jobs cancel ID` stops one.
 
-Each job has an `ArchiveRunner` Durable Object and a container (`crates/archiver`, built by `containers/archiver/Dockerfile` into a 2 MB image) that reads and writes the archives on its disk. The runner streams the job's files from R2 into the container and its output back, a chunk per request, and keeps its plan in its own storage, so that a restart of it or of the container resumes the job: extraction continues with the next member, and a new archive is rebuilt and checked, chunk by chunk, against what was stored before (its bytes are deterministic: fixed dates, owners, and deflate settings). Deploying requires Cloudflare Containers, on the Workers Paid plan.
+Each job (zip, unzip, tar, faststart) has a `JobRunner` Durable Object and a container (`crates/jobs`, built by `containers/jobs/Dockerfile` into a 2 MB image) that reads and writes the archives, or the video, on its disk. The runner streams the job's files from R2 into the container and its output back, a chunk per request, and keeps its plan in its own storage, so that a restart of it or of the container resumes the job: extraction continues with the next member, and a new archive is rebuilt and checked, chunk by chunk, against what was stored before (its bytes are deterministic: fixed dates, owners, and deflate settings). Deploying requires Cloudflare Containers, on the Workers Paid plan.
 
 ### Presentations
 
@@ -285,13 +285,13 @@ The manifest can select only a build-time registered entry. Its read permissions
 | `crates/worker` / `terminal-worker` | The Worker streams file bytes (`files.rs`); the `TerminalAuthority` Durable Object decides and records (`api.rs`; the commands it runs, one `ServerCommand` each, in `commands/`) in SQLite tables (`db.rs`) |
 | `web/app.js` | Browser bridge, authentication dialogs, the preview dialog's shell and games, focus handling |
 | `web/upload.mjs` | Chunked, resumable uploads |
-| `crates/archiver` / `terminal-worker-archiver` | The archive container's HTTP server: zip and tar, read and written deterministically |
-| `containers/archiver/Dockerfile` | Its image: a static binary, built from the workspace |
-| `crates/worker/src/runner.rs`, `jobs.rs` | Archive jobs: the `ArchiveRunner` Durable Object, and the authority's side of them |
+| `crates/jobs` / `terminal-worker-jobs` | The job container's HTTP server: zip and tar, read and written deterministically, and MP4 faststart |
+| `containers/jobs/Dockerfile` | Its image: a static binary, built from the workspace |
+| `crates/worker/src/runner.rs`, `jobs.rs` | Jobs: the `JobRunner` Durable Object, and the authority's side of them |
 | `web/editor.mjs` | Lazy-loaded CodeMirror editor |
 | `web/faststart.mjs` | MP4 structural inspection |
 | `scripts/` | Local setup, frontend build, sample seeding |
-| `wrangler.toml` | Worker, assets, FILES R2, AUTHORITY, ARCHIVES (with its container), and rate-limit bindings |
+| `wrangler.toml` | Worker, assets, FILES R2, AUTHORITY, JOBS (with its container), and rate-limit bindings |
 | `seed/` | English sample content |
 
 R2 stores bytes, as immutable chunk objects (`chunks/<file>/<index>-<random>`: each write has its own key, and the first one committed for an index is kept). `TerminalAuthority`, one Durable Object, keeps everything else in SQLite tables of its own storage (`crates/worker/src/db.rs`): accounts, groups, sessions, one row per path (`nodes`), and each file's content (`files`) with its committed chunks (`chunks`). A file has a fixed chunk size, so chunk *i* starts at *i* × the chunk size.
@@ -304,7 +304,7 @@ The R2 initialization marker (`system/terminal-authority-v2`) makes a missing au
 
 This architecture targets personal or small-team use: one authority orders all decisions, which are short.
 
-This is an independent workspace. Worker name: `terminal-worker`; bucket: `terminal-worker-files`; bindings: `FILES`, `ASSETS`, `AUTHORITY`, and `ARCHIVES`. Content projects can reuse the build output with their own assets, configuration, data, and credentials. They must also declare the `TerminalAuthority` class with its SQLite migration `v1-users-permissions`, and for archives the `ArchiveRunner` class (`v2-archive-runner`) with its container. Never connect an empty unrelated authority to an initialized bucket.
+This is an independent workspace. Worker name: `terminal-worker`; bucket: `terminal-worker-files`; bindings: `FILES`, `ASSETS`, `AUTHORITY`, and `JOBS`. Content projects can reuse the build output with their own assets, configuration, data, and credentials. They must also declare the `TerminalAuthority` class with its SQLite migration `v1-users-permissions`, and for archives the `JobRunner` class (`v2-job-runner`) with its container. Never connect an empty unrelated authority to an initialized bucket.
 
 ## Validation
 

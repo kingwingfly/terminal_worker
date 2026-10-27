@@ -797,7 +797,7 @@ pub async fn kick(env: &Env, reply: &Value) {
         return;
     };
     let woken = async {
-        env.durable_object("ARCHIVES")?
+        env.durable_object("JOBS")?
             .id_from_name(job)?
             .get_stub()?
             .fetch_with_str(&format!("https://runner/start?job={job}"))

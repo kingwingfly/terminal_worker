@@ -1,4 +1,4 @@
-//! Archives and video: zip, unzip, tar and faststart start a job, which an ArchiveRunner does
+//! Archives and video: zip, unzip, tar and faststart start a job, which a JobRunner does
 //! with its container (crate::jobs, crate::runner); the reply names it, for the terminal to
 //! follow.
 

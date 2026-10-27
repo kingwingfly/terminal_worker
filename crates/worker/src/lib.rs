@@ -8,7 +8,7 @@ mod runner;
 mod store;
 mod streams;
 use files::error_response;
-pub use runner::ArchiveRunner;
+pub use runner::JobRunner;
 pub use store::TerminalAuthority;
 use worker::*;
 

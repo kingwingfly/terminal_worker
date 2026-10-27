@@ -1,6 +1,6 @@
-//! Archive jobs, as the authority sees them: zip, unzip and tar start one, whose work an
-//! ArchiveRunner Durable Object does with a container, asking the authority, as the job's
-//! account, for each file it reads or writes.
+//! Jobs, as the authority sees them: zip, unzip, tar and faststart start one, whose work a
+//! JobRunner Durable Object does with a container, asking the authority, as the job's account,
+//! for each file it reads or writes.
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};

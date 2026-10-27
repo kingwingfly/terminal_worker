@@ -1,4 +1,4 @@
-//! The ArchiveRunner: one Durable Object, with its container (crates/archiver), a job. Its
+//! The JobRunner: one Durable Object, with its container (crates/jobs), a job. Its
 //! alarm does the work in steps, keeping its plan in its own storage, so that a restart, of it
 //! or of the container, resumes rather than starts over:
 //!
@@ -30,7 +30,7 @@ use crate::files::decode_hex;
 use crate::jobs::Spec;
 use crate::streams;
 
-/// The archiver's port in its container.
+/// The job server's port in its container.
 const PORT: u16 = 8080;
 /// How long one alarm works before handing over to the next.
 const BUDGET: f64 = 20_000.0;
@@ -38,7 +38,7 @@ const BUDGET: f64 = 20_000.0;
 const ATTEMPTS: u32 = 5;
 
 #[durable_object]
-pub struct ArchiveRunner {
+pub struct JobRunner {
     state: State,
     env: Env,
 }
@@ -94,7 +94,7 @@ fn extracted_mode(cmd: &str, root: bool, mode: Option<u32>, directory: bool) -> 
     }
 }
 
-impl DurableObject for ArchiveRunner {
+impl DurableObject for JobRunner {
     fn new(state: State, env: Env) -> Self {
         Self { state, env }
     }
@@ -170,7 +170,7 @@ impl DurableObject for ArchiveRunner {
     }
 }
 
-impl ArchiveRunner {
+impl JobRunner {
     /// Ask the authority, for the job.
     async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<(u16, Value)> {
         let headers = Headers::new();
@@ -244,8 +244,8 @@ impl ArchiveRunner {
         Ok(())
     }
 
-    /// The archiver, started if need be.
-    async fn archiver(&self) -> Result<Fetcher> {
+    /// The container's server, started if need be.
+    async fn container(&self) -> Result<Fetcher> {
         let container = self.state.container().ok_or_else(|| {
             Error::RustError(
                 "Containers are not available; see the README's archive section".into(),
@@ -271,20 +271,20 @@ impl ArchiveRunner {
         for _ in 0..120 {
             if let Some(why) = ended.borrow_mut().take() {
                 return Err(Error::RustError(format!(
-                    "The archiver did not start: {why}"
+                    "The job container did not start: {why}"
                 )));
             }
-            if let Ok(response) = fetcher.fetch("http://archiver/status", None).await
+            if let Ok(response) = fetcher.fetch("http://jobs/status", None).await
                 && response.status_code() == 200
             {
                 return Ok(fetcher);
             }
             Delay::from(Duration::from_millis(500)).await;
         }
-        Err(Error::RustError("The archiver did not start".into()))
+        Err(Error::RustError("The job container did not start".into()))
     }
     async fn status(&self, fetcher: &Fetcher, job: &str) -> Result<Value> {
-        let mut response = fetcher.fetch("http://archiver/status", None).await?;
+        let mut response = fetcher.fetch("http://jobs/status", None).await?;
         let status: Value = response.json().await?;
         // Another job's files, or none: start again from nothing.
         Ok(if status["job"].as_str() == Some(job) {
@@ -293,7 +293,7 @@ impl ArchiveRunner {
             json!({})
         })
     }
-    /// Send the file the job pins, `file`, to the archiver at `url`.
+    /// Send the file the job pins, `file`, to the container at `url`.
     async fn send(&self, fetcher: &Fetcher, job: &str, file: &str, url: &str) -> Result<()> {
         let grant = self
             .ask(
@@ -323,14 +323,14 @@ impl ArchiveRunner {
             streams::objects(self.env.bucket("FILES")?, parts).into()
         }));
         let response = fetcher
-            .fetch(format!("http://archiver{url}"), Some(init))
+            .fetch(format!("http://jobs{url}"), Some(init))
             .await?;
         if response.status_code() != 200 {
-            return Err(Error::RustError(format!("the archiver refused {url}")));
+            return Err(Error::RustError(format!("the job container refused {url}")));
         }
         Ok(())
     }
-    /// Store `length` bytes the archiver serves at `url` as the R2 object `key`.
+    /// Store `length` bytes the container serves at `url` as the R2 object `key`.
     async fn store(
         &self,
         fetcher: &Fetcher,
@@ -339,18 +339,18 @@ impl ArchiveRunner {
         length: u64,
         sha256: Option<&str>,
     ) -> Result<()> {
-        let mut response = fetcher.fetch(format!("http://archiver{url}"), None).await?;
+        let mut response = fetcher.fetch(format!("http://jobs{url}"), None).await?;
         if response.status_code() != 200 {
             let error: Value = response.json().await.unwrap_or_default();
             return Err(Error::RustError(
                 error["error"]
                     .as_str()
-                    .unwrap_or("the archiver failed")
+                    .unwrap_or("the job container failed")
                     .to_string(),
             ));
         }
         let ResponseBody::Stream(stream) = response.body() else {
-            return Err(Error::RustError("the archiver sent no content".into()));
+            return Err(Error::RustError("the job container sent no content".into()));
         };
         let data = Data::ReadableStream(streams::fixed_length(stream, length as f64));
         let bucket = self.env.bucket("FILES")?;
@@ -411,7 +411,7 @@ impl ArchiveRunner {
         Ok(step)
     }
 
-    /// Make sure the archiver has the job's archive, and has listed it, unpacked if `unpack`.
+    /// Make sure the container has the job's archive, and has listed it, unpacked if `unpack`.
     async fn prepare(
         &self,
         fetcher: &Fetcher,
@@ -431,7 +431,7 @@ impl ArchiveRunner {
         let mut response = fetcher
             .fetch(
                 format!(
-                    "http://archiver/list?job={job}{}",
+                    "http://jobs/list?job={job}{}",
                     if unpack { "&unpack=1" } else { "" }
                 ),
                 Some({
@@ -457,7 +457,7 @@ impl ArchiveRunner {
         let Command::List { zip, verbose, .. } = &spec.command else {
             return Ok(Step::Done);
         };
-        let fetcher = self.archiver().await?;
+        let fetcher = self.container().await?;
         let listing = self.prepare(&fetcher, &job.id, spec, false).await?;
         let mut lines = Lines::default();
         let members = listing["members"].as_array().cloned().unwrap_or_default();
@@ -556,7 +556,7 @@ impl ArchiveRunner {
         let cmd = if *zip { "unzip" } else { "tar" };
         let id = job.id.as_str();
         let directory = spec.directory.clone().unwrap_or_else(|| "/".into());
-        let fetcher = self.archiver().await?;
+        let fetcher = self.container().await?;
         let sql = self.sql();
         sql.exec(
             "CREATE TABLE IF NOT EXISTS plan(idx INTEGER PRIMARY KEY, name TEXT NOT NULL, size INTEGER NOT NULL, mode INTEGER, kind TEXT NOT NULL, target TEXT NOT NULL, action TEXT NOT NULL, link TEXT, done INTEGER NOT NULL)",
@@ -1130,7 +1130,7 @@ impl ArchiveRunner {
         let output = spec.output.clone().unwrap_or_default();
         let id = job.id.as_str();
         let storage = self.state.storage();
-        let fetcher = self.archiver().await?;
+        let fetcher = self.container().await?;
         let status = self.status(&fetcher, id).await?;
         let present: Vec<String> =
             serde_json::from_value(status["inputs"].clone()).unwrap_or_default();
@@ -1178,11 +1178,11 @@ impl ArchiveRunner {
             None => {
                 let (url, body) = match format {
                     Some(format) => (
-                        format!("http://archiver/build?job={id}"),
+                        format!("http://jobs/build?job={id}"),
                         json!({"format": format, "mtime": spec.mtime, "chunk_size": CHUNK_SIZE, "inputs": inputs}),
                     ),
                     None => (
-                        format!("http://archiver/faststart?job={id}"),
+                        format!("http://jobs/faststart?job={id}"),
                         json!({"chunk_size": CHUNK_SIZE}),
                     ),
                 };

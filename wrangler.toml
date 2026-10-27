@@ -34,18 +34,18 @@ class_name = "TerminalAuthority"
 tag = "v1-users-permissions"
 new_sqlite_classes = ["TerminalAuthority"]
 
-# Archive jobs (zip, unzip, tar): one ArchiveRunner Durable Object, and its container, a job.
+# Jobs (zip, unzip, tar, faststart): one JobRunner Durable Object, and its container, a job.
 [[durable_objects.bindings]]
-name = "ARCHIVES"
-class_name = "ArchiveRunner"
+name = "JOBS"
+class_name = "JobRunner"
 
 [[migrations]]
-tag = "v2-archive-runner"
-new_sqlite_classes = ["ArchiveRunner"]
+tag = "v2-job-runner"
+new_sqlite_classes = ["JobRunner"]
 
 [[containers]]
-class_name = "ArchiveRunner"
-image = "./containers/archiver/Dockerfile"
+class_name = "JobRunner"
+image = "./containers/jobs/Dockerfile"
 image_build_context = "."
 instance_type = "basic"
 max_instances = 4
