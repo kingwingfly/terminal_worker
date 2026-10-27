@@ -37,7 +37,8 @@ pub fn namespace(name: &str) -> Result<Namespace, String> {
 pub fn decode(text: &str) -> Result<Vec<u8>, String> {
     let invalid = || format!("Invalid value: {text}");
     if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        if hex.len() % 2 != 0 {
+        // Byte slicing below needs ASCII: `0xaé` would split a character and panic.
+        if !hex.is_ascii() || hex.len() % 2 != 0 {
             return Err(invalid());
         }
         return (0..hex.len())
@@ -155,6 +156,7 @@ mod tests {
         assert_eq!(decode("0x00ff").unwrap(), [0, 255]);
         assert_eq!(decode("0saGk=").unwrap(), b"hi");
         assert!(decode("0x0").is_err());
+        assert!(decode("0xaé").is_err());
         assert_eq!(encode(b"say \"hi\"\n", "text"), "\"say \\\"hi\\\"\\012\"");
         assert_eq!(encode(&[0, 255], "hex"), "0x00ff");
         assert_eq!(encode(b"hi", "base64"), "0saGk=");

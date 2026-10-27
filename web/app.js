@@ -118,7 +118,9 @@ async function accountCommand(args, cwd) {
   // Help is resolved before authentication or any command effects. -- ends options.
   const options = args.slice(1, args.indexOf('--') < 0 ? undefined : args.indexOf('--'));
   // -h is an option of these, as on Linux (no dereference, or tar's dereference), unless alone.
-  const hOption = ['chown', 'chgrp', 'getfattr', 'setfattr', 'tar'].includes(args[0]) && args.length > 2;
+  // Under sudo, the command's own -h counts.
+  const at = args[0] === 'sudo' && args[1] && !args[1].startsWith('-') ? 1 : 0;
+  const hOption = ['chown', 'chgrp', 'getfattr', 'setfattr', 'tar'].includes(args[at]) && args.length - at > 2;
   if (options.some(arg => arg === '--help' || (arg === '-h' && !hOption))) {
     let topic = args[0];
     if (topic === 'sudo' && args[1] && !args[1].startsWith('-')) topic = args[1];
@@ -219,19 +221,34 @@ async function uploadFiles(files, path, progress) {
       try {
         if (!rust.uploadable(file.name)) throw new Error('Unsupported file type');
         if (file.size > rust.maxFile) throw new Error(`Exceeds the ${rust.maxFile / 1e9} GB limit`);
+        // Not faststart is only a warning: such a file uploads, and plays once its index has.
+        let warning = null;
         if (/\.(mp4|m4v|mov|m4a)$/i.test(file.name)) {
           progress(`↑ ${file.name} · checking faststart`);
-          const result = await inspectFaststart(file);
-          if (!result.faststart) throw new Error('moov follows mdat. First run ffmpeg -i input.mp4 -c copy -movflags +faststart output.mp4');
+          warning = await faststartWarning(file);
         }
+        const flagged = warning ? ' · ⚠ not faststart' : '';
         const destination = (path === '/' ? '' : path.replace(/\/$/, '')) + '/' + file.name;
         const done = await uploadFile(file, destination, { signal: controller.signal,
-          progress: state => { progress(`↑ ${file.name} · ${state}`); if (!state.startsWith('hashing')) changed(); } });
+          progress: state => { progress(`↑ ${file.name} · ${state}${flagged}`); if (!state.startsWith('hashing')) changed(); } });
         results.push(`✓ ${file.name}${done.resumed ? ' (resumed)' : ''}`);
+        if (warning) results.push(`  ⚠ ${warning}`);
       } catch (error) { results.push(`✕ ${file.name}: ${error instanceof Cancelled ? 'Upload cancelled' : error.message}`); }
     }
     return results;
   } finally { uploading = null; changed(); }
+}
+// Why `file`, an MP4-family video or audio, will not stream, if it will not: its index (moov)
+// after its media (mdat) makes players fetch the end before they start, which a file still
+// uploading does not have yet. Null when it is faststart.
+async function faststartWarning(file) {
+  const fix = `to stream it, run faststart '${file.name.replaceAll("'", "'\\''")}' once it has uploaded`;
+  try {
+    if ((await inspectFaststart(file)).faststart) return null;
+    return `not faststart: its index (moov) is after its media, so it plays only once the end has downloaded, and not until its upload completes; ${fix}`;
+  } catch (error) {
+    return `faststart could not be checked (${error.message}); if it does not play while downloading, ${fix}`;
+  }
 }
 // Cancel the uploads in progress, if any; whether there were.
 function cancelUploads() { if (!uploading) return false; uploading.abort(); return true; }

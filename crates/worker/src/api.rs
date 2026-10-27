@@ -724,13 +724,13 @@ fn job_reply(
                 if body["replace"] != true {
                     return Reply::ok(json!({"skipped": true}));
                 }
-                acl!(db.remove(&actor, &real, false), &actor);
             }
+            // What is there gives way only once the link can be made.
             if endpoint == "/internal/job/symlink" {
-                acl!(db.symlink(&actor, target, &real), &actor);
+                acl!(db.symlink(&actor, target, &real, true), &actor);
             } else {
                 let source = real!(db, &actor, target, false);
-                acl!(db.link(&actor, &source, &real), &actor);
+                acl!(db.link(&actor, &source, &real, true), &actor);
             }
             Reply::ok(json!({"path": path}))
         }
@@ -936,7 +936,13 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
             };
             // Asked for rw-rw-rw-, less the umask; a mode from an archive is as it is.
             let mut node = match mode {
-                Some(mode) => created(who, &above, mode, false, 0),
+                // `created` takes permission bits only; an archive's setuid, setgid and sticky
+                // bits (root's tar -x) are kept as given.
+                Some(mode) => {
+                    let mut node = created(who, &above, mode, false, 0);
+                    node.mode |= mode & 0o7000;
+                    node
+                }
                 None => created(who, &above, 0o666, false, UMASK),
             };
             node.file = Some(id.clone());

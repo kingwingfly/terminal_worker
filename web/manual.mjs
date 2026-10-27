@@ -6,7 +6,7 @@
 const sections = [
  ['Files', ['ls', 'cd', 'pwd', 'open', 'vim', 'mkdir', 'touch', 'rm', 'mv', 'cp', 'ln', 'readlink', 'fd', 'upload']],
  ['Text', ['echo', 'cat', 'head', 'tail', 'grep', 'wc', 'sort', 'uniq', 'xargs']],
- ['Archives', ['zip', 'unzip', 'tar', 'jobs']],
+ ['Archives and video', ['zip', 'unzip', 'tar', 'faststart', 'jobs']],
  ['Permissions', ['chmod', 'chown', 'chgrp', 'getfacl', 'setfacl', 'getfattr', 'setfattr']],
  ['Accounts', ['whoami', 'id', 'groups', 'users', 'login', 'su', 'sudo', 'exit', 'logout', 'passwd', 'useradd', 'usermod', 'userdel', 'groupadd', 'groupmod', 'groupdel']],
  ['Terminal', ['help', 'man', 'clear']],
@@ -187,7 +187,8 @@ const entries = {
   usage: 'upload [DIR]',
   about: [
    'Choose files, or drop them onto the page, to upload into DIR or the working directory, up to 1 GB each, in chunks. After an interruption, choosing the same file again resumes it. Progress shows in the tab.',
-   'Ctrl+C (^C on a touch screen) stops and removes the unfinished file, as removing it elsewhere does. Names that exist are not overwritten. MP4/MOV-family files are checked for faststart. Others can read a file while it uploads.',
+   'Ctrl+C (^C on a touch screen) stops and removes the unfinished file, as removing it elsewhere does. Names that exist are not overwritten. Others can read a file while it uploads, and play a video or audio file as it arrives.',
+   'MP4, MOV, M4V and M4A files are checked for faststart: one whose index (moov) is after its media still uploads, with a warning that it plays only once the end has downloaded; faststart FILE then makes it stream, where it is.',
   ],
   needs: 'w and x on DIR. A directory anyone may write needs no sign-in.',
   examples: [['upload', 'into the working directory'], ['upload ~/photos', 'into a directory']],
@@ -258,10 +259,22 @@ const entries = {
   examples: [['tar -czf notes.tgz notes', 'create, gzipped'], ['tar -xvf notes.tgz -C restored', 'extract elsewhere'], ['tar -tvf notes.tgz', 'list with modes and links']],
   see: ['zip', 'unzip', 'jobs'],
  },
+ faststart: {
+  summary: 'make an MP4 video or audio file play while it downloads',
+  usage: 'faststart [--] FILE',
+  about: [
+   'Moves the index of FILE, an MP4, M4V, MOV or M4A file, before its media, as ffmpeg -c copy -movflags +faststart and qt-faststart do, and replaces FILE with the result. Nothing is re-encoded: the boxes are reordered, and the offsets in the index follow.',
+   'Without that, a player must fetch the end of the file before it starts, and cannot play it at all while it is still uploading. upload warns of such a file; this fixes it where it is.',
+   'It runs on the server, in a container, as zip and tar do (see jobs). FILE is written in place, as it would be by an editor: it keeps its owner, mode, ACLs and other names, and shows its old content until the new one is whole. A file already faststart is left as it is; one that is not an MP4 or QuickTime file, or a fragmented one, is refused.',
+  ],
+  needs: 'r and w on FILE.',
+  examples: [['faststart holiday.mp4', 'make it stream'], ['fd -e mp4 -x faststart', 'every MP4 below']],
+  see: ['upload', 'jobs'],
+ },
  jobs: {
   summary: 'list archive jobs and unfinished uploads',
   usage: 'jobs [cancel ID]',
-  about: ['Lists your zip, unzip and tar jobs and your unfinished uploads, with their state and progress. Jobs run on the server, and go on when their tab or the page closes.'],
+  about: ['Lists your zip, unzip, tar and faststart jobs and your unfinished uploads, with their state and progress. Jobs run on the server, and go on when their tab or the page closes.'],
   options: [['cancel ID', 'stop one, by the first characters of its ID']],
   examples: [['jobs', 'what is running'], ['jobs cancel 3fa9', 'stop one']],
   see: ['zip', 'unzip', 'tar', 'upload'],

@@ -2,6 +2,8 @@
 //! the same inputs, times and options give the same bytes, so that an interrupted archive can
 //! be rebuilt and checked against the chunks already stored.
 
+pub mod faststart;
+
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::Path;

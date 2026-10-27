@@ -39,10 +39,43 @@ const GLOB_CONCURRENCY: usize = 8;
 /// Commands the server runs, through web/app.js's accountCommand; ls and mkdir too, with
 /// options or several paths.
 const SERVER: &[&str] = &[
-    "help", "man", "vim", "touch", "sudo", "su", "login", "logout", "exit", "passwd", "chmod",
-    "chown", "useradd", "usermod", "userdel", "groupadd", "groupmod", "groupdel", "whoami", "id",
-    "groups", "users", "rm", "mv", "cp", "fd", "zip", "unzip", "tar", "ln", "readlink", "chgrp",
-    "getfacl", "setfacl", "getfattr", "setfattr",
+    "help",
+    "man",
+    "vim",
+    "touch",
+    "sudo",
+    "su",
+    "login",
+    "logout",
+    "exit",
+    "passwd",
+    "chmod",
+    "chown",
+    "useradd",
+    "usermod",
+    "userdel",
+    "groupadd",
+    "groupmod",
+    "groupdel",
+    "whoami",
+    "id",
+    "groups",
+    "users",
+    "rm",
+    "mv",
+    "cp",
+    "fd",
+    "zip",
+    "unzip",
+    "tar",
+    "ln",
+    "readlink",
+    "chgrp",
+    "getfacl",
+    "setfacl",
+    "getfattr",
+    "setfattr",
+    "faststart",
 ];
 /// Server commands that xargs and fd -x may run many of in one request.
 const BATCHED: &[&str] = &[
@@ -149,11 +182,16 @@ fn js_message(error: JsValue) -> String {
 const H_OPTION: &[&str] = &["chown", "chgrp", "getfattr", "setfattr", "tar"];
 /// Whether `args` ask for help before `--`.
 fn wants_help(args: &[String]) -> bool {
-    let h_option = H_OPTION.contains(&args.first().map(String::as_str).unwrap_or_default());
+    // sudo COMMAND: COMMAND's -h is what counts.
+    let at = usize::from(
+        args.first().is_some_and(|a| a == "sudo")
+            && args.get(1).is_some_and(|a| !a.starts_with('-')),
+    );
+    let h_option = H_OPTION.contains(&args.get(at).map(String::as_str).unwrap_or_default());
     args.iter()
         .skip(1)
         .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| arg == "--help" || arg == "-h" && (!h_option || args.len() == 2))
+        .any(|arg| arg == "--help" || arg == "-h" && (!h_option || args.len() - at == 2))
 }
 /// Whether `args` are mv or cp -i, under sudo or not, which ask before replacing a file: run
 /// one by one, never in a batch, however xargs or fd -x start them.
@@ -465,7 +503,10 @@ impl Shell {
                 let mut text = String::new();
                 for job in &jobs {
                     let command = &job["command"];
-                    let archive = command["archive"].as_str().unwrap_or_default();
+                    let archive = command["archive"]
+                        .as_str()
+                        .or(command["file"].as_str())
+                        .unwrap_or_default();
                     let progress = &job["progress"];
                     text.push_str(&format!(
                         "{}  {:<10} {} {}  {}/{}\n",

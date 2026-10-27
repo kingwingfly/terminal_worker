@@ -5,6 +5,8 @@
 //!   content unpacked to disk; `GET /entry?index=&offset=&length=`: part of one member.
 //! - `PUT /input?index=`: a file to archive; `POST /build`: build the archive, returning its
 //!   size and the SHA-256 of each chunk; `GET /output?offset=&length=`: part of it.
+//! - `POST /faststart`: input 0, an MP4, made faststart as the output, sized and hashed as an
+//!   archive is; or `already`, if its index already comes first.
 //! - `GET /status`, and `DELETE /job` to forget everything.
 //!
 //! Every request names its job (`?job=`); a request for another job starts again from nothing.
@@ -15,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use terminal_worker_archiver::faststart::{Outcome, faststart};
 use terminal_worker_archiver::{Input, VERSION, build, chunk_hashes, list};
 use terminal_worker_core::archive::Format;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -165,6 +168,46 @@ impl Archiver {
                         json!({"size": size, "chunks": chunks, "version": VERSION}),
                     ),
                     Err(e) => error(422, e),
+                }
+            }
+            (Method::Post, "/faststart") => {
+                #[derive(Deserialize)]
+                struct Faststart {
+                    chunk_size: u64,
+                }
+                let mut body = String::new();
+                if let Err(e) = request.as_reader().read_to_string(&mut body) {
+                    return error(400, e);
+                }
+                let wanted: Faststart = match serde_json::from_str(&body) {
+                    Ok(w) => w,
+                    Err(e) => return error(400, e),
+                };
+                // Made aside, and named the output only once whole, as status says it is.
+                let output = self.path("output");
+                let making = self.path("output.partial");
+                let _ = fs::remove_file(&output);
+                match faststart(&self.path("in/0"), &making) {
+                    Ok(Outcome::Already) => {
+                        json_reply(200, json!({"already": true, "version": VERSION}))
+                    }
+                    Ok(Outcome::Moved(moov)) => {
+                        let made = fs::rename(&making, &output).map_err(|e| e.to_string());
+                        match made.and_then(|()| chunk_hashes(&output, wanted.chunk_size.max(1))) {
+                            Ok(chunks) => json_reply(
+                                200,
+                                json!({
+                                    "size": fs::metadata(&output).map(|m| m.len()).unwrap_or(0),
+                                    "chunks": chunks, "moov": moov, "version": VERSION,
+                                }),
+                            ),
+                            Err(e) => error(500, e),
+                        }
+                    }
+                    Err(e) => {
+                        let _ = fs::remove_file(&making);
+                        error(422, e)
+                    }
                 }
             }
             (Method::Get, "/output") => send(

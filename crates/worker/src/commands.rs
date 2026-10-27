@@ -387,36 +387,6 @@ fn move_one(
     c.rename(who, src, dst, replace)
 }
 
-/// Copy `src` to `dst`, sharing content; files still uploading cannot be copied yet. Returns
-/// the files that exist, and were not replaced.
-fn copy_one(
-    c: &mut Db,
-    who: &Identity,
-    src: &str,
-    dst: &str,
-    options: &CopyOptions,
-) -> Result<Vec<String>, String> {
-    // Only what `who` may read and list: the copy refuses the rest, without telling it apart.
-    let Ok(node) = c.access(who, src, 0) else {
-        return c.copy(who, src, dst, options);
-    };
-    let below = if node.directory && options.recursive {
-        c.walk(who, src, None).map(|(n, _)| n).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    for (path, node) in std::iter::once((src.to_string(), node)).chain(below) {
-        if let Some(file) = node.file.as_deref().and_then(|id| c.file(id))
-            && !file.complete()
-        {
-            return Err(format!(
-                "cp: '{path}' is still uploading; copy it once it completes"
-            ));
-        }
-    }
-    c.copy(who, src, dst, options)
-}
-
 pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, String> {
     let (cmd, args) = command.args.split_first().ok_or("Missing command")?;
     let cwd = resolve("/", &command.cwd)?;
@@ -718,7 +688,8 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                         dest.clone()
                     };
                     if copy {
-                        let skipped = copy_one(c, who, &src, &target, &options)?;
+                        // Files still uploading are copied once whole: Store::copy refuses them.
+                        let skipped = c.copy(who, &src, &target, &options)?;
                         let whole = skipped.contains(&target);
                         if ask {
                             // What a directory holds is at the same place below the source.
@@ -803,18 +774,13 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                     (_, Some(named)) => named.clone(),
                     _ => unreachable!(),
                 };
-                let result = (|| {
-                    if o.flags.contains("-f")
-                        && let Some(existing) = c.node(&link)
-                    {
-                        if existing.directory {
-                            return Err(format!("ln: '{link}': cannot overwrite directory"));
-                        }
-                        c.remove(who, &link, false)?;
-                    }
+                // With -f, what is at the link's name gives way only once the link is known to
+                // be possible, so that one that cannot be made leaves what was there.
+                let force = o.flags.contains("-f");
+                let result = (|| -> Result<String, String> {
                     if symbolic {
                         // The target is kept as typed, read from where the link is.
-                        c.symlink(who, target, &link)?;
+                        c.symlink(who, target, &link, force)?;
                         return Ok(format!("'{link}' -> '{target}'"));
                     }
                     let src = if o.flags.contains("-L") {
@@ -822,20 +788,10 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                     } else {
                         entry_of(c, target)?
                     };
-                    if let Some(file) = c
-                        .node(&src)
-                        .and_then(|n| n.file)
-                        .and_then(|id| c.file(&id))
-                        .filter(|f| !f.complete())
-                    {
-                        let _ = file;
-                        return Err(format!(
-                            "ln: '{src}' is still uploading; link it once it completes"
-                        ));
-                    }
-                    c.link(who, &src, &link)?;
+                    c.link(who, &src, &link, force)?;
                     Ok(format!("'{link}' => '{src}'"))
-                })();
+                })()
+                .map_err(|e| format!("ln: {e}"));
                 match result {
                     Ok(line) => {
                         succeeded = true;
@@ -886,11 +842,9 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                     Err(e) => errors.push(format!("readlink: {e}")),
                 }
             }
-            let mut text = lines.join("\n");
-            if o.flags.contains("-n") {
-                text.push('\0');
-            }
-            text
+            // -n leaves out the trailing newline, which server output never has; it is not -z's
+            // NUL.
+            lines.join("\n")
         }
         "getfacl" => {
             let o = options(args, &["-a", "-d", "-c", "-n", "-p", "-R", "-P"], &[])?;
@@ -1483,7 +1437,10 @@ fn getfattr(
         }
         let attrs = c.xattrs(n.ino);
         let shown: Vec<(&String, &Vec<u8>)> = match o.values.get("-n") {
-            Some(name) => match attrs.get_key_value(name) {
+            // trusted.* is root's: to others it is not there (ENODATA), as on Linux.
+            Some(name) => match attrs.get_key_value(name).filter(|_| {
+                who.id == 0 || xattr::namespace(name).is_ok_and(|s| s == xattr::Namespace::User)
+            }) {
                 Some(pair) => vec![pair],
                 None => return Err(format!("{name}: No such attribute")),
             },

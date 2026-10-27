@@ -229,3 +229,23 @@ test('tar keeps symbolic and hard links, zip follows them unless -y, and extract
   await run(page, 'ls -l z2/docs | grep to-a'); await expect(transcript(page).locator('pre').last()).toContainText('lrwxrwxrwx');
   await expect(transcript(page).locator('pre').last()).toContainText('to-a -> a.md');
 });
+
+test('faststart moves a video\'s index before its media, in place, once', async ({ page, request }) => {
+  const video = await readFile('tests/fixtures/tail-moov.mp4');
+  expect((await request.put(file(base + '/clip.mp4'), { headers, data: video })).status()).toBe(201);
+  expect((await request.post('/api/command', { headers, data: { args: ['chmod', '640', base + '/clip.mp4'] } })).ok()).toBe(true);
+  const boxes = bytes => { const kinds = []; for (let i = 0; i < bytes.length; i += bytes.readUInt32BE(i)) kinds.push(bytes.toString('latin1', i + 4, i + 8)); return kinds; };
+  expect(boxes(video).indexOf('moov')).toBeGreaterThan(boxes(video).indexOf('mdat'));
+  await terminal(page);
+  await run(page, 'faststart clip.mp4');
+  await expect(transcript(page)).toContainText(`faststart: ${base}/clip.mp4: its index`);
+  const fixed = Buffer.from(await (await request.get(file(base + '/clip.mp4'), { headers })).body());
+  expect(fixed.length).toBe(video.length);
+  expect(boxes(fixed).indexOf('moov')).toBeLessThan(boxes(fixed).indexOf('mdat'));
+  // The same file, in place: its mode is kept.
+  const [entry] = (await ls(request, base)).filter(e => e.name === 'clip.mp4');
+  expect(entry.mode).toBe(0o640);
+  // Once is enough; what is not a video is refused.
+  await run(page, 'faststart clip.mp4'); await expect(transcript(page)).toContainText('is already faststart; left as it was');
+  await run(page, 'faststart docs/a.md'); await expect(transcript(page)).toContainText('not a readable MP4 or QuickTime file');
+});

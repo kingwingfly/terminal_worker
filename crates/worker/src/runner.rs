@@ -396,7 +396,9 @@ impl ArchiveRunner {
         let step = match &spec.command {
             Command::Extract { .. } => self.extract(&job, &spec, deadline).await?,
             Command::List { .. } => self.list(&job, &spec).await?,
-            Command::Create { .. } => self.create(&job, &spec, deadline).await?,
+            Command::Create { .. } | Command::Faststart { .. } => {
+                self.create(&job, &spec, deadline).await?
+            }
         };
         if matches!(step, Step::Done) {
             self.ask(
@@ -1117,12 +1119,15 @@ impl ArchiveRunner {
     }
 
     async fn create(&self, job: &Job, spec: &Spec, deadline: f64) -> Result<Step> {
-        let Command::Create {
-            format, verbose, ..
-        } = &spec.command
-        else {
-            return Ok(Step::Done);
+        // A new archive, or, without a format, a video made faststart in its place.
+        let (format, verbose) = match &spec.command {
+            Command::Create {
+                format, verbose, ..
+            } => (Some(*format), *verbose),
+            Command::Faststart { .. } => (None, false),
+            _ => return Ok(Step::Done),
         };
+        let output = spec.output.clone().unwrap_or_default();
         let id = job.id.as_str();
         let storage = self.state.storage();
         let fetcher = self.archiver().await?;
@@ -1171,42 +1176,62 @@ impl ArchiveRunner {
         let built = match cached {
             Some(built) => built,
             None => {
+                let (url, body) = match format {
+                    Some(format) => (
+                        format!("http://archiver/build?job={id}"),
+                        json!({"format": format, "mtime": spec.mtime, "chunk_size": CHUNK_SIZE, "inputs": inputs}),
+                    ),
+                    None => (
+                        format!("http://archiver/faststart?job={id}"),
+                        json!({"chunk_size": CHUNK_SIZE}),
+                    ),
+                };
                 let mut init = RequestInit::new();
                 init.with_method(Method::Post);
-                init.with_body(Some(
-                    json!({"format": format, "mtime": spec.mtime, "chunk_size": CHUNK_SIZE, "inputs": inputs})
-                        .to_string()
-                        .into(),
-                ));
-                let mut response = fetcher
-                    .fetch(format!("http://archiver/build?job={id}"), Some(init))
-                    .await?;
+                init.with_body(Some(body.to_string().into()));
+                let mut response = fetcher.fetch(url, Some(init)).await?;
                 let built: Value = response.json().await?;
+                let error = built["error"]
+                    .as_str()
+                    .unwrap_or("the archive could not be built");
+                // A file that cannot be made faststart is so whenever it is tried: say so, once.
+                if format.is_none() && response.status_code() == 422 {
+                    let mut lines = Lines::default();
+                    lines.err(format!("faststart: {output}: {error}"));
+                    self.update(id, lines, Some(json!({"done": 0, "total": 0, "errors": 1})))
+                        .await?;
+                    return Ok(Step::Done);
+                }
                 if response.status_code() != 200 {
-                    return Err(Error::RustError(
-                        built["error"]
-                            .as_str()
-                            .unwrap_or("the archive could not be built")
-                            .into(),
-                    ));
+                    return Err(Error::RustError(error.into()));
                 }
                 storage.put("built", built.to_string()).await?;
                 built
             }
         };
+        if built["already"] == true {
+            let mut lines = Lines::default();
+            lines.out(format!(
+                "faststart: {output} is already faststart; left as it was"
+            ));
+            self.update(id, lines, Some(json!({"done": 0, "total": 0})))
+                .await?;
+            return Ok(Step::Done);
+        }
         let size = built["size"].as_u64().unwrap_or(0);
         let hashes: Vec<String> =
             serde_json::from_value(built["chunks"].clone()).unwrap_or_default();
-        let output = spec.output.clone().unwrap_or_default();
         if storage.get::<bool>("announced").await? != Some(true) {
             let mut lines = Lines::default();
-            if *verbose {
+            if verbose {
                 for input in &spec.inputs {
-                    lines.out(if *format == terminal_worker_core::archive::Format::Zip {
-                        format!("  adding: {}", input.name)
-                    } else {
-                        input.name.clone()
-                    });
+                    lines.out(
+                        if format == Some(terminal_worker_core::archive::Format::Zip) {
+                            format!("  adding: {}", input.name)
+                        } else {
+                            input.name.clone()
+                        },
+                    );
                 }
             }
             self.update(id, lines, Some(json!({"done": 0, "total": hashes.len()})))
@@ -1304,6 +1329,14 @@ impl ArchiveRunner {
         )
         .await?;
         storage.delete("upload").await?;
+        if format.is_none() {
+            let mut lines = Lines::default();
+            lines.out(format!(
+                "faststart: {output}: its index ({} bytes) now comes before its media; it plays as it downloads",
+                built["moov"].as_u64().unwrap_or(0)
+            ));
+            self.update(id, lines, None).await?;
+        }
         Ok(Step::Done)
     }
 }

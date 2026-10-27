@@ -32,7 +32,7 @@ pub enum Existing {
     Keep,
 }
 
-/// One zip, unzip or tar command.
+/// One zip, unzip, tar or faststart command.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "job", rename_all = "lowercase")]
 pub enum Job {
@@ -67,6 +67,30 @@ pub enum Job {
         archive: String,
         verbose: bool,
     },
+    /// Replace the MP4 or QuickTime file `file` with itself made faststart: its index before
+    /// its media.
+    Faststart { file: String },
+}
+
+/// `faststart [--] FILE`
+pub fn faststart_args(args: &[String]) -> Result<Job, String> {
+    let mut operands = Vec::new();
+    let mut end = false;
+    for arg in args {
+        match arg.as_str() {
+            "--" if !end => end = true,
+            flag if !end && flag.starts_with('-') && flag.len() > 1 => {
+                return Err(format!(
+                    "faststart: unsupported option {flag}; see man faststart"
+                ));
+            }
+            _ => operands.push(arg.clone()),
+        }
+    }
+    match operands.as_slice() {
+        [file] => Ok(Job::Faststart { file: file.clone() }),
+        _ => Err("Usage: faststart [--] FILE (an MP4, M4V, MOV or M4A file, which it replaces with itself made faststart)".into()),
+    }
 }
 
 /// The format a new archive named `name` gets: gzipped tar for .tgz and .tar.gz names.
@@ -342,6 +366,25 @@ mod tests {
     use super::*;
     fn args(line: &str) -> Vec<String> {
         crate::split_command(line).unwrap()
+    }
+
+    #[test]
+    fn faststart_takes_one_file() {
+        assert_eq!(
+            faststart_args(&args("clip.mp4")).unwrap(),
+            Job::Faststart {
+                file: "clip.mp4".into()
+            }
+        );
+        assert_eq!(
+            faststart_args(&args("-- -odd.mp4")).unwrap(),
+            Job::Faststart {
+                file: "-odd.mp4".into()
+            }
+        );
+        for bad in ["", "a.mp4 b.mp4", "-v a.mp4"] {
+            assert!(faststart_args(&args(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

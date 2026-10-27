@@ -64,7 +64,7 @@ test('terminal, password modal, upload, sanitized Markdown, slides and media', a
   await page.screenshot({ path: 'test-results/terminal.png', fullPage: true });
 });
 
-test('drag/drop uploads images and faststart videos; rejects tail-moov before storage', async ({ page, request }) => {
+test('drag/drop uploads images and videos, warning of one that is not faststart', async ({ page, request }) => {
   const folder = '/media-test-' + Date.now();
   await page.goto('/');
   await run(page, 'su root');
@@ -83,12 +83,17 @@ test('drag/drop uploads images and faststart videos; rejects tail-moov before st
     // Dropped files upload in the active tab, as its upload command does.
     await expect(page.locator('.busy')).toHaveText('↵');
     await page.dispatchEvent('body', 'drop', { dataTransfer: transfer });
-    if (name === 'tail-moov.mp4') await expect(page.locator('.transcript')).toContainText('✕ tail-moov.mp4: moov follows mdat');
-    else await expect(page.locator('.filename').filter({ hasText: name })).toBeVisible();
+    await expect(page.locator('.filename').filter({ hasText: name })).toBeVisible();
+    // Not faststart is uploaded, with what it costs and how to fix it.
+    if (name === 'tail-moov.mp4') {
+      await expect(page.locator('.transcript')).toContainText('✓ tail-moov.mp4');
+      await expect(page.locator('.transcript')).toContainText("⚠ not faststart: its index (moov) is after its media");
+      await expect(page.locator('.transcript')).toContainText("run faststart 'tail-moov.mp4' once it has uploaded");
+    }
     await transfer.dispose();
   }
   const files = await (await request.get('/api/ls?path=' + encodeURIComponent(folder))).json();
-  expect(files.entries.map(e => e.name).sort()).toEqual(['faststart.mp4', 'pixel.png']);
+  expect(files.entries.map(e => e.name).sort()).toEqual(['faststart.mp4', 'pixel.png', 'tail-moov.mp4']);
   await run(page, 'open pixel.png');
   await expect.poll(() => page.locator('.media-frame img').evaluate(e => e.naturalWidth)).toBe(1);
   await page.getByRole('button', { name: 'Close preview' }).click();

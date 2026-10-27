@@ -195,17 +195,17 @@ Previews render in Rust, as the terminal does; PDF pages, Mermaid diagrams, and 
 
 The upload picker accepts the types these previews know, by extension or name (`Makefile`), plus slides and games; the API accepts any name. R2 reads support HEAD, ETag, and single HTTP byte ranges, with authorization before conditional or range responses.
 
-MP4 / MOV / M4V / M4A uploads inspect top-level boxes to check that moov precedes mdat, including 64-bit box sizes. If needed:
+MP4 / MOV / M4V / M4A uploads inspect top-level boxes to check that moov precedes mdat, including 64-bit box sizes. A file that is not faststart still uploads, with a warning: players must fetch its end before they start, so it plays only once that has downloaded, and not at all while it is still uploading. `faststart FILE` then makes it stream where it is, on the server (see [Archives](#archives)); before uploading, the same can be done without re-encoding by:
 
-```bash
+```text
 ffmpeg -i input.mp4 -c copy -movflags +faststart output.mp4
 ```
 
-This is a UI-side structural faststart check, not a codec validator or proof of a particular encoder option. Direct API uploads do not perform this check. WebM does not use it.
+This is a UI-side structural faststart check, not a codec validator or proof of a particular encoder option; a file whose boxes cannot be read is warned about, not refused. Direct API uploads do not perform this check. WebM does not use it.
 
 ### Archives
 
-`zip`, `unzip`, and `tar` behave as their Linux namesakes do, for the options in `man`, and run on the server as jobs, so the archive's bytes never pass through the browser:
+`zip`, `unzip`, and `tar` behave as their Linux namesakes do, for the options in `man`, and run on the server as jobs, so the archive's bytes never pass through the browser; so does `faststart`:
 
 ```text
 zip -r notes.zip notes          unzip -d restored notes.zip     unzip -l notes.zip
@@ -219,6 +219,7 @@ tar -czf notes.tgz notes        tar -xvf notes.tgz -C restored  tar -tf notes.tg
 - A file that exists, when replaced, is removed and made anew, as GNU tar and Info-ZIP do: it is the extractor's, and its other names keep the old file. Extracted files and directories get, from `unzip`, the archived permission bits; from `tar`, those bits less the umask, or exactly (setuid, setgid and sticky too) for root. `000` counts as a mode; a member with none (zips made elsewhere) gets 644, or 755 for a directory. Directories that were there already get the archived mode too. A new file has its mode from its first byte, so nobody reads it while it is written who could not once it is there.
 - A member named on the command line that is not in the archive is a failure (`caution: filename not matched`, `Not found in archive`), as is an empty zip; an empty tar extracts nothing, without complaint. A job that has nothing to write ends at once.
 - A job tells its account nothing of what lies where that account may not look: before asking whether to replace a file, or saying one exists, it checks that the account may search every directory above it.
+- `faststart FILE` moves an MP4, M4V, MOV or M4A file's index (`moov`) before its media, as `ffmpeg -c copy -movflags +faststart` and qt-faststart do: the boxes are reordered and the chunk offsets (`stco`, `co64`, upgraded to `co64` past 4 GB) follow, nothing re-encoded. The file is written in place, keeping its owner, mode, ACLs and other names; a file already faststart is left alone, a fragmented one or one that is not MP4 is refused.
 - A new archive appears at once and can be read while it is written. `zip` does not update an existing archive; `tar -c` replaces one.
 - Jobs go on when their tab or the page closes; `jobs` lists them, with unfinished uploads, and `jobs cancel ID` stops one.
 

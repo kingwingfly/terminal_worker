@@ -300,6 +300,11 @@ pub trait Store {
     fn delete_expired_sessions(&mut self, now: u64);
 
     fn next_id(&mut self, kind: Id) -> u32;
+    /// Whether the content `file` is still being uploaded: until it is whole, it may be neither
+    /// copied nor given another name.
+    fn uploading(&self, _file: &str) -> bool {
+        false
+    }
 
     fn username(&self, id: u32) -> String {
         if id == GUEST {
@@ -715,12 +720,19 @@ pub trait Store {
         // What to copy, parents before their children, each with where it goes.
         let mut sources: Vec<(String, Node, String)> = Vec::new();
         let mut stack = vec![(src.to_string(), node, dst.to_string())];
-        let mut entered = BTreeSet::new();
+        // Where each directory goes, and what it is: one met again above itself, through a link,
+        // would be copied without end; one met twice side by side is copied twice, as cp -L does.
+        let mut entered: BTreeMap<String, String> = BTreeMap::new();
         while let Some((path, node, target)) = stack.pop() {
             if node.directory {
-                if !entered.insert(path.clone()) {
-                    return Err(format!("'{path}' is a directory it is copied into"));
+                let mut above = target.clone();
+                while above.len() > dst.len() {
+                    above = parent(&above).to_string();
+                    if entered.get(&above) == Some(&path) {
+                        return Err(format!("'{path}' is a directory it is copied into"));
+                    }
                 }
+                entered.insert(target.clone(), path.clone());
                 self.access(who, &path, READ | EXEC)?;
                 let mut children = self.children(&path);
                 children.reverse();
@@ -755,6 +767,12 @@ pub trait Store {
         for (path, source, target) in &sources {
             if source.is_file() {
                 self.access(who, path, READ)?;
+                // Also one met through a link (-L): it is copied once it is whole.
+                if source.file.as_deref().is_some_and(|id| self.uploading(id)) {
+                    return Err(format!(
+                        "'{path}' is still uploading; copy it once it completes"
+                    ));
+                }
             }
             resolve("/", target)?;
             let in_made = made.contains_key(parent(target));
@@ -823,9 +841,14 @@ pub trait Store {
             };
             match existing {
                 Some(e) if e.directory && source.directory => {
-                    if options.preserve {
+                    // Only its owner or root may change an existing directory's mode, as
+                    // chmod(2) allows; cp -p leaves another account's as it is.
+                    if options.preserve && (who.id == 0 || who.id == e.owner) {
                         let mut kept = e.clone();
                         kept.mode = (kept.mode & !0o7777) | source.mode;
+                        if who.id != 0 && !who.groups.contains(&kept.group) {
+                            kept.mode &= !SETGID;
+                        }
                         writes.push(Write::Name(target.clone(), kept));
                     }
                 }
@@ -860,9 +883,14 @@ pub trait Store {
                             size: source.size,
                             ..e
                         };
-                        if options.preserve {
+                        // Keeping the mode and ACL is chmod(2) on the file written: its owner's or
+                        // root's to do; another account's file only gets the content.
+                        if options.preserve && (who.id == 0 || who.id == e.owner) {
                             written.mode = source.mode;
                             written.acl = source.acl.clone();
+                            if who.id != 0 && !who.groups.contains(&written.group) {
+                                written.mode &= !SETGID;
+                            }
                         } else if who.id != 0 {
                             // Writing drops setuid, as it does on Linux without CAP_FSETID.
                             written.mode &= !SETUID;
@@ -918,18 +946,21 @@ pub trait Store {
         Ok(skipped)
     }
     /// A hard link `dst` to `src`, which link(2) makes: not to a directory; it needs w+x on the
-    /// directory `dst` goes in. Without root, one may link only what one owns, or a regular
-    /// file one may read and write that is not setuid, nor setgid and executable by its group
-    /// (protected_hardlinks).
-    fn link(&mut self, who: &Identity, src: &str, dst: &str) -> Result<(), String> {
+    /// directory `dst` goes in. Without root, one may link only what one owns, or a regular file
+    /// one may read and write that is not setuid, nor setgid and executable by its group
+    /// (protected_hardlinks). With `replace` (ln -f), a file at `dst` is replaced, but only once
+    /// the link is known to be possible: a link that cannot be made leaves what was there.
+    fn link(&mut self, who: &Identity, src: &str, dst: &str, replace: bool) -> Result<(), String> {
         let node = self.access(who, src, 0)?;
         if node.directory {
             return Err(format!("'{src}': hard link not allowed for directory"));
         }
-        self.writable_parent(who, dst)?;
-        if self.node(dst).is_some() {
-            return Err(format!("failed to create hard link '{dst}': File exists"));
+        if node.file.as_deref().is_some_and(|id| self.uploading(id)) {
+            return Err(format!(
+                "'{src}' is still uploading; link it once it completes"
+            ));
         }
+        self.writable_parent(who, dst)?;
         if who.id != 0 && who.id != node.owner {
             let safe = node.is_file()
                 && node.mode & SETUID == 0
@@ -941,12 +972,25 @@ pub trait Store {
                 ));
             }
         }
+        if let Some(existing) = self.node(dst) {
+            if existing.ino == node.ino {
+                return Err(format!("'{src}' and '{dst}' are the same file"));
+            }
+            self.replaceable(who, dst, &existing, replace, "hard link")?;
+            self.delete_node(dst);
+        }
         self.set_node(dst, &node);
         Ok(())
     }
     /// A symbolic link `dst` to `target`, which symlink(2) makes: it needs w+x on the directory
-    /// it goes in; what it points to need not exist.
-    fn symlink(&mut self, who: &Identity, target: &str, dst: &str) -> Result<(), String> {
+    /// it goes in; what it points to need not exist. `replace` as for [`Store::link`].
+    fn symlink(
+        &mut self,
+        who: &Identity,
+        target: &str,
+        dst: &str,
+        replace: bool,
+    ) -> Result<(), String> {
         if target.is_empty() {
             return Err(format!(
                 "failed to create symbolic link '{dst}': No such file or directory"
@@ -959,14 +1003,13 @@ pub trait Store {
             return Err("A link's target cannot contain control characters or backslashes, nor be longer than 4095 bytes".into());
         }
         self.writable_parent(who, dst)?;
-        if self.node(dst).is_some() {
-            return Err(format!(
-                "failed to create symbolic link '{dst}': File exists"
-            ));
-        }
         let dir = self
             .node(parent(dst))
             .ok_or("Parent directory does not exist")?;
+        if let Some(existing) = self.node(dst) {
+            self.replaceable(who, dst, &existing, replace, "symbolic link")?;
+            self.delete_node(dst);
+        }
         let group = if dir.mode & SETGID != 0 {
             dir.group
         } else {
@@ -974,6 +1017,24 @@ pub trait Store {
         };
         self.set_node(dst, &Node::symlink(who.id, group, target));
         Ok(())
+    }
+    /// Whether `existing`, at `path`, may give way to a new link, as ln -f removes it: only with
+    /// `replace`, never a directory, and in a sticky directory, only if `who` may remove it.
+    fn replaceable(
+        &self,
+        who: &Identity,
+        path: &str,
+        existing: &Node,
+        replace: bool,
+        what: &str,
+    ) -> Result<(), String> {
+        if !replace {
+            return Err(format!("failed to create {what} '{path}': File exists"));
+        }
+        if existing.directory {
+            return Err(format!("'{path}': cannot overwrite directory"));
+        }
+        self.unlinkable(who, path, existing)
     }
     fn move_home(&mut self, old: &str, new: &str) -> Result<(), String> {
         if old == "/"
@@ -1026,6 +1087,8 @@ pub struct MemStore {
     pub next_ino: u64,
     /// Files no node shows any more, in the order they were freed.
     pub freed: Vec<String>,
+    /// Files still being uploaded.
+    pub incomplete: BTreeSet<String>,
 }
 impl MemStore {
     /// A filesystem with only `root` and the system groups, and `/` as its tree.
@@ -1214,6 +1277,9 @@ impl Store for MemStore {
     }
     fn delete_expired_sessions(&mut self, now: u64) {
         self.sessions.retain(|_, s| s.expires > now);
+    }
+    fn uploading(&self, file: &str) -> bool {
+        self.incomplete.contains(file)
     }
     fn next_id(&mut self, kind: Id) -> u32 {
         let next = match kind {
@@ -1701,12 +1767,14 @@ mod tests {
     #[test]
     fn symbolic_links_resolve_as_the_kernel_resolves_them() {
         let mut c = home();
-        c.symlink(&alice(), "docs", "/home/alice/rel").unwrap();
-        c.symlink(&alice(), "/home/alice/docs/b.md", "/home/alice/abs")
+        c.symlink(&alice(), "docs", "/home/alice/rel", false)
             .unwrap();
-        c.symlink(&alice(), "missing", "/home/alice/dangling")
+        c.symlink(&alice(), "/home/alice/docs/b.md", "/home/alice/abs", false)
             .unwrap();
-        c.symlink(&alice(), "loop", "/home/alice/loop").unwrap();
+        c.symlink(&alice(), "missing", "/home/alice/dangling", false)
+            .unwrap();
+        c.symlink(&alice(), "loop", "/home/alice/loop", false)
+            .unwrap();
         let link = c.at("/home/alice/rel");
         assert_eq!((link.mode, link.owner, link.size), (0o777, 1000, 4));
         let resolved = |path: &str, follow| c.physical(&alice(), path, follow);
@@ -1737,13 +1805,23 @@ mod tests {
                 .contains("Too many levels")
         );
         // A link into a directory one may not search leads nowhere one may go.
-        c.symlink(&bob(), "/home/alice/private/c.txt", "/home/alice/docs/peek")
-            .unwrap_err();
+        c.symlink(
+            &bob(),
+            "/home/alice/private/c.txt",
+            "/home/alice/docs/peek",
+            false,
+        )
+        .unwrap_err();
         let mut docs = c.at("/home/alice/docs");
         docs.mode = 0o777;
         c.set_node("/home/alice/docs", &docs);
-        c.symlink(&bob(), "/home/alice/private/c.txt", "/home/alice/docs/peek")
-            .unwrap();
+        c.symlink(
+            &bob(),
+            "/home/alice/private/c.txt",
+            "/home/alice/docs/peek",
+            false,
+        )
+        .unwrap();
         let real = c.physical(&bob(), "/home/alice/docs/peek", true).unwrap();
         assert_eq!(
             c.access(&bob(), &real, READ).unwrap_err(),
@@ -1758,7 +1836,8 @@ mod tests {
         let mut c = store();
         c.set_node("/tmp", &Node::directory(0, 0, 0o1777));
         c.set_node("/tmp/target", &file(1000, 0o644, "t"));
-        c.symlink(&bob(), "/tmp/target", "/tmp/trap").unwrap();
+        c.symlink(&bob(), "/tmp/target", "/tmp/trap", false)
+            .unwrap();
         assert!(
             c.physical(&alice(), "/tmp/trap", true)
                 .unwrap_err()
@@ -1779,10 +1858,58 @@ mod tests {
         c.remove(&Identity::root(), "/tmp/target", false).unwrap();
     }
     #[test]
+    fn cp_p_keeps_modes_only_where_the_copier_may_chmod() {
+        let mut c = store();
+        c.set_node("/shared", &Node::directory(0, 0, 0o777));
+        c.set_node("/shared/docs", &Node::directory(0, 0, 0o755));
+        c.set_node("/shared/docs/a.txt", &file(0, 0o666, "a"));
+        c.set_node("/shared/mine", &Node::directory(1001, 1001, 0o777));
+        c.set_node("/shared/mine/a.txt", &file(1001, 0o4755, "b"));
+        let preserve = CopyOptions {
+            preserve: true,
+            ..opts(true, true)
+        };
+        c.copy(&bob(), "/shared/mine", "/shared/docs", &preserve)
+            .unwrap();
+        // root's directory and file keep their modes; the file gets the content.
+        assert_eq!(c.at("/shared/docs").mode, 0o755);
+        let written = c.at("/shared/docs/a.txt");
+        assert_eq!((written.mode, written.file.as_deref()), (0o666, Some("b")));
+    }
+    #[test]
+    fn cp_l_copies_a_directory_two_links_lead_to_twice() {
+        let mut c = home();
+        let follow = CopyOptions {
+            dereference: true,
+            ..opts(true, true)
+        };
+        c.mkdir(&alice(), "/home/alice/set", false).unwrap();
+        c.symlink(&alice(), "/home/alice/docs", "/home/alice/set/one", false)
+            .unwrap();
+        c.symlink(&alice(), "/home/alice/docs", "/home/alice/set/two", false)
+            .unwrap();
+        c.copy(&alice(), "/home/alice/set", "/home/alice/copied", &follow)
+            .unwrap();
+        assert!(c.at("/home/alice/copied/one").directory);
+        assert!(c.at("/home/alice/copied/two").directory);
+        // A link to a directory above is still refused.
+        c.symlink(&alice(), "/home/alice/set", "/home/alice/set/up", false)
+            .unwrap();
+        assert!(
+            c.copy(&alice(), "/home/alice/set", "/home/alice/again", &follow)
+                .is_err()
+        );
+    }
+    #[test]
     fn hard_links_share_one_inode() {
         let mut c = home();
-        c.link(&alice(), "/home/alice/a.txt", "/home/alice/docs/a-too.txt")
-            .unwrap();
+        c.link(
+            &alice(),
+            "/home/alice/a.txt",
+            "/home/alice/docs/a-too.txt",
+            false,
+        )
+        .unwrap();
         let (one, two) = (
             c.at("/home/alice/a.txt"),
             c.at("/home/alice/docs/a-too.txt"),
@@ -1800,7 +1927,7 @@ mod tests {
             .unwrap();
         assert_eq!(c.freed, ["a"]);
         assert!(
-            c.link(&alice(), "/home/alice/docs", "/home/alice/docs2")
+            c.link(&alice(), "/home/alice/docs", "/home/alice/docs2", false)
                 .unwrap_err()
                 .contains("not allowed for directory")
         );
@@ -1809,12 +1936,12 @@ mod tests {
         c.set_node("/tmp", &Node::directory(0, 0, 0o1777));
         c.set_node("/tmp/shared.txt", &file(1000, 0o644, "s"));
         assert!(
-            c.link(&bob(), "/tmp/shared.txt", "/tmp/held")
+            c.link(&bob(), "/tmp/shared.txt", "/tmp/held", false)
                 .unwrap_err()
                 .contains("Operation not permitted")
         );
         c.set_node("/tmp/open.txt", &file(1000, 0o666, "o"));
-        c.link(&bob(), "/tmp/open.txt", "/tmp/held").unwrap();
+        c.link(&bob(), "/tmp/open.txt", "/tmp/held", false).unwrap();
         // Directories count themselves, their entry and their subdirectories.
         assert_eq!(c.at("/home/alice").links, 4);
     }
@@ -1905,12 +2032,13 @@ mod tests {
     fn cp_follows_and_keeps_links_and_owners_as_gnu_cp_does() {
         let mut c = home();
         c.set_node("/tmp", &Node::directory(0, 0, 0o777));
-        c.symlink(&alice(), "b.md", "/home/alice/docs/link.md")
+        c.symlink(&alice(), "b.md", "/home/alice/docs/link.md", false)
             .unwrap();
         c.link(
             &alice(),
             "/home/alice/docs/b.md",
             "/home/alice/docs/b-too.md",
+            false,
         )
         .unwrap();
         // -r copies links as links, and names of one file as files of their own.
@@ -1986,7 +2114,8 @@ mod tests {
         let bobs = c.at("/tmp/bobs.txt");
         assert_eq!((bobs.owner, bobs.group, bobs.mode), (1001, 1001, 0o664));
         // A file is written through a link to one; not through one leading nowhere.
-        c.symlink(&alice(), "/tmp/locked.txt", "/tmp/via").unwrap();
+        c.symlink(&alice(), "/tmp/locked.txt", "/tmp/via", false)
+            .unwrap();
         c.copy(
             &alice(),
             "/home/alice/docs/b.md",
@@ -1995,7 +2124,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.at("/tmp/locked.txt").file.as_deref(), Some("b"));
-        c.symlink(&alice(), "/tmp/nowhere", "/tmp/dangling")
+        c.symlink(&alice(), "/tmp/nowhere", "/tmp/dangling", false)
             .unwrap();
         assert!(
             c.copy(
@@ -2006,6 +2135,105 @@ mod tests {
             )
             .unwrap_err()
             .contains("dangling")
+        );
+    }
+    #[test]
+    fn ln_f_replaces_only_once_the_link_can_be_made() {
+        let mut c = home();
+        c.set_node("/home/alice/docs/old.md", &file(1000, 0o644, "old"));
+        // A directory cannot be hard-linked: what was there stays.
+        assert!(
+            c.link(
+                &alice(),
+                "/home/alice/docs",
+                "/home/alice/docs/old.md",
+                true
+            )
+            .unwrap_err()
+            .contains("not allowed for directory")
+        );
+        assert_eq!(c.at("/home/alice/docs/old.md").file.as_deref(), Some("old"));
+        // Nor may one link another's file one may not write (protected_hardlinks).
+        let mut open = c.at("/home/alice/docs");
+        open.mode = 0o777;
+        c.set_node("/home/alice/docs", &open);
+        c.set_node("/home/alice/docs/bobs.md", &file(1001, 0o644, "bobs"));
+        assert!(
+            c.link(
+                &bob(),
+                "/home/alice/a.txt",
+                "/home/alice/docs/bobs.md",
+                true
+            )
+            .is_err()
+        );
+        assert_eq!(
+            c.at("/home/alice/docs/bobs.md").file.as_deref(),
+            Some("bobs")
+        );
+        // Without -f, nothing is replaced; with it, the name now shows the other file.
+        assert!(
+            c.symlink(&alice(), "b.md", "/home/alice/docs/old.md", false)
+                .unwrap_err()
+                .contains("File exists")
+        );
+        c.symlink(&alice(), "b.md", "/home/alice/docs/old.md", true)
+            .unwrap();
+        assert_eq!(
+            c.at("/home/alice/docs/old.md").link.as_deref(),
+            Some("b.md")
+        );
+        assert!(c.freed.contains(&"old".to_string()));
+        assert!(
+            c.link(
+                &alice(),
+                "/home/alice/docs/b.md",
+                "/home/alice/docs/b.md",
+                true
+            )
+            .unwrap_err()
+            .contains("same file")
+        );
+    }
+    #[test]
+    fn what_is_still_uploading_is_neither_copied_nor_linked_however_it_is_reached() {
+        let mut c = home();
+        c.set_node("/home/alice/docs/up.bin", &file(1000, 0o644, "up"));
+        c.incomplete.insert("up".into());
+        c.symlink(&alice(), "../docs/up.bin", "/home/alice/private/l", false)
+            .unwrap();
+        let followed = CopyOptions {
+            dereference: true,
+            ..opts(true, true)
+        };
+        assert!(
+            c.copy(
+                &alice(),
+                "/home/alice/private",
+                "/home/alice/copied",
+                &followed
+            )
+            .unwrap_err()
+            .contains("still uploading")
+        );
+        assert!(!c.names.contains_key("/home/alice/copied"));
+        // Without -L, the link is copied, which is not the file.
+        c.copy(
+            &alice(),
+            "/home/alice/private",
+            "/home/alice/copied",
+            &opts(true, true),
+        )
+        .unwrap();
+        assert!(
+            c.link(
+                &alice(),
+                "/home/alice/docs/up.bin",
+                "/home/alice/up2",
+                false
+            )
+            .unwrap_err()
+            .contains("still uploading")
         );
     }
     #[test]

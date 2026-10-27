@@ -81,6 +81,19 @@ test('ln makes symbolic and hard links that behave as on Linux', async ({ page, 
   await run(page, 'cp -a . ../kept-' + base.slice(1));
   expect(await output(page, `ls -l ../kept-${base.slice(1)}/docs/a3.md`)).toMatch(/^-rw------- +2 /);
   for (const dir of ['copy', 'kept']) await request.delete(file(`/${dir}-${base.slice(1)}`) + '&recursive=true', { headers });
+  // ln -f replaces a name only once its link can be made: one that cannot leaves what was there.
+  await run(page, 'mkdir t');
+  for (const name of ['docs', 'a-too.md']) expect((await request.put(file(`${base}/t/${name}`), { headers, data: 'keep\n' })).status()).toBe(201);
+  await run(page, 'ln -f a-too.md docs t');
+  await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText('hard link not allowed for directory');
+  expect(await (await request.get(file(base + '/t/docs'), { headers })).text()).toBe('keep\n');
+  expect(await (await request.get(file(base + '/t/a-too.md'), { headers })).text()).toBe('changed\n');
+  // A file still uploading is copied once whole, also when a link leads to it.
+  expect((await request.post('/api/uploads?path=' + encodeURIComponent(base + '/up.bin'), { headers, data: { size: 4 } })).ok()).toBe(true);
+  await run(page, 'mkdir withlink'); await run(page, 'ln -s ../up.bin withlink/l');
+  await run(page, 'cp -rL withlink taken'); await expect(last(page)).toContainText('still uploading');
+  expect((await request.get('/api/stat?path=' + encodeURIComponent(base + '/taken'), { headers })).status()).toBe(404);
+  await run(page, 'ln up.bin up-too.bin'); await expect(last(page)).toContainText('still uploading');
 });
 
 test('a visitor makes an account in /guest, which is sticky, and shares files with ACLs', async ({ page, request }) => {

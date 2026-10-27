@@ -122,6 +122,14 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     for statement in SCHEMA {
         sql.exec(statement, None)?;
     }
+    // Tables made just now are this version's, said at once: initialization may fail (a
+    // missing ADMIN_PASSWORD), and the next start must not take them for an older version's.
+    if !tables.iter().any(|t| t.name == "users") {
+        sql.exec(
+            &format!("INSERT OR REPLACE INTO meta(k, v) VALUES('schema', '{SCHEMA_VERSION}')"),
+            None,
+        )?;
+    }
     Ok(())
 }
 
@@ -984,6 +992,9 @@ impl Store for Db {
         self.run("DELETE FROM sessions WHERE expires <= ?", vec![int(now)]);
     }
 
+    fn uploading(&self, file: &str) -> bool {
+        self.file(file).is_some_and(|f| !f.complete())
+    }
     fn next_id(&mut self, kind: Id) -> u32 {
         let key = match kind {
             Id::User => "next_user",
