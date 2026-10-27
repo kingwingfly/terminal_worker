@@ -31,7 +31,7 @@ function credentials(options) {
   dialogs = answer.catch(() => {});
   return answer;
 }
-function askCredentials({ title, description, username, chooseUser = false, newPassword = false, currentPassword = false, submit }) {
+function askCredentials({ title, description, username, chooseUser = false, newPassword = false, currentPassword = false, action, submit }) {
   return new Promise(resolve => {
     const dialog = $('auth'), form = $('auth-form'), password = $('password'), user = $('username');
     $('auth-title').textContent = title; $('auth-description').textContent = description; $('auth-error').textContent = '';
@@ -41,7 +41,7 @@ function askCredentials({ title, description, username, chooseUser = false, newP
     $('password-label').textContent = newPassword ? 'New password' : 'Password';
     password.autocomplete = newPassword ? 'new-password' : 'current-password';
     for (const id of ['password', 'current-password', 'confirm-password']) $(id).value = '';
-    const button = form.querySelector('[type=submit]'); button.textContent = newPassword ? 'Save password' : 'Confirm'; button.disabled = false;
+    const button = form.querySelector('[type=submit]'); button.textContent = action || (newPassword ? 'Save password' : 'Confirm'); button.disabled = false;
     let completed = false;
     const finish = result => {
       if (completed) return; completed = true;
@@ -117,11 +117,20 @@ async function sudoAuthenticate() {
 async function accountCommand(args, cwd) {
   // Help is resolved before authentication or any command effects. -- ends options.
   const options = args.slice(1, args.indexOf('--') < 0 ? undefined : args.indexOf('--'));
-  if (options.some(arg => arg === '-h' || arg === '--help')) {
+  // -h is an option of these, as on Linux (no dereference, or tar's dereference), unless alone.
+  // Under sudo, the command's own -h counts.
+  const at = args[0] === 'sudo' && args[1] && !args[1].startsWith('-') ? 1 : 0;
+  const hOption = ['chown', 'chgrp', 'getfattr', 'setfattr', 'tar'].includes(args[at]) && args.length - at > 2;
+  if (options.some(arg => arg === '--help' || (arg === '-h' && !hOption))) {
     let topic = args[0];
     if (topic === 'sudo' && args[1] && !args[1].startsWith('-')) topic = args[1];
     const { help } = await import('./manual.mjs');
     return { output: help(topic) };
+  }
+  if (args[0] === 'help') {
+    if (args.length > 2) throw new Error('Usage: help [COMMAND]');
+    const manual = await import('./manual.mjs');
+    return { output: args[1] ? manual.help(args[1]) : manual.commands() };
   }
   if (args[0] === 'man') {
     if (args.length > 2) throw new Error('Usage: man [COMMAND]');
@@ -167,6 +176,18 @@ async function accountCommand(args, cwd) {
     if (!result) throw new Error('Password change canceled');
     await identityChanged(); return { output: `Password updated for ${username}` };
   }
+  // Signed out, useradd NAME makes an account of one's own, with the password given here.
+  if (args[0] === 'useradd' && !sudo && !(await session()).authenticated) {
+    const force = args.includes('--force');
+    const rest = args.slice(1).filter(arg => arg !== '--force');
+    if (rest.length !== 1 || rest[0].startsWith('-')) throw new Error('Usage: useradd [--force] NAME (signed out: an account of your own, home /guest/NAME); options need sudo');
+    const username = rest[0];
+    const result = await credentials({ title: `Create account ${username}`, description: (force ? '--force enabled: short passwords are allowed, but cannot be empty. ' : 'Use at least 12 characters, or run useradd --force NAME to allow a short password. ') + `Your home will be /guest/${username}, which only you may enter; you will be signed in.`, newPassword: true, action: 'Create account',
+      submit: fields => post('register', { username, password: fields.password, force }) });
+    if (!result) throw new Error('Account creation canceled');
+    await identityChanged();
+    return { output: `Created user ${username} and signed in; home ${result.home}`, home: result.home };
+  }
   if (['su', 'login'].includes(args[0])) {
     if (sudo) throw new Error('Use su root to switch accounts');
     const loginShell = args[0] === 'login' || args[1] === '-';
@@ -200,19 +221,34 @@ async function uploadFiles(files, path, progress) {
       try {
         if (!rust.uploadable(file.name)) throw new Error('Unsupported file type');
         if (file.size > rust.maxFile) throw new Error(`Exceeds the ${rust.maxFile / 1e9} GB limit`);
+        // Not faststart is only a warning: such a file uploads, and plays once its index has.
+        let warning = null;
         if (/\.(mp4|m4v|mov|m4a)$/i.test(file.name)) {
           progress(`↑ ${file.name} · checking faststart`);
-          const result = await inspectFaststart(file);
-          if (!result.faststart) throw new Error('moov follows mdat. First run ffmpeg -i input.mp4 -c copy -movflags +faststart output.mp4');
+          warning = await faststartWarning(file);
         }
+        const flagged = warning ? ' · ⚠ not faststart' : '';
         const destination = (path === '/' ? '' : path.replace(/\/$/, '')) + '/' + file.name;
         const done = await uploadFile(file, destination, { signal: controller.signal,
-          progress: state => { progress(`↑ ${file.name} · ${state}`); if (!state.startsWith('hashing')) changed(); } });
+          progress: state => { progress(`↑ ${file.name} · ${state}${flagged}`); if (!state.startsWith('hashing')) changed(); } });
         results.push(`✓ ${file.name}${done.resumed ? ' (resumed)' : ''}`);
+        if (warning) results.push(`  ⚠ ${warning}`);
       } catch (error) { results.push(`✕ ${file.name}: ${error instanceof Cancelled ? 'Upload cancelled' : error.message}`); }
     }
     return results;
   } finally { uploading = null; changed(); }
+}
+// Why `file`, an MP4-family video or audio, will not stream, if it will not: its index (moov)
+// after its media (mdat) makes players fetch the end before they start, which a file still
+// uploading does not have yet. Null when it is faststart.
+async function faststartWarning(file) {
+  const fix = `to stream it, run faststart '${file.name.replaceAll("'", "'\\''")}' once it has uploaded`;
+  try {
+    if ((await inspectFaststart(file)).faststart) return null;
+    return `not faststart: its index (moov) is after its media, so it plays only once the end has downloaded, and not until its upload completes; ${fix}`;
+  } catch (error) {
+    return `faststart could not be checked (${error.message}); if it does not play while downloading, ${fix}`;
+  }
 }
 // Cancel the uploads in progress, if any; whether there were.
 function cancelUploads() { if (!uploading) return false; uploading.abort(); return true; }

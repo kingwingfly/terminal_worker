@@ -36,7 +36,7 @@ Rebuild frontend changes with `npm run build:web` (currently `npm run build` bui
 
 ## Accounts and permissions
 
-Anonymous visitors share the `guest` identity. The server checks owner/group/other rwx permissions on every request. Permission classes do not combine: an owner uses owner bits even if other bits are more permissive; group members likewise use group bits. Root (uid 0) retains full control.
+Anonymous visitors are the `guest` account (uid 65534, group `guest`), which cannot sign in, as `nobody` cannot on Linux. The server checks permissions on every request, as Linux does: an owner by the owner bits, a named user by its ACL entry, members of the owning or a named group by those entries (any may allow), everyone else by the other bits. Classes do not combine: an owner uses owner bits even if other bits are more permissive. Root (uid 0) retains full control.
 
 | Operation | Required permissions |
 | --- | --- |
@@ -47,12 +47,21 @@ Anonymous visitors share the `guest` identity. The server checks owner/group/oth
 | Delete a file | Parent w+x, independent of the file write bit |
 | Recursively delete a directory | Parent w+x and every emptied directory r+w+x; validate the whole tree first |
 | Overwrite a file | File w; ancestors x |
-| chmod | Owner or root |
-| chown | Root can change owner/group; ordinary owners can select only a group they belong to |
+| Remove or rename in a sticky directory (`+t`) | Also be the entry's owner, the directory's owner, or root |
+| chmod, setfacl | Owner or root |
+| chown, chgrp | Root can change owner/group; ordinary owners can select only a group they belong to |
+| Hard link (`ln`) | Directory w+x; without root, own the file or may read and write it (protected_hardlinks) |
+| Follow a symbolic link in a sticky directory others may write | Own the link, or the directory's owner does (protected_symlinks) |
+| `user.*` attributes (setfattr) | File w; on a sticky directory, its owner |
 
 Defaults are files 644, directories 755, and user homes 700. Public files inside private homes also need traversable ancestors; for example, home 711 and file 644 allow reading a known path without listing the home. Use 755 to permit listing.
 
-The executable bit is stored and displayed, but files and commands never execute on the host. There are no symlinks, special mode bits, POSIX ACLs, or configurable umask. Omitted chmod classes apply to all three classes.
+The executable bit is stored and displayed, but files and commands never execute on the host. The umask is 022 and cannot be changed. Omitted chmod classes apply to all three classes.
+
+- **Links.** Paths name inodes. A hard link (`ln`) is another name for an inode: content, owner, mode, ACLs and attributes are shared, and the inode goes with its last name; directories cannot be hard-linked. A symbolic link (`ln -s`) holds a target path, relative to its directory or absolute, which may not exist; its mode is always 777. Every path is resolved as the kernel resolves one: each link on the way is followed with the caller's search permission checked at every directory, at most 40 links per path. Commands follow a link at the end of a path except those that act on names (`rm`, `mv`, `ln`, `readlink`, `mkdir`, `chown -h`, `ls -l`/`-d`). `..` is resolved in the path as typed, as the shell's `cd` does, so `cd link` then `cd ..` comes back.
+- **Special bits.** setgid on a directory gives what is made in it the directory's group, and the bit to new directories; sticky (`+t`) lets only an entry's owner, the directory's owner or root remove or rename it. setuid is kept and shown. Without root, setgid needs the file's group to be one of the caller's. Changing a file's owner clears setuid, and setgid if the group may execute it.
+- **ACLs.** `setfacl` adds named user and group entries; the mode's group bits are then the mask, which bounds them, so `chmod` changes the mask. A directory's default ACL is what is made in it gets, in place of the umask. `ls -l` marks an ACL with `+`; `getfacl` shows `#effective` rights.
+- **Extended attributes.** `setfattr`/`getfattr` keep `user.*` attributes (read to get, write to set) and root's `trusted.*`, up to 4 KB per inode.
 
 ### Identity changes and sudo
 
@@ -106,7 +115,9 @@ Every command supports `-h` and `--help`, sharing the manual used by `man COMMAN
 | Identity | `whoami`, `id [USER]`, `groups [USER]`, root-only `users` |
 | Interface | `help`, `man [COMMAND]`, `clear`, `vim FILE` |
 
-`useradd -m` creates the home; `-d` selects its absolute path. Without `-g`, a same-name primary group is created. New accounts need `passwd USER` before login. Names start with a lowercase letter and contain up to 32 lowercase letters, digits, underscores, or hyphens.
+Signed out, `useradd NAME` makes an account of one's own: the dialog asks for its password (12 characters unless `--force`), and the browser is signed in. The account has a private primary group and is in group `guest`; its home is `/guest/NAME`, mode 700. `/guest` is `root:guest` 1777, shared and sticky like `/tmp`. Registration is rate-limited per address, and guests may make at most 1,000 accounts. `guest` itself cannot have a password, be changed, or be deleted.
+
+As root, `useradd -m` creates the home; `-d` selects its absolute path. Without `-g`, a same-name primary group is created. New accounts need `passwd USER` before login. Names start with a lowercase letter and contain up to 32 lowercase letters, digits, underscores, or hyphens.
 
 `usermod -G` replaces supplementary memberships; `-aG` appends. `-d PATH -m` atomically moves the home mapping while preserving content keys and permissions, without copying large files. The target must not exist or overlap another home. Without `-m`, only the account home field changes. `-g` changes the primary group, not existing file groups. `-L` locks and revokes sessions; `-U` does not restore those sessions.
 
@@ -114,11 +125,13 @@ Every command supports `-h` and `--help`, sharing the manual used by `man COMMAN
 
 Passwords use random salts, PBKDF2-SHA256 (100,000 iterations), and a server-side pepper. Sessions use random opaque tokens and HttpOnly/SameSite=Strict cookies, with Secure on HTTPS and an eight-hour lifetime. Authentication endpoints are rate-limited.
 
-`touch` creates empty files with mode 644, including extensionless names. Existing content and modes remain intact; modification timestamps are not maintained. `-c` skips missing files. Parents must already exist; all paths are validated before creation. `sudo touch` creates files as root for that request only.
+`touch` creates empty files with mode 644 (or what a default ACL gives), including extensionless names. Existing content and modes remain intact; modification timestamps are not maintained. `-c` skips missing files. Parents must already exist; all paths are validated before creation. `sudo touch` creates files as root for that request only.
 
 `mkdir`, `rm`, `chmod`, and `chown` accept several paths. As on Linux, each path succeeds or fails on its own: failures are reported, and the others are still done. `rm` protects root, the current directory, and its ancestors. There is no trash.
 
-`mv` and `cp` follow Linux defaults: an existing file at the destination is replaced. `-n` never replaces one; `-i` asks for each. A directory is never replaced. `mv` keeps owner and mode and changes metadata only, so moving is instant whatever the size; it needs w+x on both parents, and a directory that changes parent needs w itself. The working directory, its ancestors, and account homes cannot be moved (use `usermod -d HOME -m`). `cp` creates nodes owned by the caller, with the source mode less group/other write (umask 022), and merges into existing directories (`-r`). Copies share the source's immutable content, so they are instant too; editing either later keeps the other unchanged. A file still uploading cannot be copied yet.
+`mv` and `cp` follow Linux defaults: an existing file at the destination is replaced. `-n` never replaces one; `-i` asks for each. A directory is never replaced. `mv` moves names, so the inode keeps its owner, mode, ACLs and other names, and moving is instant whatever the size; it needs w+x on both parents, and a directory that changes parent needs w itself. The working directory, its ancestors, and account homes cannot be moved (use `usermod -d HOME -m`).
+
+`cp` follows GNU cp. New nodes belong to the caller, with the source mode less the umask, or what the destination's default ACL gives. An existing file is written in place, keeping its owner, mode and other names (which need w on it). With `-f`, a file that cannot be written is removed and copied anew. `-p` keeps the mode, ACLs, and, as far as the caller may, the owner and group. Without `-r`, a link named is followed. With `-r`, links are copied as links, unless `-L` follows them all or `-H` those named. `-d` copies a file's several names as one file; `-a` is `-dpR` plus extended attributes. Copying a file onto another of its names is refused ("the same file"), as is writing through a dangling link. Copies share the source's immutable content, so they are instant too; editing either later keeps the other unchanged. A file still uploading cannot be copied yet.
 
 `fd` follows sharkdp/fd: a regular expression (smart case) matched against names, or against whole paths with `-p`; `-g` for globs and `-F` for fixed strings; dot-names skipped unless `-H`. It searches only what the caller may list, reporting directories it could not read. `-x COMMAND` runs once per result and `-X COMMAND` once with all of them; `{}`, `{/}`, `{//}`, `{.}`, and `{/.}` are placeholders.
 
@@ -182,17 +195,17 @@ Previews render in Rust, as the terminal does; PDF pages, Mermaid diagrams, and 
 
 The upload picker accepts the types these previews know, by extension or name (`Makefile`), plus slides and games; the API accepts any name. R2 reads support HEAD, ETag, and single HTTP byte ranges, with authorization before conditional or range responses.
 
-MP4 / MOV / M4V / M4A uploads inspect top-level boxes to check that moov precedes mdat, including 64-bit box sizes. If needed:
+MP4 / MOV / M4V / M4A uploads inspect top-level boxes to check that moov precedes mdat, including 64-bit box sizes. A file that is not faststart still uploads, with a warning: players must fetch its end before they start, so it plays only once that has downloaded, and not at all while it is still uploading. `faststart FILE` then makes it stream where it is, on the server (see [Archives](#archives)); before uploading, the same can be done without re-encoding by:
 
-```bash
+```text
 ffmpeg -i input.mp4 -c copy -movflags +faststart output.mp4
 ```
 
-This is a UI-side structural faststart check, not a codec validator or proof of a particular encoder option. Direct API uploads do not perform this check. WebM does not use it.
+This is a UI-side structural faststart check, not a codec validator or proof of a particular encoder option; a file whose boxes cannot be read is warned about, not refused. Direct API uploads do not perform this check. WebM does not use it.
 
 ### Archives
 
-`zip`, `unzip`, and `tar` behave as their Linux namesakes do, for the options in `man`, and run on the server as jobs, so the archive's bytes never pass through the browser:
+`zip`, `unzip`, and `tar` behave as their Linux namesakes do, for the options in `man`, and run on the server as jobs, so the archive's bytes never pass through the browser; so does `faststart`:
 
 ```text
 zip -r notes.zip notes          unzip -d restored notes.zip     unzip -l notes.zip
@@ -201,10 +214,12 @@ tar -czf notes.tgz notes        tar -xvf notes.tgz -C restored  tar -tf notes.tg
 
 - A job reads the files as they were when it started, which stay until it ends, whatever happens to their paths. It acts as the account that started it (root under `sudo`), and every file it writes passes the usual permission checks.
 - Extraction writes members one by one, straight into the destination, as on Linux. Stopping early (Ctrl+C, or `jobs cancel ID`) leaves what was extracted, never a half-written file; `unzip -n` continues. `unzip` asks before replacing a file (`-o` replaces, `-n` never does); `tar -x` replaces, unless `-k` or `--skip-old-files`.
-- Members whose names contain `..`, links, devices, and duplicate names are skipped with a warning; a leading `/` is removed. Archives may hold up to 10,000 members expanding to 1 GB.
-- Extracted files and directories get the archived permission bits less group and other write (umask 022), `000` included, also a file that replaces one and a directory that was there already; a member the archive keeps no mode for (zips made elsewhere) gets 644, or 755 for a directory. A new file has its mode from its first byte, so nobody reads it while it is written who could not once it is there.
+- Members whose names contain `..`, devices, and duplicate names are skipped with a warning; a leading `/` is removed. Archives may hold up to 10,000 members expanding to 1 GB.
+- Links: `tar -c` stores symbolic links as links and a file's later names as hard links (`-h` stores what they lead to); `zip -r` follows links unless `-y`. Extraction makes them: hard links in archive order, symbolic links after everything else, as GNU tar's delayed links, so no member is written through a link from the same archive.
+- A file that exists, when replaced, is removed and made anew, as GNU tar and Info-ZIP do: it is the extractor's, and its other names keep the old file. Extracted files and directories get, from `unzip`, the archived permission bits; from `tar`, those bits less the umask, or exactly (setuid, setgid and sticky too) for root. `000` counts as a mode; a member with none (zips made elsewhere) gets 644, or 755 for a directory. Directories that were there already get the archived mode too. A new file has its mode from its first byte, so nobody reads it while it is written who could not once it is there.
 - A member named on the command line that is not in the archive is a failure (`caution: filename not matched`, `Not found in archive`), as is an empty zip; an empty tar extracts nothing, without complaint. A job that has nothing to write ends at once.
 - A job tells its account nothing of what lies where that account may not look: before asking whether to replace a file, or saying one exists, it checks that the account may search every directory above it.
+- `faststart FILE` moves an MP4, M4V, MOV or M4A file's index (`moov`) before its media, as `ffmpeg -c copy -movflags +faststart` and qt-faststart do: the boxes are reordered and the chunk offsets (`stco`, `co64`, upgraded to `co64` past 4 GB) follow, nothing re-encoded. The file is written in place, keeping its owner, mode, ACLs and other names; a file already faststart is left alone, a fragmented one or one that is not MP4 is refused.
 - A new archive appears at once and can be read while it is written. `zip` does not update an existing archive; `tar -c` replaces one.
 - Jobs go on when their tab or the page closes; `jobs` lists them, with unfinished uploads, and `jobs cancel ID` stops one.
 

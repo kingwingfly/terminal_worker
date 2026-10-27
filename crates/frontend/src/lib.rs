@@ -127,10 +127,11 @@ fn render_line(line: LogLine) -> AnyView {
         LogLine::Listing { entries, long } => {
             view! { <pre class=if long { "listing-output listing-long" } else { "listing-output" }>
                 {entries.into_iter().map(|entry| {
-                    let class = if entry.directory { "listing-entry entry-directory" } else if entry.mode & 0o111 != 0 { "listing-entry entry-executable" } else { "listing-entry entry-file" };
-                    let meta = if long { format!("{} {}:{} {:>6} ", terminal_worker_core::permissions::mode_text(entry.mode, entry.directory), entry.owner, entry.group, entry.size) } else { String::new() };
+                    let class = if entry.link.is_some() { "listing-entry entry-link" } else if entry.directory { "listing-entry entry-directory" } else if entry.mode & 0o111 != 0 { "listing-entry entry-executable" } else { "listing-entry entry-file" };
+                    let meta = if long { format!("{} {:>2} {}:{} {:>6} ", entry.mode_line(), entry.links, entry.owner, entry.group, entry.size) } else { String::new() };
                     let uploading = upload_progress(&entry).map(|p| format!(" {p}"));
-                    view! { <span class=class>{file_icon(&entry.kind, entry.directory)}<span class="ls-meta">{meta}</span><span class="ls-name">{entry.name}{if entry.directory { "/" } else if entry.mode & 0o111 != 0 { "*" } else { "" }}</span><span class="ls-uploading">{uploading}</span></span> }
+                    let suffix = entry.suffix();
+                    view! { <span class=class>{file_icon(&entry.kind, entry.directory)}<span class="ls-meta">{meta}</span><span class="ls-name">{entry.name}{suffix}</span><span class="ls-uploading">{uploading}</span></span> }
                 }).collect_view()}
             </pre> }.into_any()
         }
@@ -483,7 +484,9 @@ fn App() -> impl IntoView {
                     {move || current.get().entries.get().into_iter().map(|entry| {
                         let command = format!("{} \"{}\"", if entry.directory { "cd" } else { "open" }, entry.path.replace('"', "\\\""));
                         let size = if entry.directory { String::new() } else { upload_progress(&entry).unwrap_or_else(|| format!("{:.1} KB", entry.size as f64 / 1000.0)) };
-                        view! { <button class="file" data-kind=if entry.directory { "directory".to_string() } else { entry.kind.clone() } title=format!("{} {}:{}", terminal_worker_core::permissions::mode_text(entry.mode, entry.directory), entry.owner, entry.group) on:click=move |_| current.get_untracked().run(command.clone())><span class="file-kind">{file_icon(&entry.kind, entry.directory)}</span><span class="filename"><span class="filename-text">{entry.name}{if entry.directory { "/" } else { "" }}</span></span><span class="file-size">{size}</span></button> }
+                        let title = format!("{} {}:{}{}", entry.mode_line(), entry.owner, entry.group, entry.link.as_ref().map(|t| format!(" -> {t}")).unwrap_or_default());
+                        let linked = entry.link.is_some();
+                        view! { <button class="file" class:link=linked data-kind=if entry.directory { "directory".to_string() } else { entry.kind.clone() } title=title on:click=move |_| current.get_untracked().run(command.clone())><span class="file-kind">{file_icon(&entry.kind, entry.directory)}</span><span class="filename"><span class="filename-text">{entry.name}{if entry.directory { "/" } else { "" }}</span></span><span class="file-size">{if linked { "→".to_string() } else { size }}</span></button> }
                     }).collect_view()}
                     <p class="directory-error" role="status">{move || current.get().directory_error.get()}</p>
                     <Show when=move || current.get().entries.get().is_empty() && current.get().directory_error.get().is_empty()><p class="empty">"This directory is empty. Drop files here or use mkdir to create a directory."</p></Show>

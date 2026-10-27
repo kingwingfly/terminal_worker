@@ -119,11 +119,12 @@ test('unzip asks before replacing, -o and -n decide, tar -k keeps, and hostile m
   expect(await (await request.get(file(base + '/copy/docs/a.md'))).text()).toBe('kept\n');
   await run(page, 'tar -xf notes.tar -C copy');
   expect(await (await request.get(file(base + '/copy/docs/a.md'))).text()).toBe('alpha\n'.repeat(2000));
-  // A hostile archive: .. and links are skipped, a leading / removed, the rest extracted.
+  // A hostile archive: .. is skipped, a leading / removed, the rest extracted, its link as one.
   expect((await request.put(file(base + '/slip.zip'), { headers, data: await readFile('tests/fixtures/slip.zip') })).status()).toBe(201);
   await run(page, 'unzip slip.zip -d out');
   await expect(transcript(page)).toContainText("skipping ../evil.txt: its name contains '..'");
-  await expect(transcript(page)).toContainText('skipping safe/link: links are not supported here');
+  await expect(transcript(page)).toContainText(`linking: ${base}/out/safe/link  -> ok.txt`);
+  expect(await (await request.get(file(base + '/out/safe/link'))).text()).toBe('kept\n');
   expect(await (await request.get(file(base + '/out/safe/ok.txt'))).text()).toBe('kept\n');
   expect(await (await request.get(file(base + '/out/abs/root.txt'))).text()).toBe('rooted\n');
   expect((await request.head(file(base + '/evil.txt'))).status()).toBe(404);
@@ -205,4 +206,46 @@ test('extraction tells a guest nothing of what lies where it may not look', asyn
   await expect(transcript(page)).not.toContainText('replace ');
   for (const name of ['exists.txt', 'missing.txt']) await expect(transcript(page)).toContainText(`${base}/shared/private/${name}: Permission denied`);
   expect(await (await request.get(file(base + '/shared/private/exists.txt'), { headers })).text()).toBe('kept');
+});
+
+test('tar keeps symbolic and hard links, zip follows them unless -y, and extraction makes them, links last', async ({ page, request }) => {
+  await terminal(page);
+  await run(page, 'ln -s a.md docs/to-a'); await run(page, 'ln docs/a.md docs/a-too.md'); await run(page, 'ln -s ../outside docs/away');
+  await run(page, 'tar -cf links.tar docs');
+  await run(page, 'tar -tvf links.tar');
+  // A job's lines come one by one.
+  const listed = transcript(page);
+  await expect(listed).toContainText('docs/to-a -> a.md'); await expect(listed).toContainText('docs/away -> ../outside');
+  await expect(listed).toContainText(/docs\/a(-too)?\.md link to docs\/a(-too)?\.md/);
+  await run(page, 'mkdir out'); await run(page, 'tar -xf links.tar -C out');
+  await run(page, 'readlink out/docs/to-a'); await expect(transcript(page).locator('pre').last()).toHaveText('a.md');
+  expect(await (await request.get(file(base + '/out/docs/to-a'))).text()).toBe('alpha\n'.repeat(2000));
+  // The two names are one file again, as ls -l counts them.
+  await run(page, 'ls -l out/docs | grep a-too'); await expect(transcript(page).locator('pre').last()).toContainText(' 2 root root');
+  // zip stores what a link leads to; -y the link.
+  await run(page, 'zip -r followed.zip docs'); await run(page, 'zip -ry kept.zip docs');
+  await run(page, 'mkdir z1 z2'); await run(page, 'unzip -q followed.zip -d z1'); await run(page, 'unzip -q kept.zip -d z2');
+  await run(page, 'ls -l z1/docs | grep to-a'); await expect(transcript(page).locator('pre').last()).toContainText('-rw');
+  await run(page, 'ls -l z2/docs | grep to-a'); await expect(transcript(page).locator('pre').last()).toContainText('lrwxrwxrwx');
+  await expect(transcript(page).locator('pre').last()).toContainText('to-a -> a.md');
+});
+
+test('faststart moves a video\'s index before its media, in place, once', async ({ page, request }) => {
+  const video = await readFile('tests/fixtures/tail-moov.mp4');
+  expect((await request.put(file(base + '/clip.mp4'), { headers, data: video })).status()).toBe(201);
+  expect((await request.post('/api/command', { headers, data: { args: ['chmod', '640', base + '/clip.mp4'] } })).ok()).toBe(true);
+  const boxes = bytes => { const kinds = []; for (let i = 0; i < bytes.length; i += bytes.readUInt32BE(i)) kinds.push(bytes.toString('latin1', i + 4, i + 8)); return kinds; };
+  expect(boxes(video).indexOf('moov')).toBeGreaterThan(boxes(video).indexOf('mdat'));
+  await terminal(page);
+  await run(page, 'faststart clip.mp4');
+  await expect(transcript(page)).toContainText(`faststart: ${base}/clip.mp4: its index`);
+  const fixed = Buffer.from(await (await request.get(file(base + '/clip.mp4'), { headers })).body());
+  expect(fixed.length).toBe(video.length);
+  expect(boxes(fixed).indexOf('moov')).toBeLessThan(boxes(fixed).indexOf('mdat'));
+  // The same file, in place: its mode is kept.
+  const [entry] = (await ls(request, base)).filter(e => e.name === 'clip.mp4');
+  expect(entry.mode).toBe(0o640);
+  // Once is enough; what is not a video is refused.
+  await run(page, 'faststart clip.mp4'); await expect(transcript(page)).toContainText('is already faststart; left as it was');
+  await run(page, 'faststart docs/a.md'); await expect(transcript(page)).toContainText('not a readable MP4 or QuickTime file');
 });

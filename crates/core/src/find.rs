@@ -22,7 +22,7 @@ pub struct Find {
     pub exec: Option<(bool, Vec<String>)>,
 }
 
-const USAGE: &str = "Usage: fd [-H] [-t f|d|x] [-e EXT] [-d N] [-g|-F] [-i|-s] [-p] [-a] [-0] [PATTERN] [PATH...] [-x|-X COMMAND...]";
+const USAGE: &str = "Usage: fd [-H] [-t f|d|l|x] [-e EXT] [-d N] [-g|-F] [-i|-s] [-p] [-a] [-0] [PATTERN] [PATH...] [-x|-X COMMAND...]";
 
 /// A glob as a regular expression matching all of a name: `*` and `?` within a name, `**`
 /// across directories.
@@ -93,8 +93,9 @@ pub fn parse(args: &[String]) -> Result<Find, String> {
                 match kind.as_str() {
                     "f" | "file" => find.types.push('f'),
                     "d" | "directory" => find.types.push('d'),
+                    "l" | "symlink" => find.types.push('l'),
                     "x" | "executable" => find.types.push('x'),
-                    _ => return Err(format!("fd: unsupported type {kind}; use f, d or x")),
+                    _ => return Err(format!("fd: unsupported type {kind}; use f, d, l or x")),
                 }
             }
             "-e" | "--extension" => find.extensions.push(
@@ -148,7 +149,9 @@ pub fn parse(args: &[String]) -> Result<Find, String> {
 
 impl Find {
     /// Whether the node at `path`, below the searched directory `root`, is a result.
-    pub fn matches(&self, root: &str, path: &str, directory: bool, mode: u16) -> bool {
+    /// Whether `path`, below `root`, is found: a directory, a symbolic link if `link`, or else a
+    /// file, with `mode`.
+    pub fn matches(&self, root: &str, path: &str, directory: bool, link: bool, mode: u16) -> bool {
         let below = path
             .strip_prefix(root)
             .unwrap_or(path)
@@ -159,9 +162,10 @@ impl Find {
         let name = path.rsplit('/').next().unwrap_or(path);
         if !self.types.is_empty()
             && !self.types.iter().any(|t| match t {
-                'f' => !directory,
+                'f' => !directory && !link,
                 'd' => directory,
-                _ => !directory && mode & 0o111 != 0,
+                'l' => link,
+                _ => !directory && !link && mode & 0o111 != 0,
             })
         {
             return false;
@@ -213,31 +217,31 @@ mod tests {
     #[test]
     fn patterns_types_extensions_and_hidden_names() {
         let f = find(&["spéc"]);
-        assert!(f.matches("/", "/docs/SPÉCTRUM.txt", false, 0o644));
-        assert!(!find(&["Spéc"]).matches("/", "/docs/spéctrum.txt", false, 0o644));
-        assert!(find(&["-i", "Spéc"]).matches("/", "/spéctrum", false, 0o644));
+        assert!(f.matches("/", "/docs/SPÉCTRUM.txt", false, false, 0o644));
+        assert!(!find(&["Spéc"]).matches("/", "/docs/spéctrum.txt", false, false, 0o644));
+        assert!(find(&["-i", "Spéc"]).matches("/", "/spéctrum", false, false, 0o644));
         let md = find(&["-e", "MD", "-t", "f"]);
-        assert!(md.matches("/", "/a/notes.md", false, 0o644));
-        assert!(!md.matches("/", "/a/notes.md", true, 0o755));
-        assert!(!md.matches("/", "/a/notes.mdx", false, 0o644));
-        assert!(find(&["-t", "x"]).matches("/", "/run.sh", false, 0o755));
-        assert!(!find(&["-t", "x"]).matches("/", "/run.sh", false, 0o644));
-        assert!(!find(&[]).matches("/home", "/home/.cache/a", false, 0o644));
-        assert!(find(&["-H"]).matches("/home", "/home/.cache/a", false, 0o644));
+        assert!(md.matches("/", "/a/notes.md", false, false, 0o644));
+        assert!(!md.matches("/", "/a/notes.md", true, false, 0o755));
+        assert!(!md.matches("/", "/a/notes.mdx", false, false, 0o644));
+        assert!(find(&["-t", "x"]).matches("/", "/run.sh", false, false, 0o755));
+        assert!(!find(&["-t", "x"]).matches("/", "/run.sh", false, false, 0o644));
+        assert!(!find(&[]).matches("/home", "/home/.cache/a", false, false, 0o644));
+        assert!(find(&["-H"]).matches("/home", "/home/.cache/a", false, false, 0o644));
         // A hidden directory searched by name is not hidden itself.
-        assert!(find(&[]).matches("/home/.config", "/home/.config/a", false, 0o644));
-        assert!(find(&["-p", "^/src/.*\\.rs$"]).matches("/", "/src/a/b.rs", false, 0o644));
+        assert!(find(&[]).matches("/home/.config", "/home/.config/a", false, false, 0o644));
+        assert!(find(&["-p", "^/src/.*\\.rs$"]).matches("/", "/src/a/b.rs", false, false, 0o644));
     }
 
     #[test]
     fn globs_and_fixed_strings() {
         let g = find(&["-g", "*.rs"]);
-        assert!(g.matches("/", "/src/main.rs", false, 0o644));
-        assert!(!g.matches("/", "/src/main.rs.bak", false, 0o644));
-        assert!(find(&["-g", "a?[0-9]"]).matches("/", "/ab1", false, 0o644));
-        assert!(find(&["-g", "[!a]*"]).matches("/", "/b", false, 0o644));
-        assert!(find(&["-F", "a.b"]).matches("/", "/xa.by", false, 0o644));
-        assert!(!find(&["-F", "a.b"]).matches("/", "/axb", false, 0o644));
+        assert!(g.matches("/", "/src/main.rs", false, false, 0o644));
+        assert!(!g.matches("/", "/src/main.rs.bak", false, false, 0o644));
+        assert!(find(&["-g", "a?[0-9]"]).matches("/", "/ab1", false, false, 0o644));
+        assert!(find(&["-g", "[!a]*"]).matches("/", "/b", false, false, 0o644));
+        assert!(find(&["-F", "a.b"]).matches("/", "/xa.by", false, false, 0o644));
+        assert!(!find(&["-F", "a.b"]).matches("/", "/axb", false, false, 0o644));
     }
 
     #[test]

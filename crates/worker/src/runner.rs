@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use terminal_worker_core::CHUNK_SIZE;
 use terminal_worker_core::archive::{Existing, Job as Command, member_path};
-use terminal_worker_core::permissions::mode_text;
+use terminal_worker_core::permissions::{mode_text, type_mode_text};
 use wasm_bindgen::JsValue;
 use worker::*;
 
@@ -71,16 +71,24 @@ struct Row {
     size: u64,
     /// The member's permission bits, if the archive keeps them: a zip made elsewhere may not.
     mode: Option<u32>,
+    /// file, directory, symlink or hardlink.
+    kind: String,
     target: String,
     action: String,
+    /// A symbolic link's target, as written, or the path a hard link names.
+    link: Option<String>,
 }
+/// A plan's columns, as a [`Row`].
+const ROW: &str = "idx, name, size, mode, kind, target, action, link";
 
-/// The permission bits a member gets, as on Linux with the usual umask (022): those it was
-/// archived with, 000 included, less group and other write; without any, 644 for a file and 755
-/// for a directory.
-fn extracted_mode(mode: Option<u32>, directory: bool) -> u32 {
+/// The permission bits a member gets, as each tool gives them: unzip those archived, as tar
+/// does for root, setuid, setgid and sticky too; tar for others less the umask (022). Without
+/// any, 644 for a file and 755 for a directory.
+fn extracted_mode(cmd: &str, root: bool, mode: Option<u32>, directory: bool) -> u32 {
     match mode {
-        Some(mode) => mode & 0o755,
+        Some(mode) if cmd == "tar" && root => mode & 0o7777,
+        Some(mode) if cmd == "tar" => mode & 0o777 & !0o022,
+        Some(mode) => mode & 0o777,
         None if directory => 0o755,
         None => 0o644,
     }
@@ -388,7 +396,9 @@ impl ArchiveRunner {
         let step = match &spec.command {
             Command::Extract { .. } => self.extract(&job, &spec, deadline).await?,
             Command::List { .. } => self.list(&job, &spec).await?,
-            Command::Create { .. } => self.create(&job, &spec, deadline).await?,
+            Command::Create { .. } | Command::Faststart { .. } => {
+                self.create(&job, &spec, deadline).await?
+            }
         };
         if matches!(step, Step::Done) {
             self.ask(
@@ -479,11 +489,22 @@ impl ArchiveRunner {
             for m in &members {
                 let name = m["name"].as_str().unwrap_or_default();
                 if *verbose {
-                    let directory = m["kind"] == "directory";
+                    let kind = match m["kind"].as_str() {
+                        Some("directory") => 'd',
+                        Some("symlink") => 'l',
+                        Some("hardlink") => 'h',
+                        _ => '-',
+                    };
+                    let link = m["link"].as_str().unwrap_or_default();
                     lines.out(format!(
-                        "{} {:>9} {name}",
-                        mode_text(m["mode"].as_u64().unwrap_or(0) as u16 & 0o777, directory),
-                        m["size"].as_u64().unwrap_or(0)
+                        "{} {:>9} {name}{}",
+                        type_mode_text(m["mode"].as_u64().unwrap_or(0) as u16 & 0o7777, kind),
+                        m["size"].as_u64().unwrap_or(0),
+                        match kind {
+                            'l' => format!(" -> {link}"),
+                            'h' => format!(" link to {link}"),
+                            _ => String::new(),
+                        }
                     ));
                 } else {
                     lines.out(name);
@@ -538,7 +559,7 @@ impl ArchiveRunner {
         let fetcher = self.archiver().await?;
         let sql = self.sql();
         sql.exec(
-            "CREATE TABLE IF NOT EXISTS plan(idx INTEGER PRIMARY KEY, name TEXT NOT NULL, size INTEGER NOT NULL, mode INTEGER, kind TEXT NOT NULL, target TEXT NOT NULL, action TEXT NOT NULL, done INTEGER NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS plan(idx INTEGER PRIMARY KEY, name TEXT NOT NULL, size INTEGER NOT NULL, mode INTEGER, kind TEXT NOT NULL, target TEXT NOT NULL, action TEXT NOT NULL, link TEXT, done INTEGER NOT NULL)",
             None,
         )?;
         // Said once the plan is made, which may have no members at all.
@@ -557,7 +578,10 @@ impl ArchiveRunner {
         }
         if spec.decisions.is_none() {
             let asking: Vec<String> = self
-                .rows("SELECT idx, name, size, mode, kind, target, action FROM plan WHERE action = 'ask' ORDER BY idx", vec![])?
+                .rows(
+                    &format!("SELECT {ROW} FROM plan WHERE action = 'ask' ORDER BY idx"),
+                    vec![],
+                )?
                 .into_iter()
                 .map(|row| row.target)
                 .collect();
@@ -583,14 +607,25 @@ impl ArchiveRunner {
         let mut errors = serde_json::from_str::<Value>(&job.progress).unwrap_or_default()["errors"]
             .as_u64()
             .unwrap_or(0);
-        // Members go in order, so the next one is past the last, found through the key.
+        // Members go in order, so the next one is past the last, found through the key; symbolic
+        // links after all the rest, as GNU tar makes them, so that nothing this archive holds
+        // is written through one it makes.
         let mut after = -1;
+        let mut links = false;
         loop {
             let Some(row) = self
-                .rows("SELECT idx, name, size, mode, kind, target, action FROM plan WHERE done = 0 AND idx > ? ORDER BY idx LIMIT 1", vec![SqlStorageValue::Integer(after)])?
+                .rows(
+                    &format!("SELECT {ROW} FROM plan WHERE done = 0 AND (kind = 'symlink') = ? AND idx > ? ORDER BY idx LIMIT 1"),
+                    vec![SqlStorageValue::Integer(links as i64), SqlStorageValue::Integer(after)],
+                )?
                 .pop()
             else {
-                break;
+                if links {
+                    break;
+                }
+                links = true;
+                after = -1;
+                continue;
             };
             after = row.idx as i64;
             let replace = match row.action.as_str() {
@@ -625,40 +660,30 @@ impl ArchiveRunner {
                 "write" | "replace" | "ask"
                     if row.action != "ask" || decisions.contains_key(&row.target) =>
                 {
-                    let mode = extracted_mode(row.mode, false);
-                    match self
-                        .write(&fetcher, id, &row, &directory, replace, mode)
-                        .await?
-                    {
-                        Ok(Some(had)) => {
+                    let written = if row.kind == "file" {
+                        // A file is made anew, with its mode from the start.
+                        let mode = extracted_mode(cmd, job.actor == 0, row.mode, false);
+                        self.write(&fetcher, id, &row, &directory, replace, mode)
+                            .await?
+                            .map(|made| made.is_some())
+                    } else {
+                        self.link(id, &row, &directory, replace).await?
+                    };
+                    match written {
+                        Ok(true) => {
                             if *verbose {
-                                lines.out(if *zip {
-                                    format!("  inflating: {}", row.target)
-                                } else {
-                                    row.name.clone()
+                                lines.out(match (*zip, row.kind.as_str()) {
+                                    (true, "symlink") => format!(
+                                        "    linking: {}  -> {}",
+                                        row.target,
+                                        row.link.as_deref().unwrap_or_default()
+                                    ),
+                                    (true, _) => format!("  inflating: {}", row.target),
+                                    (false, _) => row.name.clone(),
                                 });
                             }
-                            // A new file has its mode from the start; one replaced kept its own.
-                            if had != mode {
-                                let (status, reply) = self
-                                    .call(
-                                        Method::Post,
-                                        &format!("/internal/job/chmod?id={id}"),
-                                        Some(json!({"path": row.target, "mode": mode})),
-                                    )
-                                    .await?;
-                                if status >= 400 {
-                                    errors += 1;
-                                    lines.err(format!(
-                                        "{cmd}: {}: Cannot change mode to {}: {}",
-                                        row.target,
-                                        &mode_text(mode as u16, false)[1..],
-                                        reply["error"].as_str().unwrap_or("not permitted")
-                                    ));
-                                }
-                            }
                         }
-                        Ok(None) => {}
+                        Ok(false) => {}
                         Err(message) => {
                             errors += 1;
                             lines.err(format!("{cmd}: {}: {message}", row.target));
@@ -689,7 +714,10 @@ impl ArchiveRunner {
         // Directories get their modes last, deepest first, so that none stops its own filling:
         // those that were there before too, whatever mode they had. One that is not there, or
         // not where the job may look, failed to be made, and said so.
-        let directories = self.rows("SELECT idx, name, size, mode, kind, target, action FROM plan WHERE action = 'mkdir' ORDER BY length(target) DESC", vec![])?;
+        let directories = self.rows(
+            &format!("SELECT {ROW} FROM plan WHERE action = 'mkdir' ORDER BY length(target) DESC"),
+            vec![],
+        )?;
         let paths: Vec<&String> = directories.iter().map(|row| &row.target).collect();
         let found = self
             .ask(
@@ -699,7 +727,7 @@ impl ArchiveRunner {
             )
             .await?;
         for row in &directories {
-            let mode = extracted_mode(row.mode, true);
+            let mode = extracted_mode(cmd, job.actor == 0, row.mode, true);
             let Some(had) = found["modes"][&row.target].as_u64() else {
                 continue;
             };
@@ -758,7 +786,17 @@ impl ArchiveRunner {
                     .unwrap_or_default()
             ));
         }
-        let mut rows: Vec<(u64, String, u64, Option<u32>, String, String, String)> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut rows: Vec<(
+            u64,
+            String,
+            u64,
+            Option<u32>,
+            String,
+            String,
+            String,
+            Option<String>,
+        )> = Vec::new();
         let mut targets = BTreeMap::new();
         let mut stripped_noted = false;
         let members = listing["members"].as_array().cloned().unwrap_or_default();
@@ -781,19 +819,28 @@ impl ArchiveRunner {
                 }
             }
             let kind = member["kind"].as_str().unwrap_or("other").to_string();
+            let mut link = member["link"].as_str().map(String::from);
             match kind.as_str() {
-                "link" => {
-                    lines.err(format!(
-                        "{cmd}: skipping {name}: links are not supported here"
-                    ));
-                    continue;
-                }
                 "other" => {
                     lines.err(format!(
-                        "{cmd}: skipping {name}: not a regular file or directory"
+                        "{cmd}: skipping {name}: not a regular file, directory or link"
                     ));
                     continue;
                 }
+                "symlink" if link.as_deref().is_none_or(str::is_empty) => {
+                    lines.err(format!("{cmd}: skipping {name}: the link has no target"));
+                    continue;
+                }
+                // A hard link names a member, which must be one it may write as safely.
+                "hardlink" => match member_path(directory, link.as_deref().unwrap_or_default()) {
+                    Ok((path, _)) => link = Some(path),
+                    Err(reason) => {
+                        lines.err(format!(
+                            "{cmd}: skipping {name}: what it links to: {reason}"
+                        ));
+                        continue;
+                    }
+                },
                 _ => {}
             }
             let (target, stripped) = match member_path(directory, &name) {
@@ -830,6 +877,7 @@ impl ArchiveRunner {
                 kind,
                 target,
                 action.to_string(),
+                link,
             ));
         }
         let paths: Vec<&String> = rows.iter().map(|r| &r.5).collect();
@@ -876,7 +924,7 @@ impl ArchiveRunner {
         let sql = self.sql();
         for row in &rows {
             sql.exec(
-                "INSERT OR REPLACE INTO plan(idx, name, size, mode, kind, target, action, done) VALUES(?, ?, ?, ?, ?, ?, ?, 0)",
+                "INSERT OR REPLACE INTO plan(idx, name, size, mode, kind, target, action, link, done) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0)",
                 vec![
                     SqlStorageValue::Integer(row.0 as i64),
                     row.1.as_str().into(),
@@ -885,6 +933,7 @@ impl ArchiveRunner {
                     row.4.as_str().into(),
                     row.5.as_str().into(),
                     row.6.as_str().into(),
+                    row.7.as_deref().into(),
                 ],
             )?;
         }
@@ -967,6 +1016,7 @@ impl ArchiveRunner {
                 &format!("/internal/job/begin?id={id}"),
                 Some(json!({
                     "path": row.target, "size": row.size, "replace": replace, "mode": mode,
+                    "unlink": true,
                 })),
             )
             .await?;
@@ -1022,13 +1072,62 @@ impl ArchiveRunner {
         Ok(Ok(Some(had)))
     }
 
-    async fn create(&self, job: &Job, spec: &Spec, deadline: f64) -> Result<Step> {
-        let Command::Create {
-            format, verbose, ..
-        } = &spec.command
-        else {
-            return Ok(Step::Done);
+    /// Make the symbolic or hard link `row` is: Ok(true) if made, Ok(false) if left as it was,
+    /// Err with a message if refused.
+    async fn link(
+        &self,
+        id: &str,
+        row: &Row,
+        directory: &str,
+        replace: bool,
+    ) -> Result<std::result::Result<bool, String>> {
+        let parent = terminal_worker_core::parent(&row.target);
+        if parent != directory {
+            let (status, reply) = self
+                .call(
+                    Method::Post,
+                    &format!("/internal/job/mkdir?id={id}"),
+                    Some(json!({"path": parent})),
+                )
+                .await?;
+            if status >= 400 {
+                return Ok(Err(reply["error"]
+                    .as_str()
+                    .unwrap_or("cannot create its directory")
+                    .into()));
+            }
+        }
+        let endpoint = if row.kind == "symlink" {
+            "symlink"
+        } else {
+            "link"
         };
+        let (status, reply) = self
+            .call(
+                Method::Post,
+                &format!("/internal/job/{endpoint}?id={id}"),
+                Some(json!({"path": row.target, "target": row.link, "replace": replace})),
+            )
+            .await?;
+        if status >= 400 {
+            return Ok(Err(reply["error"]
+                .as_str()
+                .unwrap_or("cannot be linked")
+                .into()));
+        }
+        Ok(Ok(reply["skipped"] != true))
+    }
+
+    async fn create(&self, job: &Job, spec: &Spec, deadline: f64) -> Result<Step> {
+        // A new archive, or, without a format, a video made faststart in its place.
+        let (format, verbose) = match &spec.command {
+            Command::Create {
+                format, verbose, ..
+            } => (Some(*format), *verbose),
+            Command::Faststart { .. } => (None, false),
+            _ => return Ok(Step::Done),
+        };
+        let output = spec.output.clone().unwrap_or_default();
         let id = job.id.as_str();
         let storage = self.state.storage();
         let fetcher = self.archiver().await?;
@@ -1059,6 +1158,7 @@ impl ArchiveRunner {
                 json!({
                     "name": i.name, "file": i.file.as_ref().map(|_| index.to_string()), "mode": i.mode,
                     "owner": i.owner, "group": i.group, "uid": i.uid, "gid": i.gid, "store": i.store,
+                    "symlink": i.symlink, "hardlink": i.hardlink,
                 })
             })
             .collect();
@@ -1076,42 +1176,62 @@ impl ArchiveRunner {
         let built = match cached {
             Some(built) => built,
             None => {
+                let (url, body) = match format {
+                    Some(format) => (
+                        format!("http://archiver/build?job={id}"),
+                        json!({"format": format, "mtime": spec.mtime, "chunk_size": CHUNK_SIZE, "inputs": inputs}),
+                    ),
+                    None => (
+                        format!("http://archiver/faststart?job={id}"),
+                        json!({"chunk_size": CHUNK_SIZE}),
+                    ),
+                };
                 let mut init = RequestInit::new();
                 init.with_method(Method::Post);
-                init.with_body(Some(
-                    json!({"format": format, "mtime": spec.mtime, "chunk_size": CHUNK_SIZE, "inputs": inputs})
-                        .to_string()
-                        .into(),
-                ));
-                let mut response = fetcher
-                    .fetch(format!("http://archiver/build?job={id}"), Some(init))
-                    .await?;
+                init.with_body(Some(body.to_string().into()));
+                let mut response = fetcher.fetch(url, Some(init)).await?;
                 let built: Value = response.json().await?;
+                let error = built["error"]
+                    .as_str()
+                    .unwrap_or("the archive could not be built");
+                // A file that cannot be made faststart is so whenever it is tried: say so, once.
+                if format.is_none() && response.status_code() == 422 {
+                    let mut lines = Lines::default();
+                    lines.err(format!("faststart: {output}: {error}"));
+                    self.update(id, lines, Some(json!({"done": 0, "total": 0, "errors": 1})))
+                        .await?;
+                    return Ok(Step::Done);
+                }
                 if response.status_code() != 200 {
-                    return Err(Error::RustError(
-                        built["error"]
-                            .as_str()
-                            .unwrap_or("the archive could not be built")
-                            .into(),
-                    ));
+                    return Err(Error::RustError(error.into()));
                 }
                 storage.put("built", built.to_string()).await?;
                 built
             }
         };
+        if built["already"] == true {
+            let mut lines = Lines::default();
+            lines.out(format!(
+                "faststart: {output} is already faststart; left as it was"
+            ));
+            self.update(id, lines, Some(json!({"done": 0, "total": 0})))
+                .await?;
+            return Ok(Step::Done);
+        }
         let size = built["size"].as_u64().unwrap_or(0);
         let hashes: Vec<String> =
             serde_json::from_value(built["chunks"].clone()).unwrap_or_default();
-        let output = spec.output.clone().unwrap_or_default();
         if storage.get::<bool>("announced").await? != Some(true) {
             let mut lines = Lines::default();
-            if *verbose {
+            if verbose {
                 for input in &spec.inputs {
-                    lines.out(if *format == terminal_worker_core::archive::Format::Zip {
-                        format!("  adding: {}", input.name)
-                    } else {
-                        input.name.clone()
-                    });
+                    lines.out(
+                        if format == Some(terminal_worker_core::archive::Format::Zip) {
+                            format!("  adding: {}", input.name)
+                        } else {
+                            input.name.clone()
+                        },
+                    );
                 }
             }
             self.update(id, lines, Some(json!({"done": 0, "total": hashes.len()})))
@@ -1209,6 +1329,14 @@ impl ArchiveRunner {
         )
         .await?;
         storage.delete("upload").await?;
+        if format.is_none() {
+            let mut lines = Lines::default();
+            lines.out(format!(
+                "faststart: {output}: its index ({} bytes) now comes before its media; it plays as it downloads",
+                built["moov"].as_u64().unwrap_or(0)
+            ));
+            self.update(id, lines, None).await?;
+        }
         Ok(Step::Done)
     }
 }

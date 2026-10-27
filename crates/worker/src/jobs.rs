@@ -13,7 +13,7 @@ use crate::commands::{self, command_path};
 use crate::db::{Db, Job};
 
 /// The commands that start jobs.
-pub const ARCHIVERS: [&str; 3] = ["zip", "unzip", "tar"];
+pub const ARCHIVERS: [&str; 4] = ["zip", "unzip", "tar", "faststart"];
 
 /// An archive a job reads.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +36,12 @@ pub struct Input {
     pub gid: u64,
     /// Whether to store it as it is, as for content already compressed.
     pub store: bool,
+    /// A symbolic link's target, stored as a link.
+    #[serde(default)]
+    pub symlink: Option<String>,
+    /// The earlier member it is another name of, in a tar.
+    #[serde(default)]
+    pub hardlink: Option<String>,
 }
 /// What a job does.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,6 +106,8 @@ fn source(db: &Db, who: &Identity, cmd: &str, path: &str) -> Result<Source, Stri
 
 /// The members of an archive made of `paths`, as they are now; warnings for what is left out.
 /// Relative paths are found in `directory` if given, as tar -C works in it, and stored as typed.
+/// With `links`, as tar does, a symbolic link is stored as one, and the second name of a file
+/// as another name for the first; otherwise, as zip does, links are followed.
 #[allow(clippy::too_many_arguments)]
 fn inputs(
     db: &Db,
@@ -108,6 +116,7 @@ fn inputs(
     cmd: &str,
     paths: &[String],
     recursive: bool,
+    links: bool,
     output: &str,
     directory: Option<&str>,
 ) -> Result<(Vec<Input>, Vec<String>), String> {
@@ -134,94 +143,141 @@ fn inputs(
     let mut members = Vec::new();
     let mut warnings = Vec::new();
     let mut names = BTreeSet::new();
-    let entry = |db: &Db, name: String, node: &Node| Input {
-        store: matches!(kind(&name), "image" | "video" | "audio" | "pdf" | "archive"),
-        name,
-        file: node.file.clone().filter(|_| !node.directory),
-        size: if node.directory { 0 } else { node.size },
-        mode: u32::from(node.mode),
-        owner: db.username(node.owner),
-        group: db.groupname(node.group),
-        uid: u64::from(node.owner),
-        gid: u64::from(node.group),
-    };
+    // The first member each inode was stored as, for its other names.
+    let mut first: BTreeMap<u64, String> = BTreeMap::new();
     for typed in paths {
-        let path = match command_path(db, who, command, typed)
-            .and_then(|p| db.access(who, &p, READ).map(|n| (p, n)))
-        {
+        let found = if links {
+            commands::entry_path(db, who, command, typed)
+        } else {
+            command_path(db, who, command, typed)
+        };
+        let (path, node) = match found.and_then(|p| db.access(who, &p, 0).map(|n| (p, n))) {
             Ok(found) => found,
             Err(e) => {
                 warnings.push(format!("{cmd}: {typed}: {e}"));
                 continue;
             }
         };
-        let (path, node) = path;
         // Stored as typed, or, for an absolute or home path, without its leading slash.
         let base = if typed.starts_with('/') || typed.starts_with('~') {
             archive::stored_name(&path)
         } else {
             archive::stored_name(typed)
         };
-        let mut add = |name: String, node: &Node, members: &mut Vec<Input>| {
-            if !name.is_empty() && names.insert(name.clone()) {
-                members.push(entry(db, name, node));
+        // Depth first, parents before what they hold, each directory's in order of name.
+        // Each with the directories above it, so that a link to one of them does not loop.
+        let mut stack = vec![(path, node, base, Vec::<String>::new())];
+        while let Some((path, mut node, name, above)) = stack.pop() {
+            let mut path = path;
+            if node.is_link() && !links {
+                // A link that loops, or may not be followed, is left out, as zip warns and goes on.
+                let real = match db.physical(who, &path, true) {
+                    Ok(real) => real,
+                    Err(e) => {
+                        warnings.push(format!("{cmd}: {name}: {e}; left out"));
+                        continue;
+                    }
+                };
+                match db.node(&real).filter(|_| db.traverse(who, &real).is_ok()) {
+                    Some(target) => {
+                        path = real;
+                        node = target;
+                    }
+                    None => {
+                        warnings.push(format!("{cmd}: {name}: the link leads nowhere; left out"));
+                        continue;
+                    }
+                }
             }
-        };
-        if !node.directory {
-            if path == output {
-                warnings.push(format!("{cmd}: {typed} is the archive itself; left out"));
+            // A directory named `.` (or `/`, or `..`) is stored as nothing itself, and what it
+            // holds by its own names.
+            let unnamed = name.is_empty();
+            if unnamed && !node.directory || !unnamed && !names.insert(name.clone()) {
                 continue;
             }
-            if let Some(file) = node.file.as_deref().and_then(|id| db.file(id))
-                && !file.complete()
-            {
-                warnings.push(format!("{cmd}: {typed} is still uploading; left out"));
-                continue;
-            }
-            add(base, &node, &mut members);
-            continue;
-        }
-        add(base.clone(), &node, &mut members);
-        if !recursive {
-            continue;
-        }
-        let (found, hidden) = db
-            .walk(who, &path, None)
-            .map_err(|e| format!("{cmd}: {e}"))?;
-        if hidden > 0 {
-            warnings.push(format!(
-                "{cmd}: {typed}: {hidden} director{} could not be read; left out",
-                if hidden == 1 { "y" } else { "ies" }
-            ));
-        }
-        for (p, n) in found {
-            let relative = p[path.len()..].trim_start_matches('/');
-            let name = if base.is_empty() {
-                relative.to_string()
-            } else {
-                format!("{base}/{relative}")
+            let mut input = Input {
+                store: matches!(kind(&name), "image" | "video" | "audio" | "pdf" | "archive"),
+                name: name.clone(),
+                file: None,
+                size: 0,
+                mode: u32::from(node.mode),
+                owner: db.username(node.owner),
+                group: db.groupname(node.group),
+                uid: u64::from(node.owner),
+                gid: u64::from(node.group),
+                symlink: None,
+                hardlink: None,
             };
-            if !n.directory {
-                if p == output {
+            if let Some(target) = &node.link {
+                input.symlink = Some(target.clone());
+                members.push(input);
+                continue;
+            }
+            if !node.directory {
+                if path == output {
+                    warnings.push(format!("{cmd}: {name} is the archive itself; left out"));
                     continue;
                 }
-                if !who.allows(&n, READ) {
-                    warnings.push(format!("{cmd}: {p}: Permission denied; left out"));
+                if !who.allows(&node, READ) {
+                    warnings.push(format!("{cmd}: {path}: Permission denied; left out"));
                     continue;
                 }
-                if let Some(file) = n.file.as_deref().and_then(|id| db.file(id))
+                if let Some(file) = node.file.as_deref().and_then(|id| db.file(id))
                     && !file.complete()
                 {
-                    warnings.push(format!("{cmd}: {p} is still uploading; left out"));
+                    warnings.push(format!("{cmd}: {name} is still uploading; left out"));
                     continue;
                 }
+                match first.get(&node.ino) {
+                    // Only tar has hard links: zip -y keeps symbolic links, and stores another
+                    // name of a file as a file (a zip entry without content is a directory).
+                    Some(earlier) if links && cmd == "tar" => {
+                        input.hardlink = Some(earlier.clone())
+                    }
+                    _ => {
+                        if node.links > 1 {
+                            first.insert(node.ino, name.clone());
+                        }
+                        input.file = node.file.clone();
+                        input.size = node.size;
+                    }
+                }
+                members.push(input);
+                continue;
             }
-            add(name, &n, &mut members);
-        }
-        if members.len() > ENTRIES_MAX {
-            return Err(format!(
-                "{cmd}: more than {ENTRIES_MAX} members; archive less at once"
-            ));
+            if !unnamed {
+                members.push(input);
+            }
+            // Without -r, a directory named is a member, and what it holds is not.
+            if !recursive {
+                continue;
+            }
+            if !who.allows(&node, READ | EXEC) {
+                warnings.push(format!("{cmd}: {name}: could not be read; left out"));
+                continue;
+            }
+            if above.contains(&path) {
+                warnings.push(format!(
+                    "{cmd}: {name}: a directory it is in again; left out"
+                ));
+                continue;
+            }
+            let mut inside = above;
+            inside.push(path.clone());
+            for (child, n) in db.children(&path).into_iter().rev() {
+                let leaf = child.rsplit('/').next().unwrap_or_default();
+                let named = if unnamed {
+                    leaf.to_string()
+                } else {
+                    format!("{name}/{leaf}")
+                };
+                stack.push((child.clone(), n, named, inside.clone()));
+            }
+            if members.len() > ENTRIES_MAX {
+                return Err(format!(
+                    "{cmd}: more than {ENTRIES_MAX} members; archive less at once"
+                ));
+            }
         }
     }
     let total: u64 = members.iter().map(|m| m.size).sum();
@@ -248,6 +304,7 @@ pub fn start(
     let parsed = match cmd.as_str() {
         "zip" => archive::zip_args(args)?,
         "unzip" => archive::unzip_args(args)?,
+        "faststart" => archive::faststart_args(args)?,
         _ => archive::tar_args(args)?,
     };
     let path = |db: &Db, value: &str| command_path(db, who, command, value);
@@ -270,6 +327,7 @@ pub fn start(
             paths,
             recursive,
             directory,
+            links,
             ..
         } => {
             let output = path(db, name)?;
@@ -301,6 +359,7 @@ pub fn start(
                 cmd,
                 paths,
                 *recursive,
+                *links,
                 &output,
                 directory.as_deref(),
             )?;
@@ -343,6 +402,30 @@ pub fn start(
         }
         Command::List { archive: name, .. } => {
             spec.source = Some(source(db, who, cmd, &path(db, name)?)?);
+        }
+        // The file is read as it is now, and written over in place, as a new archive is: it
+        // keeps its owner, mode, ACLs and other names, and shows its old content until done.
+        Command::Faststart { file } => {
+            let target = path(db, file)?;
+            let found = source(db, who, cmd, &target)?;
+            let node = db
+                .access(who, &target, READ | WRITE)
+                .map_err(|e| format!("{cmd}: {e}"))?;
+            spec.inputs = vec![Input {
+                name: target.rsplit('/').next().unwrap_or_default().to_string(),
+                file: Some(found.file),
+                size: found.size,
+                mode: u32::from(node.mode),
+                owner: db.username(node.owner),
+                group: db.groupname(node.group),
+                uid: u64::from(node.owner),
+                gid: u64::from(node.group),
+                store: true,
+                symlink: None,
+                hardlink: None,
+            }];
+            spec.output = Some(target);
+            spec.replace = true;
         }
     }
     let spec_value = serde_json::to_value(&spec).map_err(|e| e.to_string())?;

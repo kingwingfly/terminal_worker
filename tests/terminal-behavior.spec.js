@@ -17,7 +17,7 @@ test('stdout and errors scroll after DOM updates; completion uses a separate pag
   await page.route('**/api/ls?*', async route => { await new Promise(resolve => setTimeout(resolve, 120)); await route.continue(); });
   for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 780 });
-    for (let i = 0; i < 4; i++) { await command(page, 'help'); await expect(log.locator('pre').last()).toContainText('.slides.md'); }
+    for (let i = 0; i < 4; i++) { await command(page, 'help'); await expect(log.locator('pre').last()).toContainText('useradd NAME makes an account'); }
     expect(await log.evaluate(e => e.scrollHeight > e.clientHeight)).toBe(true);
     await log.evaluate(e => { e.scrollTop = 0; });
     await command(page, 'ls');

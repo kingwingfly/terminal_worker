@@ -11,6 +11,8 @@ worker = "=0.8.7"
 serde.workspace = true
 serde_json.workspace = true
 terminal-worker-core = { path = "../core" }
+# getfattr -m patterns, with the regular expressions fd takes.
+regex = { version = "1.13", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"

@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod archive;
 pub mod completion;
 pub mod find;
@@ -5,6 +6,7 @@ pub mod glob;
 pub mod permissions;
 pub mod shell;
 pub mod text;
+pub mod xattr;
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +33,43 @@ pub struct Entry {
     /// For a file still uploading, the bytes readable so far.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uploaded: Option<u64>,
+    /// A symbolic link's target, as written; `directory` then says whether it leads to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    /// How many names it has, as ls -l counts them.
+    #[serde(default)]
+    pub links: u32,
+    /// Whether it has an ACL beyond its mode, which ls -l marks with `+`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub acl: bool,
+}
+
+impl Entry {
+    /// Its type and mode as ls -l writes them, then `+` for an ACL, or a space.
+    pub fn mode_line(&self) -> String {
+        let kind = if self.link.is_some() {
+            'l'
+        } else if self.directory {
+            'd'
+        } else {
+            '-'
+        };
+        format!(
+            "{}{}",
+            permissions::type_mode_text(self.mode, kind),
+            if self.acl { "+" } else { " " }
+        )
+    }
+    /// What follows its name in a listing: where a link points, `/` for a directory, `*` for
+    /// what may be executed.
+    pub fn suffix(&self) -> String {
+        match &self.link {
+            Some(target) => format!(" -> {target}"),
+            None if self.directory => "/".into(),
+            None if self.mode & 0o111 != 0 => "*".into(),
+            None => String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

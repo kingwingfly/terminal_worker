@@ -114,7 +114,10 @@ fn absolute_home(path: &str) -> std::result::Result<String, String> {
 }
 fn protect_home(c: &Db, path: &str, except: u32) -> std::result::Result<(), String> {
     for (_, u) in c.users() {
+        // The homes of the accounts guests make are in guest's.
+        let a_guests = u.id == GUEST && path.starts_with(&format!("{}/", u.home));
         if u.id != except
+            && !a_guests
             && (u.home == path
                 || u.home.starts_with(&format!("{path}/"))
                 || path.starts_with(&format!("{}/", u.home)))
@@ -139,18 +142,37 @@ fn show_id(c: &Db, who: &Identity) -> String {
     )
 }
 
-pub fn entry(c: &Db, path: &str, n: &Node) -> Entry {
+/// What `who` sees of `n`, named `path`, shown at `shown`: the path as it was asked for, through
+/// any link on the way.
+pub fn entry(c: &Db, who: &Identity, shown: &str, path: &str, n: &Node) -> Entry {
     let uploaded = n
         .file
         .as_deref()
         .and_then(|id| c.file(id))
         .filter(|f| !f.complete())
         .map(|f| c.readable(&f));
-    described(path, n, uploaded, c.username(n.owner), c.groupname(n.group))
+    let mut entry = described(
+        c,
+        who,
+        path,
+        n,
+        uploaded,
+        c.username(n.owner),
+        c.groupname(n.group),
+    );
+    entry.path = shown.into();
+    entry
 }
-/// The entries of `children`, the nodes in directory `dir`, directories first, then by name.
-/// Each owner, group and unfinished upload is looked up once, not once per entry.
-pub fn entries(c: &Db, dir: &str, children: &[(String, Node)]) -> Vec<Entry> {
+/// The entries of `children`, the nodes in directory `dir`, directories first, then by name,
+/// with their paths in `shown`, the directory as it was asked for. Each owner, group and
+/// unfinished upload is looked up once, not once per entry.
+pub fn entries(
+    c: &Db,
+    who: &Identity,
+    dir: &str,
+    shown: &str,
+    children: &[(String, Node)],
+) -> Vec<Entry> {
     let uploading: BTreeMap<String, u64> = c
         .uploading_in(dir)
         .into_iter()
@@ -166,7 +188,9 @@ pub fn entries(c: &Db, dir: &str, children: &[(String, Node)]) -> Vec<Entry> {
                 .entry(n.group)
                 .or_insert_with(|| c.groupname(n.group));
             let uploaded = n.file.as_ref().and_then(|id| uploading.get(id).copied());
-            described(path, n, uploaded, owner.clone(), group.clone())
+            let mut entry = described(c, who, path, n, uploaded, owner.clone(), group.clone());
+            entry.path = joined(shown, &entry.name);
+            entry
         })
         .collect();
     entries.sort_by(|a, b| {
@@ -176,26 +200,97 @@ pub fn entries(c: &Db, dir: &str, children: &[(String, Node)]) -> Vec<Entry> {
     });
     entries
 }
-fn described(path: &str, n: &Node, uploaded: Option<u64>, owner: String, group: String) -> Entry {
+/// `name` in the directory `dir`.
+pub fn joined(dir: &str, name: &str) -> String {
+    if dir == "/" {
+        format!("/{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+fn described(
+    c: &Db,
+    who: &Identity,
+    path: &str,
+    n: &Node,
+    uploaded: Option<u64>,
+    owner: String,
+    group: String,
+) -> Entry {
+    // A link to a directory opens as one, if `who` may get there.
+    let directory = n.directory
+        || n.is_link()
+            && c.physical(who, path, true)
+                .ok()
+                .and_then(|real| c.node(&real))
+                .is_some_and(|target| target.directory);
     Entry {
         uploaded,
         name: path.rsplit('/').next().unwrap_or("").into(),
         path: path.into(),
-        directory: n.directory,
+        directory,
         size: n.size,
-        kind: if n.directory { "directory" } else { kind(path) }.into(),
+        kind: if directory { "directory" } else { kind(path) }.into(),
         owner,
         group,
         mode: n.mode,
+        link: n.link.clone(),
+        links: n.links,
+        acl: n.acl.is_some(),
     }
 }
+/// ls -l's line for `n`, named `path`: its type and mode, `+` for an ACL, names, owner, group,
+/// size and name, and where a link points.
+fn long_line(c: &Db, path: &str, n: &Node) -> String {
+    let kind = if n.is_link() {
+        'l'
+    } else if n.directory {
+        'd'
+    } else {
+        '-'
+    };
+    let name = path
+        .rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty())
+        .unwrap_or("/");
+    format!(
+        "{}{} {:>2} {} {} {:>8} {name}{}",
+        type_mode_text(n.mode, kind),
+        if n.acl.is_some() { "+" } else { " " },
+        n.links,
+        c.username(n.owner),
+        c.groupname(n.group),
+        n.size,
+        match (&n.link, n.directory) {
+            (Some(target), _) => format!(" -> {target}"),
+            (None, true) if name != "/" => "/".into(),
+            _ => String::new(),
+        }
+    )
+}
 
+/// `value`, a path typed in `command`, from its working directory, `~` its home, physically: a
+/// link on the way, and at its end, followed, as most commands take a path (stat(2)).
 pub fn command_path(
     c: &Db,
     who: &Identity,
     command: &Command,
     value: &str,
 ) -> Result<String, String> {
+    c.physical(who, &typed_path(c, who, command, value)?, true)
+}
+/// The same, but a link at the end is itself, as rm, mv and ln take names (lstat(2)).
+pub fn entry_path(
+    c: &Db,
+    who: &Identity,
+    command: &Command,
+    value: &str,
+) -> Result<String, String> {
+    c.physical(who, &typed_path(c, who, command, value)?, false)
+}
+/// `value` as typed, from the working directory: links not followed.
+fn typed_path(c: &Db, who: &Identity, command: &Command, value: &str) -> Result<String, String> {
     let cwd = resolve("/", &command.cwd)?;
     let home = command
         .home
@@ -267,7 +362,8 @@ fn remove_one(
     Ok(true)
 }
 
-/// Move `src` to `dst`, unless that would move the working directory or an account's home.
+/// Move `src` to `dst`, unless that would move the working directory or an account's home; `cwd`
+/// is where the working directory physically is.
 fn move_one(
     c: &mut Db,
     who: &Identity,
@@ -291,41 +387,13 @@ fn move_one(
     c.rename(who, src, dst, replace)
 }
 
-/// Copy `src` to `dst`, sharing content; files still uploading cannot be copied yet. Returns
-/// the files that exist, and were not replaced.
-fn copy_one(
-    c: &mut Db,
-    who: &Identity,
-    src: &str,
-    dst: &str,
-    recursive: bool,
-    replace: bool,
-) -> Result<Vec<String>, String> {
-    // Only what `who` may read and list: the copy refuses the rest, without telling it apart.
-    let Ok(node) = c.access(who, src, READ) else {
-        return c.copy(who, src, dst, recursive, replace);
-    };
-    let below = if node.directory && recursive {
-        c.walk(who, src, None).map(|(n, _)| n).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    for (path, node) in std::iter::once((src.to_string(), node)).chain(below) {
-        if let Some(file) = node.file.as_deref().and_then(|id| c.file(id))
-            && !file.complete()
-        {
-            return Err(format!(
-                "cp: '{path}' is still uploading; copy it once it completes"
-            ));
-        }
-    }
-    c.copy(who, src, dst, recursive, replace)
-}
-
 pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, String> {
     let (cmd, args) = command.args.split_first().ok_or("Missing command")?;
     let cwd = resolve("/", &command.cwd)?;
     let path_of = |c: &Db, value: &str| command_path(c, who, &command, value);
+    let entry_of = |c: &Db, value: &str| entry_path(c, who, &command, value);
+    // Where the working directory physically is, which nothing may remove or move.
+    let here = c.physical(who, &cwd, true)?;
     let mut listing = None;
     // Commands that take several paths go on after one fails, and report each failure.
     let mut errors: Vec<String> = Vec::new();
@@ -341,7 +409,12 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
             for path in &paths {
                 let file = c.create_file(0, 1, None, who.id, path, None, crate::auth::now());
                 c.finish_file(&file);
-                c.set_node(path, &Node::file(who.id, who.group, 0o644, file, 0));
+                let above = c
+                    .node(parent(path))
+                    .ok_or("Parent directory does not exist")?;
+                let mut node = created(who, &above, 0o666, false, UMASK);
+                node.file = Some(file);
+                c.set_node(path, &node);
             }
             if paths.is_empty() {
                 "File already exists or was skipped; content unchanged".to_string()
@@ -396,37 +469,47 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                 .join("\n")
         }
         "ls" => {
-            let o = options(args, &["-l", "-a", "-la", "-al"], &[])?;
+            let o = options(args, &["-l", "-a", "-d"], &[])?;
             if o.args.len() > 1 {
                 return Err("ls accepts one path at a time".into());
             }
-            let path = path_of(c, o.args.first().map(String::as_str).unwrap_or("."))?;
-            let node = c.access(who, &path, READ | EXEC)?;
-            if !node.directory {
-                return Err("Not a directory".into());
+            let typed = o.args.first().map(String::as_str).unwrap_or(".");
+            let long = o.flags.contains("-l");
+            let itself = o.flags.contains("-d");
+            // A link to a directory lists the directory, but with -l or -d, itself, as GNU ls
+            // shows a link named on the command line; a trailing / follows it.
+            let follow = !(long || itself) || typed.ends_with('/');
+            let path = if follow {
+                path_of(c, typed)?
+            } else {
+                entry_of(c, typed)?
+            };
+            let shown = typed_path(c, who, &command, typed)?;
+            let node = c.access(who, &path, 0)?;
+            if node.directory && !itself {
+                c.access(who, &path, READ | EXEC)?;
+                let children = c.children(&path);
+                listing = Some((entries(c, who, &path, &shown, &children), long));
+                children
+                    .iter()
+                    .map(|(p, n)| {
+                        if long {
+                            long_line(c, p, n)
+                        } else {
+                            let name = p.rsplit('/').next().unwrap_or_default();
+                            format!("{name}{}", if n.directory { "/" } else { "" })
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(if long { "\n" } else { "  " })
+            } else {
+                listing = Some((vec![entry(c, who, &shown, &path, &node)], long));
+                if long {
+                    long_line(c, &path, &node)
+                } else {
+                    typed.to_string()
+                }
             }
-            let long = o.flags.iter().any(|s| s.contains('l'));
-            let children = c.children(&path);
-            listing = Some((entries(c, &path, &children), long));
-            children
-                .iter()
-                .map(|(p, n)| {
-                    let name = p.rsplit('/').next().unwrap();
-                    if long {
-                        format!(
-                            "{} {} {} {:>8} {name}{}",
-                            mode_text(n.mode, n.directory),
-                            c.username(n.owner),
-                            c.groupname(n.group),
-                            n.size,
-                            if n.directory { "/" } else { "" }
-                        )
-                    } else {
-                        format!("{name}{}", if n.directory { "/" } else { "" })
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(if long { "\n" } else { "  " })
         }
         "mkdir" => {
             let o = options(args, &["-p"], &[])?;
@@ -435,7 +518,7 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
             }
             let mut created = Vec::new();
             for value in &o.args {
-                match path_of(c, value).and_then(|path| {
+                match entry_of(c, value).and_then(|path| {
                     c.mkdir(who, &path, o.flags.contains("-p"))?;
                     Ok(path)
                 }) {
@@ -452,8 +535,8 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
             let removal = terminal_worker_core::remove_args(args)?;
             let mut removed = Vec::new();
             for value in &removal.paths {
-                match path_of(c, value)
-                    .and_then(|path| remove_one(c, who, &cwd, &path, &removal).map(|r| (path, r)))
+                match entry_of(c, value)
+                    .and_then(|path| remove_one(c, who, &here, &path, &removal).map(|r| (path, r)))
                 {
                     Ok((path, true)) => {
                         succeeded = true;
@@ -465,20 +548,34 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
             }
             removed.join("\n")
         }
-        "chmod" | "chown" => {
-            let o = options(args, &["-R"], &[])?;
+        "chmod" | "chown" | "chgrp" => {
+            let o = options(
+                args,
+                if cmd == "chmod" {
+                    &["-R"]
+                } else {
+                    &["-R", "-h"]
+                },
+                &[],
+            )?;
             if o.args.len() < 2 {
                 return Err(format!(
-                    "Usage: {cmd} [-R] {} PATH...",
-                    if cmd == "chmod" {
-                        "MODE"
-                    } else {
-                        "USER[:GROUP]"
+                    "Usage: {cmd} [-R]{} {} PATH...",
+                    if cmd == "chmod" { "" } else { " [-h]" },
+                    match cmd.as_str() {
+                        "chmod" => "MODE",
+                        "chown" => "USER[:GROUP]",
+                        _ => "GROUP",
                     }
                 ));
             }
             let recursive = o.flags.contains("-R");
-            let owner_group = if cmd == "chown" {
+            // chown -h changes a link itself; chmod has no mode for a link, and goes to what it
+            // points to, as chown and chgrp do without -h.
+            let itself = o.flags.contains("-h");
+            let owner_group = if cmd == "chgrp" {
+                Some((None, Some(group(c, &o.args[0])?)))
+            } else if cmd == "chown" {
                 let (user, grp) = o.args[0]
                     .split_once(':')
                     .map(|(u, g)| (u, Some(g)))
@@ -506,7 +603,12 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
             };
             let mut updated = Vec::new();
             for value in &o.args[1..] {
-                match path_of(c, value).and_then(|path| {
+                let path = if itself {
+                    entry_of(c, value)
+                } else {
+                    path_of(c, value)
+                };
+                match path.and_then(|path| {
                     match owner_group {
                         Some((owner, grp)) => c.chown(who, &path, owner, grp, recursive)?,
                         None => c.chmod(who, &path, &o.args[0], recursive)?,
@@ -525,7 +627,9 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
         "mv" | "cp" => {
             let copy = cmd == "cp";
             let flags: &[&str] = if copy {
-                &["-r", "-R", "-f", "-n", "-i", "-v"]
+                &[
+                    "-r", "-R", "-f", "-n", "-i", "-v", "-P", "-L", "-H", "-d", "-p", "-a",
+                ]
             } else {
                 &["-f", "-n", "-i", "-v"]
             };
@@ -533,42 +637,59 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
             let Some((dest, sources)) = o.args.split_last().filter(|(_, s)| !s.is_empty()) else {
                 return Err(format!(
                     "Usage: {cmd} [{}-f|-n|-i] [-v] [--] SOURCE... DEST",
-                    if copy { "-r] [" } else { "" }
+                    if copy {
+                        "-r] [-a|-d|-p] [-L|-P|-H] ["
+                    } else {
+                        ""
+                    }
                 ));
             };
             // -i replaces nothing here, and names each file that exists, as [SOURCE, TARGET],
             // for the terminal to ask about; -n asks about none.
             let ask = o.flags.contains("-i") && !o.flags.contains("-n");
             let replace = !o.flags.contains("-n") && !ask;
-            let dest = path_of(c, dest)?;
+            let all = o.flags.contains("-a");
+            let options = CopyOptions {
+                recursive: all || o.flags.contains("-r") || o.flags.contains("-R"),
+                replace,
+                force: o.flags.contains("-f"),
+                dereference: o.flags.contains("-L"),
+                links: all || o.flags.contains("-d"),
+                preserve: all || o.flags.contains("-p"),
+                xattrs: all,
+            };
+            // A link named on the command line is followed by cp without -r, and with -L or -H;
+            // otherwise copied as one (-P, also in -d and -a). mv moves names.
+            let follow = copy
+                && (o.flags.contains("-L")
+                    || o.flags.contains("-H")
+                    || !options.recursive && !options.links);
+            // Into DEST, if it is, or leads to, a directory; otherwise DEST itself, a link there
+            // being replaced, or written through.
+            let into_dir = path_of(c, dest)?;
             // Only where `who` may look is it told what is there.
-            c.traverse(who, &dest)?;
-            let into = c.node(&dest).is_some_and(|n| n.directory);
+            c.traverse(who, &into_dir)?;
+            let into = c.node(&into_dir).is_some_and(|n| n.directory);
+            let dest = if into { into_dir } else { entry_of(c, dest)? };
             if sources.len() > 1 && !into {
                 return Err(format!("{cmd}: target '{dest}' is not a directory"));
             }
             let mut done = Vec::new();
             for value in sources {
-                let result = path_of(c, value).and_then(|src| {
+                let src = if follow {
+                    path_of(c, value)
+                } else {
+                    entry_of(c, value)
+                };
+                let result = src.and_then(|src| {
                     let target = if into {
-                        let name = src.rsplit('/').next().unwrap_or_default();
-                        if dest == "/" {
-                            format!("/{name}")
-                        } else {
-                            format!("{dest}/{name}")
-                        }
+                        joined(&dest, src.rsplit('/').next().unwrap_or_default())
                     } else {
                         dest.clone()
                     };
                     if copy {
-                        let skipped = copy_one(
-                            c,
-                            who,
-                            &src,
-                            &target,
-                            o.flags.contains("-r") || o.flags.contains("-R"),
-                            replace,
-                        )?;
+                        // Files still uploading are copied once whole: Store::copy refuses them.
+                        let skipped = c.copy(who, &src, &target, &options)?;
                         let whole = skipped.contains(&target);
                         if ask {
                             // What a directory holds is at the same place below the source.
@@ -581,7 +702,7 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                         if whole {
                             return Ok(None);
                         }
-                    } else if !move_one(c, who, &cwd, &src, &target, replace)? {
+                    } else if !move_one(c, who, &here, &src, &target, replace)? {
                         if ask {
                             existing.push(json!([src, target]));
                         }
@@ -605,6 +726,406 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
             }
             done.join("\n")
         }
+        "ln" => {
+            let o = options(args, &["-s", "-f", "-n", "-T", "-v", "-L", "-P"], &[])?;
+            let symbolic = o.flags.contains("-s");
+            let usage =
+                || "Usage: ln [-s] [-f] [-n|-T] [-L|-P] [-v] [--] TARGET... [LINK_NAME|DIRECTORY]";
+            let (targets, dest) = match o.args.as_slice() {
+                [] => return Err(usage().into()),
+                // ln TARGET: a link of the same name in the working directory.
+                [target] => (std::slice::from_ref(target), None),
+                [targets @ .., dest] => (targets, Some(dest.as_str())),
+            };
+            // Into DEST if it is, or leads to, a directory, unless -n or -T take it as the
+            // name of the link itself.
+            let plain = o.flags.contains("-n") || o.flags.contains("-T");
+            let (dir, named) = match dest {
+                None => (Some(here.clone()), None),
+                Some(dest) => {
+                    let followed = path_of(c, dest)?;
+                    if !plain
+                        && c.traverse(who, &followed).is_ok()
+                        && c.node(&followed).is_some_and(|n| n.directory)
+                    {
+                        (Some(followed), None)
+                    } else {
+                        (None, Some(entry_of(c, dest)?))
+                    }
+                }
+            };
+            if dir.is_none() && targets.len() > 1 {
+                return Err(format!(
+                    "ln: target '{}' is not a directory",
+                    named.unwrap_or_default()
+                ));
+            }
+            let mut made = Vec::new();
+            for target in targets {
+                let link = match (&dir, &named) {
+                    (Some(dir), _) => joined(
+                        dir,
+                        target
+                            .trim_end_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or_default(),
+                    ),
+                    (_, Some(named)) => named.clone(),
+                    _ => unreachable!(),
+                };
+                // With -f, what is at the link's name gives way only once the link is known to
+                // be possible, so that one that cannot be made leaves what was there.
+                let force = o.flags.contains("-f");
+                let result = (|| -> Result<String, String> {
+                    if symbolic {
+                        // The target is kept as typed, read from where the link is.
+                        c.symlink(who, target, &link, force)?;
+                        return Ok(format!("'{link}' -> '{target}'"));
+                    }
+                    let src = if o.flags.contains("-L") {
+                        path_of(c, target)?
+                    } else {
+                        entry_of(c, target)?
+                    };
+                    c.link(who, &src, &link, force)?;
+                    Ok(format!("'{link}' => '{src}'"))
+                })()
+                .map_err(|e| format!("ln: {e}"));
+                match result {
+                    Ok(line) => {
+                        succeeded = true;
+                        if o.flags.contains("-v") {
+                            made.push(line);
+                        }
+                    }
+                    Err(e) => errors.push(e),
+                }
+            }
+            made.join("\n")
+        }
+        "readlink" => {
+            let o = options(args, &["-f", "-e", "-m", "-n"], &[])?;
+            if o.args.is_empty() {
+                return Err("Usage: readlink [-f|-e|-m] [-n] [--] FILE...".into());
+            }
+            let canonical = ["-f", "-e", "-m"]
+                .into_iter()
+                .find(|f| o.flags.contains(*f));
+            let mut lines = Vec::new();
+            for value in &o.args {
+                let result = match canonical {
+                    // -f: every part but the last must exist; -e: all; -m: none.
+                    Some(flag) => path_of(c, value).and_then(|real| {
+                        let missing = c.traverse(who, &real).is_err() || c.node(&real).is_none();
+                        let above = c.node(parent(&real)).is_some_and(|n| n.directory);
+                        match flag {
+                            "-e" if missing => Err(format!("{value}: No such file or directory")),
+                            "-f" if missing && !above => {
+                                Err(format!("{value}: No such file or directory"))
+                            }
+                            _ => Ok(real),
+                        }
+                    }),
+                    None => entry_of(c, value).and_then(|path| {
+                        c.traverse(who, &path)?;
+                        c.node(&path)
+                            .and_then(|n| n.link)
+                            .ok_or_else(|| format!("{value}: not a symbolic link"))
+                    }),
+                };
+                match result {
+                    Ok(line) => {
+                        succeeded = true;
+                        lines.push(line);
+                    }
+                    Err(e) => errors.push(format!("readlink: {e}")),
+                }
+            }
+            // -n leaves out the trailing newline, which server output never has; it is not -z's
+            // NUL.
+            lines.join("\n")
+        }
+        "getfacl" => {
+            let o = options(args, &["-a", "-d", "-c", "-n", "-p", "-R", "-P"], &[])?;
+            if o.args.is_empty() {
+                return Err("Usage: getfacl [-a|-d] [-c] [-n] [-p] [-R] [-P] [--] FILE...".into());
+            }
+            let numeric = o.flags.contains("-n");
+            let user = |id: u32| {
+                if numeric {
+                    id.to_string()
+                } else {
+                    c.username(id)
+                }
+            };
+            let group = |id: u32| {
+                if numeric {
+                    id.to_string()
+                } else {
+                    c.groupname(id)
+                }
+            };
+            let mut blocks = Vec::new();
+            for value in &o.args {
+                let start = if o.flags.contains("-P") {
+                    entry_of(c, value)
+                } else {
+                    path_of(c, value)
+                };
+                let nodes = start.and_then(|path| {
+                    let node = c.access(who, &path, 0)?;
+                    Ok(if o.flags.contains("-R") && node.directory {
+                        c.walk(who, &path, None).map(|(found, _)| {
+                            std::iter::once((path.clone(), node.clone()))
+                                .chain(found)
+                                .filter(|(_, n)| !n.is_link())
+                                .collect::<Vec<_>>()
+                        })?
+                    } else {
+                        vec![(path, node)]
+                    })
+                });
+                let nodes = match nodes {
+                    Ok(nodes) => nodes,
+                    Err(e) => {
+                        errors.push(format!("getfacl: {value}: {e}"));
+                        continue;
+                    }
+                };
+                succeeded = true;
+                for (path, node) in nodes {
+                    let mut lines = Vec::new();
+                    if !o.flags.contains("-c") {
+                        let shown = if o.flags.contains("-p") {
+                            path.clone()
+                        } else {
+                            path.trim_start_matches('/').to_string()
+                        };
+                        lines.push(format!(
+                            "# file: {}",
+                            if shown.is_empty() { "/" } else { &shown }
+                        ));
+                        lines.push(format!("# owner: {}", user(node.owner)));
+                        lines.push(format!("# group: {}", group(node.group)));
+                        let special = node.mode & 0o7000;
+                        if special != 0 {
+                            let flag = |bit, c| if special & bit != 0 { c } else { '-' };
+                            lines.push(format!(
+                                "# flags: {}{}{}",
+                                flag(SETUID, 's'),
+                                flag(SETGID, 's'),
+                                flag(STICKY, 't')
+                            ));
+                        }
+                    }
+                    if !o.flags.contains("-d") {
+                        lines.extend(terminal_worker_core::acl::lines(
+                            &node.entries(),
+                            false,
+                            &user,
+                            &group,
+                        ));
+                    }
+                    if !o.flags.contains("-a")
+                        && let Some(default) = &node.default_acl
+                    {
+                        lines.extend(terminal_worker_core::acl::lines(
+                            default, true, &user, &group,
+                        ));
+                    }
+                    blocks.push(lines.join("\n") + "\n");
+                }
+            }
+            blocks.join("\n")
+        }
+        "setfacl" => {
+            let o = options(
+                args,
+                &["-b", "-k", "-d", "-R", "-n", "--mask"],
+                &["-m", "-x", "--set", "-M", "-X"],
+            )?;
+            let usage = "Usage: setfacl [-b] [-k] [-d] [-R] [-n] {-m|-x|--set} ACL_ENTRIES FILE...";
+            if o.args.is_empty()
+                || ["-m", "-x", "--set"]
+                    .iter()
+                    .all(|f| !o.values.contains_key(*f))
+                    && !o.flags.contains("-b")
+                    && !o.flags.contains("-k")
+            {
+                return Err(usage.into());
+            }
+            if o.values.contains_key("-M") || o.values.contains_key("-X") {
+                return Err("setfacl: -M and -X read files of entries, which this terminal does not; give them with -m and -x".into());
+            }
+            let user = |name: &str| c.user(name).map(|u| u.id);
+            let group_id = |name: &str| c.group(name);
+            let parse = |text: &str, perms| {
+                terminal_worker_core::acl::parse_specs(text, perms, &user, &group_id)
+                    .map_err(|e| format!("setfacl: {e}"))
+            };
+            // -d makes every entry a default one.
+            let defaulted = |mut specs: Vec<terminal_worker_core::acl::Spec>| {
+                if o.flags.contains("-d") {
+                    for spec in &mut specs {
+                        spec.default = true;
+                    }
+                }
+                specs
+            };
+            let modify = defaulted(match o.values.get("-m") {
+                Some(text) => parse(text, true)?,
+                None => Vec::new(),
+            });
+            let remove = defaulted(match o.values.get("-x") {
+                Some(text) => parse(text, false)?,
+                None => Vec::new(),
+            });
+            let set = defaulted(match o.values.get("--set") {
+                Some(text) => parse(text, true)?,
+                None => Vec::new(),
+            });
+            let keep_mask = o.flags.contains("-n");
+            let mut updated = Vec::new();
+            for value in &o.args {
+                let result = path_of(c, value).and_then(|path| {
+                    let node = c.access(who, &path, 0)?;
+                    let nodes = if o.flags.contains("-R") && node.directory {
+                        c.walk(who, &path, None).map(|(found, _)| {
+                            std::iter::once((path.clone(), node))
+                                .chain(found)
+                                .filter(|(_, n)| !n.is_link())
+                                .collect::<Vec<_>>()
+                        })?
+                    } else {
+                        vec![(path.clone(), node)]
+                    };
+                    let mut changed = Vec::new();
+                    for (p, mut n) in nodes {
+                        if who.id != 0 && who.id != n.owner {
+                            return Err(format!("setfacl: {p}: Operation not permitted"));
+                        }
+                        let executable = n.directory || n.mode & 0o111 != 0;
+                        if o.flags.contains("-b") {
+                            let mut entries = n.entries();
+                            entries.users.clear();
+                            entries.groups.clear();
+                            entries.mask = None;
+                            n.set_entries(&entries);
+                            n.default_acl = None;
+                        }
+                        if o.flags.contains("-k") {
+                            n.default_acl = None;
+                        }
+                        // A default ACL is a directory's; -R passes over files for one.
+                        let defaults = !sided(&set, true).is_empty()
+                            || !sided(&modify, true).is_empty()
+                            || !sided(&remove, true).is_empty();
+                        if defaults && !n.directory {
+                            if o.flags.contains("-R") && p != path {
+                                continue;
+                            }
+                            return Err(format!(
+                                "setfacl: {p}: Only directories can have default ACLs"
+                            ));
+                        }
+                        let mut access = n.entries();
+                        let mut default = n.default_acl.clone().unwrap_or_else(|| {
+                            // A default ACL begins as the access ACL's base entries.
+                            let base = n.entries();
+                            terminal_worker_core::acl::Entries {
+                                user: base.user,
+                                group: base.group,
+                                other: base.other,
+                                ..Default::default()
+                            }
+                        });
+                        let had_default = n.default_acl.is_some();
+                        for (target, default_side) in [(&mut access, false), (&mut default, true)] {
+                            let set = sided(&set, default_side);
+                            if !set.is_empty() {
+                                *target = terminal_worker_core::acl::set(&set, executable)
+                                    .map_err(|e| format!("setfacl: {p}: {e}"))?;
+                            }
+                            terminal_worker_core::acl::modify(
+                                target,
+                                &sided(&modify, default_side),
+                                executable,
+                                keep_mask,
+                            );
+                            let removing = sided(&remove, default_side);
+                            if !removing.is_empty() {
+                                terminal_worker_core::acl::remove(target, &removing, keep_mask)
+                                    .map_err(|e| format!("setfacl: {p}: {e}"))?;
+                            }
+                        }
+                        n.set_entries(&access);
+                        let touched_default = !sided(&set, true).is_empty()
+                            || !sided(&modify, true).is_empty()
+                            || !sided(&remove, true).is_empty();
+                        if n.directory && (had_default || touched_default) {
+                            n.default_acl = Some(default);
+                        }
+                        if o.flags.contains("-k") || o.flags.contains("-b") && !touched_default {
+                            n.default_acl = None;
+                        }
+                        changed.push((p, n));
+                    }
+                    for (p, n) in changed {
+                        c.set_node(&p, &n);
+                    }
+                    Ok(path)
+                });
+                match result {
+                    Ok(path) => {
+                        succeeded = true;
+                        updated.push(format!("Updated the ACL of {path}"));
+                    }
+                    Err(e) => errors.push(e),
+                }
+            }
+            updated.join("\n")
+        }
+        "getfattr" | "setfattr" => {
+            let reading = cmd == "getfattr";
+            let o = if reading {
+                options(
+                    args,
+                    &["-d", "-h", "-R", "--absolute-names"],
+                    &["-n", "-m", "-e"],
+                )?
+            } else {
+                options(args, &["-h"], &["-n", "-v", "-x"])?
+            };
+            if o.args.is_empty() {
+                return Err(if reading {
+                    "Usage: getfattr [-d] [-n NAME] [-m PATTERN] [-e text|hex|base64] [-h] [-R] FILE..."
+                } else {
+                    "Usage: setfattr {-n NAME [-v VALUE] | -x NAME} [-h] FILE..."
+                }
+                .into());
+            }
+            let mut out = Vec::new();
+            for value in &o.args {
+                let start = if o.flags.contains("-h") {
+                    entry_of(c, value)
+                } else {
+                    path_of(c, value)
+                };
+                let result = start.and_then(|path| {
+                    if reading {
+                        getfattr(c, who, &path, &o, &mut out)
+                    } else {
+                        setfattr(c, who, &path, &o)
+                    }
+                });
+                match result {
+                    Ok(()) => succeeded = true,
+                    Err(e) => errors.push(format!("{cmd}: {value}: {e}")),
+                }
+            }
+            out.join("\n")
+        }
         "fd" => {
             let find = terminal_worker_core::find::parse(args)?;
             if find.exec.is_some() {
@@ -627,7 +1148,9 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                         found.extend(
                             nodes
                                 .into_iter()
-                                .filter(|(p, n)| find.matches(&root, p, n.directory, n.mode))
+                                .filter(|(p, n)| {
+                                    find.matches(&root, p, n.directory, n.is_link(), n.mode)
+                                })
                                 .map(|(p, _)| find.display(typed, &root, &cwd, &p)),
                         );
                     }
@@ -650,7 +1173,11 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
         }
         "useradd" | "usermod" | "userdel" | "groupadd" | "groupmod" | "groupdel" => {
             if who.id != 0 {
-                return Err("Root permission required; use sudo".into());
+                return Err(if cmd == "useradd" && who.id == GUEST {
+                    "useradd: signed out, useradd NAME makes an account of your own; options need root".into()
+                } else {
+                    "Root permission required; use sudo".into()
+                });
             }
             match cmd.as_str() {
                 "useradd" => {
@@ -719,6 +1246,9 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                     if o.flags.contains("-L") && o.flags.contains("-U") {
                         return Err("-L and -U are mutually exclusive".into());
                     }
+                    if name == "guest" {
+                        return Err("The guest account cannot be changed".into());
+                    }
                     let mut user = c.user(name).ok_or("User does not exist")?;
                     if user.id == 0 {
                         return Err(
@@ -775,8 +1305,8 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                     let o = options(args, &["-r"], &[])?;
                     let name = one(&o)?;
                     let user = c.user(name).ok_or("User does not exist")?;
-                    if user.id == 0 {
-                        return Err("Cannot delete root".into());
+                    if user.id == 0 || user.id == GUEST {
+                        return Err(format!("Cannot delete {name}"));
                     }
                     if o.flags.contains("-r") && c.node(&user.home).is_some() {
                         protect_home(c, &user.home, user.id)?;
@@ -800,7 +1330,7 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                     let o = options(args, &[], &["-n"])?;
                     let name = one(&o)?;
                     let new = o.values.get("-n").ok_or("Usage: groupmod -n NEW OLD")?;
-                    if ["root", "wheel", "nogroup"].contains(&name) {
+                    if ["root", "wheel", "guest"].contains(&name) {
                         return Err("Cannot rename a system group".into());
                     }
                     let gid = named_group(c, name)?;
@@ -814,7 +1344,7 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                 _ => {
                     let o = options(args, &[], &[])?;
                     let name = one(&o)?;
-                    if ["root", "wheel", "nogroup"].contains(&name) {
+                    if ["root", "wheel", "guest"].contains(&name) {
                         return Err("Cannot delete a system group".into());
                     }
                     let gid = named_group(c, name)?;
@@ -866,4 +1396,142 @@ pub fn is_permission_error(message: &str) -> bool {
         || message.contains("only the owner")
         || message.contains("root permission required")
         || message.contains("cannot traverse")
+        || message.contains("operation not permitted")
+}
+
+/// getfattr for one path: its names, or with -d or -n their values, in blocks as getfattr
+/// writes them; -R walks a directory.
+fn getfattr(
+    c: &Db,
+    who: &Identity,
+    path: &str,
+    o: &Options,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    use terminal_worker_core::xattr;
+    let node = c.access(who, path, 0)?;
+    let nodes = if o.flags.contains("-R") && node.directory {
+        let (found, _) = c.walk(who, path, None)?;
+        std::iter::once((path.to_string(), node))
+            .chain(found)
+            .collect()
+    } else {
+        vec![(path.to_string(), node)]
+    };
+    let encoding = o.values.get("-e").map(String::as_str).unwrap_or("text");
+    if !["text", "hex", "base64"].contains(&encoding) {
+        return Err(format!(
+            "unknown encoding {encoding}; use text, hex or base64"
+        ));
+    }
+    // -m - and -m . match everything; the default, user. only.
+    let pattern = o.values.get("-m").map(String::as_str).unwrap_or("^user\\.");
+    let matcher = match pattern {
+        "-" | "." | "" => None,
+        p => Some(regex::Regex::new(p).map_err(|e| format!("bad pattern: {e}"))?),
+    };
+    for (p, n) in nodes {
+        // Reading a file's attributes needs read permission on it.
+        if !who.allows(&n, READ) && !n.is_link() {
+            return Err(format!("{p}: Permission denied"));
+        }
+        let attrs = c.xattrs(n.ino);
+        let shown: Vec<(&String, &Vec<u8>)> = match o.values.get("-n") {
+            // trusted.* is root's: to others it is not there (ENODATA), as on Linux.
+            Some(name) => match attrs.get_key_value(name).filter(|_| {
+                who.id == 0 || xattr::namespace(name).is_ok_and(|s| s == xattr::Namespace::User)
+            }) {
+                Some(pair) => vec![pair],
+                None => return Err(format!("{name}: No such attribute")),
+            },
+            None => attrs
+                .iter()
+                .filter(|(name, _)| {
+                    xattr::namespace(name)
+                        .is_ok_and(|space| space == xattr::Namespace::User || who.id == 0)
+                        && matcher.as_ref().is_none_or(|m| m.is_match(name))
+                })
+                .collect(),
+        };
+        if shown.is_empty() {
+            continue;
+        }
+        let file = if o.flags.contains("--absolute-names") {
+            p.clone()
+        } else {
+            p.trim_start_matches('/').to_string()
+        };
+        let mut block = vec![format!("# file: {file}")];
+        for (name, value) in shown {
+            block.push(if o.flags.contains("-d") || o.values.contains_key("-n") {
+                format!("{name}={}", xattr::encode(value, encoding))
+            } else {
+                name.clone()
+            });
+        }
+        out.push(block.join("\n") + "\n");
+    }
+    Ok(())
+}
+/// setfattr for one path: user.* needs w on what is changed, and in a sticky directory being
+/// its owner; trusted.* root. A link has none.
+fn setfattr(c: &mut Db, who: &Identity, path: &str, o: &Options) -> Result<(), String> {
+    use terminal_worker_core::xattr;
+    let (name, value) = match (o.values.get("-n"), o.values.get("-x")) {
+        (Some(name), None) => (
+            name,
+            Some(xattr::decode(
+                o.values.get("-v").map(String::as_str).unwrap_or(""),
+            )?),
+        ),
+        (None, Some(name)) => (name, None),
+        _ => return Err("give -n NAME [-v VALUE], or -x NAME".into()),
+    };
+    let space = xattr::namespace(name)?;
+    let node = c.access(who, path, 0)?;
+    match space {
+        xattr::Namespace::Trusted if who.id != 0 => {
+            return Err(format!("{name}: Operation not permitted"));
+        }
+        xattr::Namespace::User if node.is_link() => {
+            return Err(format!("{name}: Operation not permitted"));
+        }
+        xattr::Namespace::User => {
+            if !who.allows(&node, WRITE) {
+                return Err("Permission denied".into());
+            }
+            if node.directory && node.mode & STICKY != 0 && who.id != 0 && who.id != node.owner {
+                return Err(format!("{name}: Operation not permitted"));
+            }
+        }
+        xattr::Namespace::Trusted => {}
+    }
+    let mut attrs = c.xattrs(node.ino);
+    match value {
+        Some(value) => {
+            if value.len() > xattr::VALUE_MAX {
+                return Err(format!("{name}: Argument list too long"));
+            }
+            attrs.insert(name.clone(), value);
+            let total: usize = attrs.iter().map(|(n, v)| n.len() + v.len()).sum();
+            if total > xattr::TOTAL_MAX {
+                return Err(format!("{name}: No space left on device"));
+            }
+        }
+        None => {
+            if attrs.remove(name).is_none() {
+                return Err(format!("{name}: No such attribute"));
+            }
+        }
+    }
+    c.set_xattrs(node.ino, &attrs);
+    Ok(())
+}
+
+/// The entries of `specs` for the default ACL, if `default`, or for the access ACL.
+fn sided(
+    specs: &[terminal_worker_core::acl::Spec],
+    default: bool,
+) -> Vec<&terminal_worker_core::acl::Spec> {
+    specs.iter().filter(|s| s.default == default).collect()
 }
