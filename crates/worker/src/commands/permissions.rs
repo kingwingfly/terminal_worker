@@ -104,8 +104,14 @@ impl ServerCommand for Chgrp {
     }
 }
 
-/// `path`'s node, and with `recursive`, every one below it that `who` may list, links left out.
-fn nodes(ctx: &Context, path: &str, recursive: bool) -> Result<Vec<(String, Node)>, String> {
+/// `path`'s node, and with `recursive`, every one below it that `who` may list; links left out
+/// unless `links` (getfattr's, as root may give a link trusted.* attributes; ACLs have none).
+fn nodes(
+    ctx: &Context,
+    path: &str,
+    recursive: bool,
+    links: bool,
+) -> Result<Vec<(String, Node)>, String> {
     let node = ctx.db.access(ctx.who, path, 0)?;
     if !recursive || !node.directory {
         return Ok(vec![(path.to_string(), node)]);
@@ -113,7 +119,7 @@ fn nodes(ctx: &Context, path: &str, recursive: bool) -> Result<Vec<(String, Node
     let (found, _) = ctx.db.walk(ctx.who, path, None)?;
     Ok(std::iter::once((path.to_string(), node))
         .chain(found)
-        .filter(|(_, n)| !n.is_link())
+        .filter(|(_, n)| links || !n.is_link())
         .collect())
 }
 
@@ -132,7 +138,7 @@ impl ServerCommand for Getfacl {
                 ctx.path(value)
             };
             let found = start
-                .and_then(|path| nodes(ctx, &path, getfacl.recursive))
+                .and_then(|path| nodes(ctx, &path, getfacl.recursive, false))
                 .map_err(|e| format!("getfacl: {value}: {e}"));
             let Some(found) = ctx.each(found) else {
                 continue;
@@ -236,7 +242,7 @@ impl ServerCommand for Setfacl {
         for value in &setfacl.files {
             let result = ctx.path(value).and_then(|path| {
                 let mut changed = Vec::new();
-                for (p, mut n) in nodes(ctx, &path, setfacl.recursive)? {
+                for (p, mut n) in nodes(ctx, &path, setfacl.recursive, false)? {
                     if ctx.who.id != 0 && ctx.who.id != n.owner {
                         return Err(format!("setfacl: {p}: Operation not permitted"));
                     }
@@ -326,7 +332,7 @@ impl ServerCommand for Getfattr {
                 ctx.path(value)
             };
             let result = start.and_then(|path| {
-                for (p, n) in nodes(ctx, &path, getfattr.recursive)? {
+                for (p, n) in nodes(ctx, &path, getfattr.recursive, true)? {
                     // Reading a file's attributes needs read permission on it.
                     if !ctx.who.allows(&n, READ) && !n.is_link() {
                         return Err(format!("{p}: Permission denied"));

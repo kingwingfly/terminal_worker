@@ -104,11 +104,14 @@ impl<T: Manual> Definition for Def<T> {
     }
 }
 
+/// An option given again overrides itself, as GNU's getopt allows (rm -rf -f, tar -f a -f b);
+/// options that gather values (grep -e, fd -e) still gather them all.
 fn configured(command: Command) -> Command {
     command
         .disable_help_flag(true)
         .disable_version_flag(true)
         .disable_help_subcommand(true)
+        .args_override_self(true)
 }
 
 /// Every command: within its section, in the order help lists it; the sections in the order
@@ -289,11 +292,23 @@ pub fn wants_help(args: &[String]) -> bool {
     let Some(name) = args.first() else {
         return false;
     };
-    let own_h = definition(name).is_some_and(|d| {
-        d.command()
-            .get_arguments()
-            .any(|arg| arg.get_short() == Some('h'))
+    // Whether each command has an -h of its own, worked out once: xargs and fd -x ask this of
+    // every command line they run.
+    static OWN_H: OnceLock<Vec<bool>> = OnceLock::new();
+    let own_h = OWN_H.get_or_init(|| {
+        DEFINITIONS
+            .iter()
+            .map(|d| {
+                d.command()
+                    .get_arguments()
+                    .any(|arg| arg.get_short() == Some('h'))
+            })
+            .collect()
     });
+    let own_h = names()
+        .iter()
+        .position(|n| n == name)
+        .is_some_and(|i| own_h[i]);
     args.iter()
         .skip(1)
         .take_while(|arg| arg.as_str() != "--")
@@ -611,6 +626,33 @@ mod tests {
         assert_eq!(
             check(&line("sudo rm")),
             Err("rm: missing PATH...; rm -h shows how to use it".into())
+        );
+    }
+
+    #[test]
+    fn options_given_again_are_taken_as_getopt_takes_them() {
+        let line = |text: &str| text.split(' ').map(String::from).collect::<Vec<_>>();
+        for text in ["rm -rf -f x", "ls -l -l", "cp -f -f -- a b", "echo -nn hi"] {
+            assert_eq!(check(&line(text)), Ok(()), "{text}");
+        }
+        let tar = parse::<archives::Tar>(&line("-cf a.tar -f b.tar x")).unwrap();
+        assert_eq!(tar.file.as_deref(), Some("b.tar"));
+    }
+
+    #[test]
+    fn options_with_attached_values_are_not_taken_for_the_command() {
+        let line = |text: &str| text.split(' ').map(String::from).collect::<Vec<_>>();
+        let xargs = parse::<text::Xargs>(&line("-n1 -I{} cp {} -r b")).unwrap();
+        assert_eq!(
+            (xargs.max_args, xargs.replace.as_deref()),
+            (Some(1), Some("{}"))
+        );
+        assert_eq!(xargs.command, line("cp {} -r b"));
+        let sudo = parse::<accounts::Sudo>(&line("-ubob")).unwrap();
+        assert_eq!((sudo.user.as_deref(), sudo.command.len()), (Some("bob"), 0));
+        assert_eq!(
+            parse::<accounts::Sudo>(&line("rm -- -h")).unwrap().command,
+            line("rm -- -h")
         );
     }
 

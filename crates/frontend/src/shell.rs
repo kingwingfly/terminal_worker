@@ -153,6 +153,54 @@ fn asks(args: &[String]) -> bool {
         _ => false,
     }
 }
+/// `args`, a command line clap accepts, as web/app.js reads it for the commands it runs itself,
+/// with their dialogs: as clap read them, options before operands and -- gone (sudo -ubob is
+/// sudo -u bob, vim -- f is vim f). Other commands go as typed, for the server to read.
+fn spelled(args: &[String]) -> Result<Vec<String>, String> {
+    use cli::{accounts, files, terminal};
+    let Some((name, rest)) = args.split_first() else {
+        return Ok(Vec::new());
+    };
+    let mut out = vec![name.clone()];
+    let mut option = |on: bool, option: &str, value: Option<String>| {
+        if on || value.is_some() {
+            out.push(option.into());
+        }
+        out.extend(value);
+    };
+    match name.as_str() {
+        "sudo" => {
+            let sudo = cli::parse::<accounts::Sudo>(rest)?;
+            option(false, "-u", sudo.user);
+            option(sudo.forget, "-k", None);
+            out.extend(spelled(&sudo.command)?);
+        }
+        "su" => out.extend(cli::parse::<accounts::Su>(rest)?.operands),
+        "login" => out.extend(cli::parse::<accounts::Login>(rest)?.user),
+        "passwd" => {
+            let passwd = cli::parse::<accounts::Passwd>(rest)?;
+            option(passwd.force, "--force", None);
+            out.extend(passwd.user);
+        }
+        // Signed out, app.js makes the account; signed in, the server, which reads it again.
+        "useradd" => {
+            let useradd = cli::parse::<accounts::Useradd>(rest)?;
+            option(useradd.force, "--force", None);
+            option(useradd.create_home, "-m", None);
+            option(false, "-d", useradd.home);
+            option(false, "-g", useradd.group);
+            option(false, "-G", useradd.groups);
+            if useradd.name.starts_with('-') {
+                out.push("--".into());
+            }
+            out.push(useradd.name);
+        }
+        "vim" => out.push(cli::parse::<files::Vim>(rest)?.file),
+        "man" => out.extend(cli::parse::<terminal::Man>(rest)?.command),
+        _ => out.extend(rest.iter().cloned()),
+    }
+    Ok(out)
+}
 /// A listing as text, as ls writes into a pipe: one name a line.
 fn listing_text(entries: &[Entry], long: bool) -> String {
     entries
@@ -298,6 +346,7 @@ impl Shell {
     async fn call(self, args: &[String]) -> Result<Value, String> {
         // What clap would refuse goes no further, whether app.js or the server runs it.
         cli::check(args)?;
+        let args = &spelled(args)?;
         let value = JsFuture::from(account_command(
             serde_wasm_bindgen::to_value(args).map_err(|e| e.to_string())?,
             &self.cwd.get_untracked(),
@@ -444,12 +493,13 @@ impl Shell {
         }
         decisions
     }
-    /// The jobs and unfinished uploads of this account, or `jobs cancel ID`.
-    async fn jobs(self, args: &[String]) -> Result<Output, String> {
+    /// The jobs and unfinished uploads of this account, or, given the ID of `jobs cancel ID`,
+    /// cancel that one.
+    async fn jobs(self, cancel: Option<&str>) -> Result<Output, String> {
         let value = request("/api/jobs", "GET").await?;
         let jobs = value["jobs"].as_array().cloned().unwrap_or_default();
         let uploads = value["uploads"].as_array().cloned().unwrap_or_default();
-        match args.get(1).map(String::as_str) {
+        match cancel {
             None => {
                 let mut text = String::new();
                 for job in &jobs {
@@ -483,8 +533,7 @@ impl Shell {
                 }
                 Ok(Output::text(text))
             }
-            Some("cancel") if args.len() == 3 => {
-                let wanted = args[2].as_str();
+            Some(wanted) => {
                 let starts = |v: &Value| v["id"].as_str().is_some_and(|id| id.starts_with(wanted));
                 if let Some(job) = jobs.iter().find(|j| starts(j)) {
                     let id = job["id"].as_str().unwrap_or_default();
@@ -502,7 +551,6 @@ impl Shell {
                     Err(format!("jobs: no job or upload {wanted}"))
                 }
             }
-            _ => Err("Usage: jobs [cancel ID]".into()),
         }
     }
     /// Run commands on the server, a batch a request, each in its own transaction.
@@ -707,11 +755,8 @@ impl Shell {
         let Some((all, template)) = search.exec else {
             return self.manage(args, true).await;
         };
-        let cut = args
-            .iter()
-            .position(|a| ["-x", "-X", "--exec", "--exec-batch"].contains(&a.as_str()))
-            .unwrap_or(args.len());
-        let value = self.call(&args[..cut]).await?;
+        // The server searches as the line says, leaving the command to this.
+        let value = self.call(args).await?;
         let found = self.output(&value, true)?;
         let results: Vec<String> =
             serde_json::from_value(value["results"].clone()).unwrap_or_default();
@@ -749,10 +794,15 @@ impl Shell {
     async fn interactive(self, args: &[String]) -> Result<Output, String> {
         let sudo = usize::from(args[0] == "sudo");
         let command = args[sudo].clone();
-        // The options again, for each replacement, less -i, which may come with others, as in -ri.
+        // The options again, for each replacement, long ones too (--archive), less -i, which may
+        // come with others, as in -ri; the -f after them overrides any -n.
         let mut options = Vec::new();
         for arg in args[sudo + 1..].iter().take_while(|a| a.as_str() != "--") {
-            if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 1 {
+            if arg.starts_with("--") {
+                if arg != "--interactive" {
+                    options.push(arg.clone());
+                }
+            } else if arg.starts_with('-') && arg.len() > 1 {
                 let rest: String = arg[1..].chars().filter(|c| *c != 'i').collect();
                 if !rest.is_empty() {
                     options.push(format!("-{rest}"));
@@ -1217,5 +1267,29 @@ impl Shell {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spelled;
+
+    #[test]
+    fn app_js_reads_its_commands_as_clap_read_them() {
+        let line = |text: &str| text.split(' ').map(String::from).collect::<Vec<_>>();
+        let spell = |text: &str| spelled(&line(text)).unwrap().join(" ");
+        assert_eq!(spell("sudo -ubob"), "sudo -u bob");
+        assert_eq!(spell("sudo -k"), "sudo -k");
+        assert_eq!(spell("vim -- -notes.md"), "vim -notes.md");
+        assert_eq!(spell("useradd -- ann"), "useradd ann");
+        assert_eq!(
+            spell("sudo useradd -m -G team,web -- -odd"),
+            "sudo useradd -m -G team,web -- -odd"
+        );
+        assert_eq!(spell("passwd bob --force"), "passwd --force bob");
+        assert_eq!(spell("su - bob"), "su - bob");
+        assert_eq!(spell("sudo passwd -- bob"), "sudo passwd bob");
+        // The server's commands go as typed.
+        assert_eq!(spell("sudo rm -rf -- -h"), "sudo rm -rf -- -h");
     }
 }

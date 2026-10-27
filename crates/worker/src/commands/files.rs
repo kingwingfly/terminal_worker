@@ -416,10 +416,8 @@ impl ServerCommand for Fd {
         "fd"
     }
     fn run(&self, ctx: &mut Context) -> Result<String, String> {
+        // -x and -X are the terminal's to run, on what this finds.
         let find = find::parse(ctx.args)?;
-        if find.exec.is_some() {
-            return Err("fd -x and -X run in the terminal, not on the server".into());
-        }
         let roots = if find.roots.is_empty() {
             vec![(None, ctx.cwd.clone())]
         } else {

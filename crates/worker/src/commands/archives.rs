@@ -4,48 +4,14 @@
 
 use super::{Context, ServerCommand};
 
-/// Start the job `ctx`'s command asks for.
-fn start(ctx: &mut Context) -> Result<String, String> {
-    ctx.reply = Some(crate::jobs::start(ctx.db, ctx.who, ctx.owner, ctx.command)?);
-    Ok(String::new())
-}
-
-pub struct Zip;
-impl ServerCommand for Zip {
+/// A command that starts a job: zip, unzip, tar or faststart, which crate::jobs::start parses.
+pub struct Job(pub &'static str);
+impl ServerCommand for Job {
     fn name(&self) -> &'static str {
-        "zip"
+        self.0
     }
     fn run(&self, ctx: &mut Context) -> Result<String, String> {
-        start(ctx)
-    }
-}
-
-pub struct Unzip;
-impl ServerCommand for Unzip {
-    fn name(&self) -> &'static str {
-        "unzip"
-    }
-    fn run(&self, ctx: &mut Context) -> Result<String, String> {
-        start(ctx)
-    }
-}
-
-pub struct Tar;
-impl ServerCommand for Tar {
-    fn name(&self) -> &'static str {
-        "tar"
-    }
-    fn run(&self, ctx: &mut Context) -> Result<String, String> {
-        start(ctx)
-    }
-}
-
-pub struct Faststart;
-impl ServerCommand for Faststart {
-    fn name(&self) -> &'static str {
-        "faststart"
-    }
-    fn run(&self, ctx: &mut Context) -> Result<String, String> {
-        start(ctx)
+        ctx.reply = Some(crate::jobs::start(ctx.db, ctx.who, ctx.owner, ctx.command)?);
+        Ok(String::new())
     }
 }

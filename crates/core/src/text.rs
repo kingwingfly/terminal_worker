@@ -70,19 +70,25 @@ pub fn parse(command: &str, args: &[String]) -> Result<Filter, String> {
         "cat" => (Kind::Cat, parse::<cli::Cat>(args)?.files),
         "head" | "tail" => {
             // head -5 is head -n 5, as it always was.
+            // A -N that is -n's value (head -n -5, head --lines -5) is the value.
             let mut spelled = Vec::new();
+            let mut ended = false;
             for (i, arg) in args.iter().enumerate() {
-                let ended = args[..i].iter().any(|a| a == "--");
                 match arg.strip_prefix('-') {
                     Some(digits)
                         if !ended
                             && !digits.is_empty()
                             && digits.bytes().all(|b| b.is_ascii_digit())
-                            && args.get(i.wrapping_sub(1)).is_none_or(|a| a != "-n") =>
+                            && args
+                                .get(i.wrapping_sub(1))
+                                .is_none_or(|a| a != "-n" && a != "--lines") =>
                     {
                         spelled.extend(["-n".to_string(), digits.to_string()]);
                     }
-                    _ => spelled.push(arg.clone()),
+                    _ => {
+                        ended |= arg == "--";
+                        spelled.push(arg.clone());
+                    }
                 }
             }
             if command == "head" {
@@ -100,18 +106,25 @@ pub fn parse(command: &str, args: &[String]) -> Result<Filter, String> {
         "grep" => {
             let grep = parse::<cli::Grep>(args)?;
             let mut operands = grep.operands;
-            let pattern = match grep.pattern {
-                Some(pattern) => pattern,
-                None if operands.is_empty() => {
-                    return Err("grep: no PATTERN given; grep -h shows how to use it".into());
-                }
-                None => operands.remove(0),
-            };
-            let source = if grep.fixed {
-                regex::escape(&pattern)
+            let patterns = if !grep.patterns.is_empty() {
+                grep.patterns
+            } else if operands.is_empty() {
+                return Err("grep: no PATTERN given; grep -h shows how to use it".into());
             } else {
-                pattern
+                vec![operands.remove(0)]
             };
+            // Several -e: a line matching any of them, as GNU grep selects.
+            let source = patterns
+                .iter()
+                .map(|pattern| {
+                    if grep.fixed {
+                        regex::escape(pattern)
+                    } else {
+                        format!("(?:{pattern})")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("|");
             let pattern = RegexBuilder::new(&source)
                 .case_insensitive(grep.ignore_case)
                 .build()
@@ -382,6 +395,10 @@ mod tests {
         );
         assert_eq!(run("head", &["-n", "-9"], &[("-", LINES)]).0, "");
         assert_eq!(run("head", &["-n", "+1"], &[("-", LINES)]).0, "beta\n");
+        assert_eq!(
+            run("head", &["--lines", "-4"], &[("-", LINES)]).0,
+            "beta\nalpha\n"
+        );
         assert!(parse("tail", &["-n".into(), "+x".into()]).is_err());
         assert_eq!(
             run("head", &["-n", "1"], &[("a", "1\n2\n"), ("b", "3")]).0,
@@ -416,6 +433,20 @@ mod tests {
             )
             .0,
             "x.txt:spéctrum 9\n"
+        );
+        // Several -e select a line matching any.
+        assert_eq!(
+            run("grep", &["-e", "beta", "-e", "Gamma"], &[("-", LINES)]).0,
+            "beta\nGamma\n"
+        );
+        assert_eq!(
+            run(
+                "grep",
+                &["-F", "-e", "a.b", "-e", "c|d"],
+                &[("-", "a.b\naxb\nc|d\nc\n")]
+            )
+            .0,
+            "a.b\nc|d\n"
         );
         assert!(parse("grep", &[]).is_err());
         assert!(parse("grep", &["(".into()]).is_err());

@@ -82,10 +82,18 @@ impl TerminalCommand for Echo {
         _: bool,
     ) -> LocalBoxFuture<'static, Result<Output, String>> {
         async move {
-            let echo = cli::parse::<filters::Echo>(rest(&args))?;
+            let typed = rest(&args);
+            let echo = cli::parse::<filters::Echo>(typed)?;
+            // echo has no --: one before its words is a word, as GNU echo writes it.
+            let start = typed.len() - echo.words.len();
+            let start = if start > 0 && typed[start - 1] == "--" {
+                start - 1
+            } else {
+                start
+            };
             Ok(Output::text(format!(
                 "{}{}",
-                echo.words.join(" "),
+                typed[start..].join(" "),
                 if echo.no_newline { "" } else { "\n" }
             )))
         }
@@ -165,8 +173,8 @@ impl TerminalCommand for Jobs {
         _: bool,
     ) -> LocalBoxFuture<'static, Result<Output, String>> {
         async move {
-            cli::parse::<cli::archives::Jobs>(rest(&args))?;
-            shell.jobs(&args).await
+            let jobs = cli::parse::<cli::archives::Jobs>(rest(&args))?;
+            shell.jobs(jobs.id.as_deref()).await
         }
         .boxed_local()
     }

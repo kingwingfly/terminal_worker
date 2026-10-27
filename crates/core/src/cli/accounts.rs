@@ -108,11 +108,7 @@ pub struct Sudo {
     /// forget the verification
     #[arg(short = 'k', conflicts_with = "command")]
     pub forget: bool,
-    #[arg(
-        value_name = "COMMAND",
-        trailing_var_arg = true,
-        allow_hyphen_values = true
-    )]
+    #[arg(value_name = "COMMAND", trailing_var_arg = true)]
     pub command: Vec<String>,
 }
 impl Manual for Sudo {

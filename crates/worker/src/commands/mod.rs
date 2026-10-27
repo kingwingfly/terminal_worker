@@ -341,10 +341,10 @@ pub static COMMANDS: &[&dyn ServerCommand] = &[
     &accounts::Groupadd,
     &accounts::Groupmod,
     &accounts::Groupdel,
-    &archives::Zip,
-    &archives::Unzip,
-    &archives::Tar,
-    &archives::Faststart,
+    &archives::Job("zip"),
+    &archives::Job("unzip"),
+    &archives::Job("tar"),
+    &archives::Job("faststart"),
 ];
 
 /// The command named `name`, if the server runs it.

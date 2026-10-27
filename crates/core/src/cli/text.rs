@@ -135,14 +135,14 @@ pub struct Grep {
     /// PATTERN is an extended regular expression (always)
     #[arg(short = 'E', long = "extended-regexp")]
     pub extended: bool,
-    /// a pattern, which may start with -
+    /// a pattern, which may start with -; given again, lines matching any are selected
     #[arg(
         short = 'e',
         long = "regexp",
         value_name = "PATTERN",
         allow_hyphen_values = true
     )]
-    pub pattern: Option<String>,
+    pub patterns: Vec<String>,
     #[arg(value_name = "PATTERN|FILE")]
     pub operands: Vec<String>,
 }
@@ -264,11 +264,7 @@ pub struct Xargs {
     /// print each command first
     #[arg(short = 't', long = "verbose")]
     pub verbose: bool,
-    #[arg(
-        value_name = "COMMAND",
-        trailing_var_arg = true,
-        allow_hyphen_values = true
-    )]
+    #[arg(value_name = "COMMAND", trailing_var_arg = true)]
     pub command: Vec<String>,
 }
 impl Manual for Xargs {
