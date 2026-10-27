@@ -90,6 +90,12 @@ fn group(c: &Db, name: &str) -> std::result::Result<u32, String> {
         .or_else(|| name.parse().ok().filter(|id| c.group_name(*id).is_some()))
         .ok_or_else(|| format!("Group does not exist: {name}"))
 }
+/// The group named `name`, as groupmod and groupdel take one: by its name only, as on Linux, so
+/// that what they refuse to change by name, they refuse by number too.
+fn named_group(c: &Db, name: &str) -> std::result::Result<u32, String> {
+    c.group(name)
+        .ok_or_else(|| format!("Group does not exist: {name}"))
+}
 fn groups(c: &Db, value: &str) -> std::result::Result<BTreeSet<u32>, String> {
     if value.is_empty() {
         return Ok(BTreeSet::new());
@@ -285,7 +291,8 @@ fn move_one(
     c.rename(who, src, dst, replace)
 }
 
-/// Copy `src` to `dst`, sharing content; files still uploading cannot be copied yet.
+/// Copy `src` to `dst`, sharing content; files still uploading cannot be copied yet. Returns
+/// the files that exist, and were not replaced.
 fn copy_one(
     c: &mut Db,
     who: &Identity,
@@ -293,10 +300,10 @@ fn copy_one(
     dst: &str,
     recursive: bool,
     replace: bool,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     // Only what `who` may read and list: the copy refuses the rest, without telling it apart.
     let Ok(node) = c.access(who, src, READ) else {
-        return c.copy(who, src, dst, recursive, replace).map(|_| ());
+        return c.copy(who, src, dst, recursive, replace);
     };
     let below = if node.directory && recursive {
         c.walk(who, src, None).map(|(n, _)| n).unwrap_or_default()
@@ -312,7 +319,7 @@ fn copy_one(
             ));
         }
     }
-    c.copy(who, src, dst, recursive, replace).map(|_| ())
+    c.copy(who, src, dst, recursive, replace)
 }
 
 pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, String> {
@@ -325,6 +332,8 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
     // Whether any of those paths succeeded, so that what did is kept.
     let mut succeeded = false;
     let mut results = None;
+    // The files mv and cp -i did not replace, which the terminal asks about.
+    let mut existing: Vec<Value> = Vec::new();
     let output = match cmd.as_str() {
         "touch" => {
             // Validate every path before creating any file; an empty file has no chunks.
@@ -516,19 +525,24 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
         "mv" | "cp" => {
             let copy = cmd == "cp";
             let flags: &[&str] = if copy {
-                &["-r", "-R", "-f", "-n", "-v"]
+                &["-r", "-R", "-f", "-n", "-i", "-v"]
             } else {
-                &["-f", "-n", "-v"]
+                &["-f", "-n", "-i", "-v"]
             };
             let o = options(args, flags, &[])?;
             let Some((dest, sources)) = o.args.split_last().filter(|(_, s)| !s.is_empty()) else {
                 return Err(format!(
-                    "Usage: {cmd} [{}-f|-n] [-v] [--] SOURCE... DEST",
+                    "Usage: {cmd} [{}-f|-n|-i] [-v] [--] SOURCE... DEST",
                     if copy { "-r] [" } else { "" }
                 ));
             };
-            let replace = !o.flags.contains("-n");
+            // -i replaces nothing here, and names each file that exists, as [SOURCE, TARGET],
+            // for the terminal to ask about; -n asks about none.
+            let ask = o.flags.contains("-i") && !o.flags.contains("-n");
+            let replace = !o.flags.contains("-n") && !ask;
             let dest = path_of(c, dest)?;
+            // Only where `who` may look is it told what is there.
+            c.traverse(who, &dest)?;
             let into = c.node(&dest).is_some_and(|n| n.directory);
             if sources.len() > 1 && !into {
                 return Err(format!("{cmd}: target '{dest}' is not a directory"));
@@ -547,7 +561,7 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                         dest.clone()
                     };
                     if copy {
-                        copy_one(
+                        let skipped = copy_one(
                             c,
                             who,
                             &src,
@@ -555,7 +569,22 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                             o.flags.contains("-r") || o.flags.contains("-R"),
                             replace,
                         )?;
+                        let whole = skipped.contains(&target);
+                        if ask {
+                            // What a directory holds is at the same place below the source.
+                            existing.extend(
+                                skipped
+                                    .into_iter()
+                                    .map(|t| json!([format!("{src}{}", &t[target.len()..]), t])),
+                            );
+                        }
+                        if whole {
+                            return Ok(None);
+                        }
                     } else if !move_one(c, who, &cwd, &src, &target, replace)? {
+                        if ask {
+                            existing.push(json!([src, target]));
+                        }
                         return Ok(None);
                     }
                     Ok(Some(if copy {
@@ -774,7 +803,7 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                     if ["root", "wheel", "nogroup"].contains(&name) {
                         return Err("Cannot rename a system group".into());
                     }
-                    let gid = group(c, name)?;
+                    let gid = named_group(c, name)?;
                     if !valid_name(new) || c.group(new).is_some() {
                         return Err("Group name is invalid or already exists".into());
                     }
@@ -788,7 +817,7 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
                     if ["root", "wheel", "nogroup"].contains(&name) {
                         return Err("Cannot delete a system group".into());
                     }
-                    let gid = group(c, name)?;
+                    let gid = named_group(c, name)?;
                     if c.users().iter().any(|(_, u)| u.group == gid) {
                         return Err("This group is still an account's primary group".into());
                     }
@@ -821,6 +850,9 @@ pub fn execute(c: &mut Db, who: &Identity, command: Command) -> Result<Value, St
     }
     if let Some(results) = results {
         value["results"] = json!(results);
+    }
+    if !existing.is_empty() {
+        value["existing"] = json!(existing);
     }
     Ok(value)
 }

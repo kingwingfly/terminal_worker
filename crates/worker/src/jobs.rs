@@ -62,10 +62,14 @@ impl Spec {
     }
 }
 
-/// The identity a job acts as: root if started with sudo, otherwise its account as it is now.
+/// The identity a job acts as: root if started with sudo, a guest if started by one, otherwise
+/// its account as it is now.
 pub fn actor(db: &Db, job: &Job) -> Result<Identity, String> {
     if job.actor == 0 {
         return Ok(Identity::root());
+    }
+    if job.actor == GUEST {
+        return Ok(Identity::guest());
     }
     match db.user_by_id(job.actor) {
         Some((_, user)) if !user.locked => Ok(Identity::of(&user)),
@@ -360,10 +364,16 @@ pub fn start(
     Ok(json!({"job": id, "kind": cmd}))
 }
 
-/// What a job's owner sees of it: its state, progress, question and new lines.
+/// The most lines one view of a job carries.
+const LINES_MAX: u32 = 500;
+
+/// What a job's owner sees of it: its state, progress, question and new lines, a page of them,
+/// and whether more follow, which a job that has ended may still have.
 pub fn view(db: &Db, job: &Job, since: u64) -> Value {
-    let lines: Vec<Value> = db
-        .lines(&job.id, since, 500)
+    let mut lines = db.lines(&job.id, since, LINES_MAX + 1);
+    let more = lines.len() > LINES_MAX as usize;
+    lines.truncate(LINES_MAX as usize);
+    let lines: Vec<Value> = lines
         .into_iter()
         .map(|(seq, err, text)| json!([seq, err, text]))
         .collect();
@@ -371,7 +381,7 @@ pub fn view(db: &Db, job: &Job, since: u64) -> Value {
         "id": job.id, "kind": job.kind, "state": job.state, "created": job.created,
         "progress": serde_json::from_str::<Value>(&job.progress).unwrap_or_default(),
         "question": job.question.as_deref().and_then(|q| serde_json::from_str::<Value>(q).ok()),
-        "lines": lines,
+        "lines": lines, "more": more,
     })
 }
 

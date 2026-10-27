@@ -1,5 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const password = 'testing-long-passphrase-8274';
@@ -130,6 +131,81 @@ test('public directory write, file overwrite, recursive deletion, concurrent upd
   for(const name of [team+'one',team+'two'])await ok(await command(root,['groupdel',name]));
   expect((await command(root,['groupdel',a])).status()).toBe(400);
  } finally {await command(root,['rm','-r',shared]);await f.cleanup();}
+});
+
+test('an upload goes on only while its account may still write where the file is', async () => {
+ const f=await setup();const {root,alice,a}=f;const dir='/upload-'+a;
+ const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
+ const begin=async path=>(await ok(await alice.post('/api/uploads?path='+encodeURIComponent(path),{data:{size:4}}))).json();
+ const chunk=(id,text)=>alice.put(`/api/uploads/chunk?id=${id}&index=0`,{headers:{'X-Chunk-SHA256':sha(Buffer.from(text)),'Content-Type':'application/octet-stream'},data:Buffer.from(text)});
+ const complete=id=>alice.post('/api/uploads/complete?id='+id);
+ try {
+  await ok(await command(root,['mkdir',dir]));await ok(await command(root,['chown',a,dir]));
+  // Shut out of the directory, the uploader may neither send nor publish the file.
+  const revoked=await begin(dir+'/a.txt');
+  await ok(await command(root,['chown','root',dir]));await ok(await command(root,['chmod','700',dir]));
+  expect((await alice.get('/api/stat?path='+encodeURIComponent(dir+'/a.txt'))).status()).toBe(403);
+  expect((await chunk(revoked.id,'abcd')).status()).toBe(403);
+  expect((await complete(revoked.id)).status()).toBe(403);
+  // Let back in, the file being still hers, it goes on.
+  await ok(await command(root,['chmod','755',dir]));
+  await ok(await chunk(revoked.id,'abcd'));await ok(await complete(revoked.id),201);
+  expect(await (await root.get(file(dir+'/a.txt'))).text()).toBe('abcd');
+  // Moved while it uploads, a new file is written, and published, where it is now.
+  await ok(await command(root,['chown',a,dir]));
+  const moved=await begin(dir+'/b.txt');
+  await ok(await command(alice,['mv',dir+'/b.txt',dir+'/c.txt']));
+  await ok(await chunk(moved.id,'wxyz'));
+  expect((await (await ok(await complete(moved.id),201)).json()).path).toBe(dir+'/c.txt');
+  expect(await (await alice.get(file(dir+'/c.txt'))).text()).toBe('wxyz');
+  // Given to an account that alone may write it, it is the uploader's no more.
+  const given=await begin(dir+'/d.txt');
+  await ok(await command(root,['chown','root',dir+'/d.txt']));
+  expect((await chunk(given.id,'1234')).status()).toBe(403);
+  expect((await complete(given.id)).status()).toBe(403);
+ } finally {await command(root,['rm','-r',dir]);await f.cleanup();}
+});
+
+test('cp and mv tell nothing of a destination below a directory the caller may not search', async () => {
+ const f=await setup();const {root,alice,home}=f;
+ try {
+  await ok(await command(root,['mkdir','/root/acl-hidden-'+f.a]));
+  for (const name of ['one.txt','two.txt']) await ok(await alice.put(file(home+'/'+name),{data:name}),201);
+  for (const cmd of ['cp','mv']) for (const dest of ['/root/acl-hidden-'+f.a,'/root/acl-missing-'+f.a]) {
+   const reply=await command(alice,[cmd,home+'/one.txt',home+'/two.txt',dest]);
+   expect(reply.status(),dest).toBe(403);expect((await reply.json()).error).toContain('cannot traverse /root');
+  }
+  // Nor below one deep in a merge: cp -ri is refused alike whether the file there is or not, and
+  // names nothing it would ask about.
+  const dst='/acl-merge-'+f.a,hidden=dst+'/src/private';
+  await ok(await alice.post('/api/mkdir?path='+encodeURIComponent(home+'/src/private')));
+  await ok(await alice.put(file(home+'/src/private/probe.txt'),{data:'probe'}),201);
+  await ok(await command(root,['mkdir','-p',hidden]));await ok(await command(root,['chmod','777',dst,dst+'/src']));await ok(await command(root,['chmod','700',hidden]));
+  for (const leaf of [true,false]) {
+   if (leaf) await ok(await root.put(file(hidden+'/probe.txt'),{data:'kept'}),201); else await ok(await root.delete(file(hidden+'/probe.txt')));
+   const reply=await command(alice,['cp','-ri',home+'/src',dst]);const body=await reply.json();
+   expect(reply.status(),String(leaf)).toBe(403);expect(body.error).toContain('cannot traverse '+hidden);expect(body.existing).toBeUndefined();
+  }
+  await command(root,['rm','-r',dst]);
+ } finally {await command(root,['rm','-r','/root/acl-hidden-'+f.a]);await f.cleanup();}
+});
+
+test('groupmod and groupdel take a group by its name, as on Linux, never by number', async () => {
+ const f=await setup();const {root,team}=f;
+ try {
+  // A system group's number is no way around its protection.
+  for (const [gid,name] of [['0','root'],['27','wheel']]) {
+   expect((await command(root,['groupmod','-n','renamed-'+team,gid])).status()).toBe(404);
+   expect((await command(root,['groupdel',gid])).status()).toBe(404);
+   // Still there, by its name.
+   expect((await command(root,['groupadd',name])).status()).toBe(409);
+  }
+  const groups=(await (await command(root,['id',f.a])).json()).output;
+  const gid=groups.match(new RegExp('(\\d+)\\('+team+'\\)'))[1];
+  const reply=await command(root,['groupdel',gid]);
+  expect(reply.status()).toBe(404);expect((await reply.json()).error).toBe('Group does not exist: '+gid);
+  expect((await (await command(root,['id',f.a])).json()).output).toContain(`${gid}(${team})`);
+ } finally {await f.cleanup();}
 });
 
 test('terminal account workflow uses password dialogs, su homes and a caller-authenticated sudo prompt', async ({ page }) => {

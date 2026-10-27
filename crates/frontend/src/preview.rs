@@ -7,10 +7,8 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::io::{Cursor, Read};
 
 use ammonia::{UrlRelative, UrlRelativeEvaluate};
-use flate2::read::GzDecoder;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use pulldown_latex::{RenderConfig, Storage, config::DisplayMode};
 use terminal_worker_preview::language::{self, Language};
@@ -21,10 +19,8 @@ pub const TEXT_MAX: usize = 2_000_000;
 pub const HIGHLIGHT_MAX: usize = 1_000_000;
 /// The most bytes of an archive listed, which takes the whole of it.
 pub const ARCHIVE_MAX: usize = 50_000_000;
-/// The most rows of a table shown, ...
+/// The most rows of a table shown.
 pub const ROWS_MAX: usize = 1_000;
-/// ... and entries of an archive.
-pub const ENTRIES_MAX: usize = 10_000;
 
 /// Office documents, which show no preview, not even as the archives some of them are.
 const OFFICE: [&str; 13] = [
@@ -52,7 +48,8 @@ pub enum Kind {
         language: Option<&'static str>,
     },
     Table(Table),
-    Archive(Vec<Entry>),
+    /// A ZIP or tar archive, gzipped or not, which its worker lists.
+    Archive,
     /// Contacts or events.
     Cards(Vec<Card>),
     Diff(Vec<(DiffLine, String)>),
@@ -222,44 +219,10 @@ fn sniff(name: &str, data: &[u8]) -> Option<Kind> {
         [0xFF, second, ..] if second & 0xE0 == 0xE0 && second & 0x06 != 0 => {
             Kind::Audio("audio/mpeg")
         }
-        [b'P', b'K', 3, 4, ..] | [b'P', b'K', 5, 6, ..] => Kind::Archive(zip(data)?),
-        [0x1F, 0x8B, ..] => Kind::Archive(tar(GzDecoder::new(data))?),
-        _ if data.get(257..262) == Some(b"ustar") => Kind::Archive(tar(data)?),
+        [b'P', b'K', 3, 4, ..] | [b'P', b'K', 5, 6, ..] | [0x1F, 0x8B, ..] => Kind::Archive,
+        _ if data.get(257..262) == Some(b"ustar") => Kind::Archive,
         _ => return None,
     })
-}
-
-/// The entries of the ZIP archive `data`, at most [`ENTRIES_MAX`].
-fn zip(data: &[u8]) -> Option<Vec<Entry>> {
-    let mut archive = ::zip::ZipArchive::new(Cursor::new(data)).ok()?;
-    (0..archive.len().min(ENTRIES_MAX))
-        .map(|index| {
-            let file = archive.by_index_raw(index).ok()?;
-            Some(Entry {
-                path: file.name().ok()?.into_owned(),
-                size: file.size(),
-                directory: file.is_dir(),
-            })
-        })
-        .collect()
-}
-
-/// The entries of the tar archive `reader` reads, at most [`ENTRIES_MAX`].
-fn tar(reader: impl Read) -> Option<Vec<Entry>> {
-    let mut archive = ::tar::Archive::new(reader);
-    archive
-        .entries()
-        .ok()?
-        .take(ENTRIES_MAX)
-        .map(|entry| {
-            let entry = entry.ok()?;
-            Some(Entry {
-                path: entry.path().ok()?.to_string_lossy().into_owned(),
-                size: entry.header().size().ok()?,
-                directory: entry.header().entry_type().is_dir(),
-            })
-        })
-        .collect()
 }
 
 /// Markdown `source`, the file at `path`, as HTML: GitHub's flavour, with maths, as MathML.
@@ -674,8 +637,6 @@ fn date(value: &str) -> String {
 
 #[cfg(test)]
 mod test {
-    use std::io::Write;
-
     use super::*;
 
     #[test]
@@ -886,45 +847,12 @@ mod test {
     }
 
     #[test]
-    fn archives_list_their_entries() {
-        let mut zip = ::zip::ZipWriter::new(Cursor::new(vec![]));
-        zip.add_directory("docs/", ::zip::write::SimpleFileOptions::default())
-            .unwrap();
-        zip.start_file("docs/a.txt", ::zip::write::SimpleFileOptions::default())
-            .unwrap();
-        zip.write_all(b"hello").unwrap();
-        let data = zip.finish().unwrap().into_inner();
-        assert_eq!(
-            kind("/a.zip", &data),
-            Kind::Archive(vec![
-                Entry {
-                    path: "docs/".into(),
-                    size: 0,
-                    directory: true
-                },
-                Entry {
-                    path: "docs/a.txt".into(),
-                    size: 5,
-                    directory: false
-                },
-            ])
-        );
-
-        let mut tar = ::tar::Builder::new(vec![]);
-        let mut header = ::tar::Header::new_gnu();
-        header.set_size(5);
-        header.set_cksum();
-        tar.append_data(&mut header, "a.txt", &b"hello"[..])
-            .unwrap();
-        let tar = tar.into_inner().unwrap();
-        let mut gz = flate2::write::GzEncoder::new(vec![], flate2::Compression::default());
-        gz.write_all(&tar).unwrap();
-        let expected = Kind::Archive(vec![Entry {
-            path: "a.txt".into(),
-            size: 5,
-            directory: false,
-        }]);
-        assert_eq!(kind("/a.tar.gz", &gz.finish().unwrap()), expected);
-        assert_eq!(kind("/a.tar", &tar), expected);
+    fn archives_are_known_by_their_first_bytes() {
+        let mut tar = vec![0u8; 512];
+        tar[257..262].copy_from_slice(b"ustar");
+        for data in [&b"PK\x03\x04rest"[..], b"PK\x05\x06", b"\x1f\x8b\x08", &tar] {
+            assert_eq!(kind("/a.bin", data), Kind::Archive);
+        }
+        assert_eq!(kind("/a.docx", b"PK\x03\x04"), Kind::None);
     }
 }

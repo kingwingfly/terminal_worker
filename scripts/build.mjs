@@ -41,18 +41,21 @@ async function copyTree(from, to) {
 await mkdir(join(out, 'pkg'), { recursive: true });
 run('cargo', ['build', '-p', 'terminal-worker-ui', '--target', 'wasm32-unknown-unknown', '--release']);
 run('wasm-bindgen', ['--target', 'web', '--out-dir', join(out, 'pkg'), '--out-name', 'frontend', join(target, 'wasm32-unknown-unknown/release/terminal_worker_ui.wasm')]);
-// The preview workers, started by the page when a preview first needs one: PDF pages, Mermaid
-// diagrams, and code highlighted in four groups of languages, as crates/preview/src/lib.rs names
-// their loaders. Each feature set builds on its own, so a worker links only its own engine.
+// The preview workers, started by the page when a preview first needs one: PDF pages, archive
+// listings, Mermaid diagrams, and code highlighted in four groups of languages, as
+// crates/preview/src/lib.rs names their loaders. Each feature set builds on its own, so a worker
+// links only its own engine.
 for (const [feature, profile, bins] of [
   ['pdf', 'release', ['preview_pdf']],
+  ['archive', 'release', ['preview_archive']],
   ['diagram', 'size', ['preview_diagram']],
   ['code', 'release', ['preview_code_web', 'preview_code_systems', 'preview_code_apps', 'preview_code_scripts']],
 ]) {
   run('cargo', ['build', '-p', 'terminal-worker-preview', '--target', 'wasm32-unknown-unknown', '--profile', profile, '--features', feature + ',worker', ...bins.flatMap(bin => ['--bin', bin])]);
   for (const bin of bins) {
     run('wasm-bindgen', ['--target', 'no-modules', '--no-typescript', '--out-dir', out, '--out-name', bin, join(target, 'wasm32-unknown-unknown', profile, bin + '.wasm')]);
-    await writeFile(join(out, bin + '_loader.js'), `importScripts('./${bin}.js');wasm_bindgen('./${bin}_bg.wasm');\n`);
+    // A worker whose code cannot load or start says so, as the failure of its being ready.
+    await writeFile(join(out, bin + '_loader.js'), `importScripts('./${bin}.js');wasm_bindgen('./${bin}_bg.wasm').catch(e=>postMessage([0,false,String(e&&e.message||e)]));\n`);
   }
 }
 await build({ absWorkingDir: root, entryPoints: { bridge: 'web/app.js' },

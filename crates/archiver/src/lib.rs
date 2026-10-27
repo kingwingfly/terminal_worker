@@ -33,7 +33,9 @@ pub enum Kind {
 pub struct Member {
     pub name: String,
     pub size: u64,
-    pub mode: u32,
+    /// Its permission bits, if the archive keeps them, 0 included: a zip made on a system without
+    /// them has none.
+    pub mode: Option<u32>,
     pub kind: Kind,
 }
 
@@ -127,7 +129,7 @@ pub fn list(path: &Path, unpack: Option<&Path>) -> Result<(Format, Vec<Member>),
                 budget.entry()?;
                 let mut file = archive.by_index(index).map_err(err)?;
                 let name = file.name().map_err(err)?.into_owned();
-                let mode = file.unix_mode().unwrap_or(0) & 0o7777;
+                let mode = file.unix_mode().map(|mode| mode & 0o7777);
                 let kind = if file.is_dir() {
                     Kind::Directory
                 } else if file.is_symlink() {
@@ -165,7 +167,7 @@ pub fn list(path: &Path, unpack: Option<&Path>) -> Result<(Format, Vec<Member>),
                 let mut entry = entry.map_err(|e| format!("not a readable tar archive: {e}"))?;
                 let name = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
                 let header = entry.header();
-                let mode = header.mode().unwrap_or(0) & 0o7777;
+                let mode = header.mode().ok().map(|mode| mode & 0o7777);
                 let kind = match header.entry_type() {
                     tar::EntryType::Regular | tar::EntryType::Continuous => Kind::File,
                     tar::EntryType::Directory => Kind::Directory,
@@ -418,8 +420,8 @@ mod tests {
             );
             assert_eq!(members[0].kind, Kind::Directory);
             assert_eq!(
-                (members[2].mode & 0o777, members[2].kind),
-                (0o755, Kind::File)
+                (members[2].mode.map(|m| m & 0o777), members[2].kind),
+                (Some(0o755), Kind::File)
             );
             assert_eq!(members[1].size, 6000);
             assert_eq!(
@@ -430,6 +432,34 @@ mod tests {
                 fs::read(s.path("unpacked/2")).unwrap(),
                 [0u8, 159, 146, 150]
             );
+        }
+    }
+
+    #[test]
+    fn a_mode_of_000_is_a_mode() {
+        for format in [Format::Zip, Format::Tar] {
+            let s = Scratch::new(&format!("private-{format:?}"));
+            fs::write(s.path("in/0"), "new").unwrap();
+            let private = Input {
+                name: "private.txt".into(),
+                file: Some("0".into()),
+                mode: 0,
+                owner: "alice".into(),
+                group: "team".into(),
+                uid: 1000,
+                gid: 1000,
+                store: false,
+            };
+            build(
+                format,
+                1_761_400_000,
+                &[private],
+                &s.path("in"),
+                &s.path("out"),
+            )
+            .unwrap();
+            let (_, members) = list(&s.path("out"), None).unwrap();
+            assert_eq!(members[0].mode.map(|m| m & 0o777), Some(0));
         }
     }
 
