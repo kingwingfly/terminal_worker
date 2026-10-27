@@ -108,13 +108,10 @@ fn file_icon(kind: &str, directory: bool) -> impl IntoView + use<> {
 /// How much of a file still uploading has arrived, as shown after its name.
 fn upload_progress(entry: &Entry) -> Option<String> {
     let uploaded = entry.uploaded?;
+    // An empty file has all of itself.
     Some(format!(
         "↑ {}%",
-        if entry.size == 0 {
-            100
-        } else {
-            uploaded * 100 / entry.size
-        }
+        (uploaded * 100).checked_div(entry.size).unwrap_or(100)
     ))
 }
 fn render_line(line: LogLine) -> AnyView {
@@ -139,9 +136,11 @@ fn render_line(line: LogLine) -> AnyView {
     }
 }
 
+/// The tabs, and the active one's id.
+type Tabs = (RwSignal<Vec<Shell>>, RwSignal<u64>);
 thread_local! {
-    /// The tabs and the active one's id, for saving them as they change.
-    static TABS: RefCell<Option<(RwSignal<Vec<Shell>>, RwSignal<u64>)>> = const { RefCell::new(None) };
+    /// The tabs, for saving them as they change.
+    static TABS: RefCell<Option<Tabs>> = const { RefCell::new(None) };
 }
 /// Where the tabs are kept for this browser tab, across reloads.
 const SAVED: &str = "terminal-tabs";
