@@ -3766,6 +3766,7 @@ dependencies = [
  "base64 0.22.1",
  "hmac",
  "js-sys",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -31,7 +31,7 @@ function credentials(options) {
   dialogs = answer.catch(() => {});
   return answer;
 }
-function askCredentials({ title, description, username, chooseUser = false, newPassword = false, currentPassword = false, submit }) {
+function askCredentials({ title, description, username, chooseUser = false, newPassword = false, currentPassword = false, action, submit }) {
   return new Promise(resolve => {
     const dialog = $('auth'), form = $('auth-form'), password = $('password'), user = $('username');
     $('auth-title').textContent = title; $('auth-description').textContent = description; $('auth-error').textContent = '';
@@ -41,7 +41,7 @@ function askCredentials({ title, description, username, chooseUser = false, newP
     $('password-label').textContent = newPassword ? 'New password' : 'Password';
     password.autocomplete = newPassword ? 'new-password' : 'current-password';
     for (const id of ['password', 'current-password', 'confirm-password']) $(id).value = '';
-    const button = form.querySelector('[type=submit]'); button.textContent = newPassword ? 'Save password' : 'Confirm'; button.disabled = false;
+    const button = form.querySelector('[type=submit]'); button.textContent = action || (newPassword ? 'Save password' : 'Confirm'); button.disabled = false;
     let completed = false;
     const finish = result => {
       if (completed) return; completed = true;
@@ -117,11 +117,18 @@ async function sudoAuthenticate() {
 async function accountCommand(args, cwd) {
   // Help is resolved before authentication or any command effects. -- ends options.
   const options = args.slice(1, args.indexOf('--') < 0 ? undefined : args.indexOf('--'));
-  if (options.some(arg => arg === '-h' || arg === '--help')) {
+  // -h is an option of these, as on Linux (no dereference, or tar's dereference), unless alone.
+  const hOption = ['chown', 'chgrp', 'getfattr', 'setfattr', 'tar'].includes(args[0]) && args.length > 2;
+  if (options.some(arg => arg === '--help' || (arg === '-h' && !hOption))) {
     let topic = args[0];
     if (topic === 'sudo' && args[1] && !args[1].startsWith('-')) topic = args[1];
     const { help } = await import('./manual.mjs');
     return { output: help(topic) };
+  }
+  if (args[0] === 'help') {
+    if (args.length > 2) throw new Error('Usage: help [COMMAND]');
+    const manual = await import('./manual.mjs');
+    return { output: args[1] ? manual.help(args[1]) : manual.commands() };
   }
   if (args[0] === 'man') {
     if (args.length > 2) throw new Error('Usage: man [COMMAND]');
@@ -166,6 +173,18 @@ async function accountCommand(args, cwd) {
       submit: fields => post('passwd', { username, password: fields.password, current_password: fields.current_password, sudo, force }) });
     if (!result) throw new Error('Password change canceled');
     await identityChanged(); return { output: `Password updated for ${username}` };
+  }
+  // Signed out, useradd NAME makes an account of one's own, with the password given here.
+  if (args[0] === 'useradd' && !sudo && !(await session()).authenticated) {
+    const force = args.includes('--force');
+    const rest = args.slice(1).filter(arg => arg !== '--force');
+    if (rest.length !== 1 || rest[0].startsWith('-')) throw new Error('Usage: useradd [--force] NAME (signed out: an account of your own, home /guest/NAME); options need sudo');
+    const username = rest[0];
+    const result = await credentials({ title: `Create account ${username}`, description: (force ? '--force enabled: short passwords are allowed, but cannot be empty. ' : 'Use at least 12 characters, or run useradd --force NAME to allow a short password. ') + `Your home will be /guest/${username}, which only you may enter; you will be signed in.`, newPassword: true, action: 'Create account',
+      submit: fields => post('register', { username, password: fields.password, force }) });
+    if (!result) throw new Error('Account creation canceled');
+    await identityChanged();
+    return { output: `Created user ${username} and signed in; home ${result.home}`, home: result.home };
   }
   if (['su', 'login'].includes(args[0])) {
     if (sudo) throw new Error('Use su root to switch accounts');

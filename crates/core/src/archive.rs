@@ -46,6 +46,10 @@ pub enum Job {
         verbose: bool,
         #[serde(default)]
         directory: Option<String>,
+        /// Store symbolic and hard links as links, as tar does unless -h, and zip with -y;
+        /// otherwise what they lead to.
+        #[serde(default)]
+        links: bool,
     },
     /// Write the members of `archive`, or those named in `members`, into `directory`.
     Extract {
@@ -77,7 +81,7 @@ fn tar_format(name: &str, gzip: bool) -> Format {
 
 /// `zip [-r] [-q] [-v] [--] ARCHIVE PATH...`
 pub fn zip_args(args: &[String]) -> Result<Job, String> {
-    let (mut recursive, mut verbose) = (false, true);
+    let (mut recursive, mut verbose, mut links) = (false, true, false);
     let mut operands = Vec::new();
     let mut end = false;
     for arg in args {
@@ -87,6 +91,7 @@ pub fn zip_args(args: &[String]) -> Result<Job, String> {
                 for flag in flags[1..].chars() {
                     match flag {
                         'r' | 'R' => recursive = true,
+                        'y' => links = true,
                         'q' => verbose = false,
                         'v' => verbose = true,
                         _ => return Err(format!("zip: unsupported option -{flag}; see man zip")),
@@ -97,7 +102,7 @@ pub fn zip_args(args: &[String]) -> Result<Job, String> {
         }
     }
     if operands.len() < 2 {
-        return Err("Usage: zip [-r] [-q] ARCHIVE.zip PATH...".into());
+        return Err("Usage: zip [-r] [-y] [-q] ARCHIVE.zip PATH...".into());
     }
     let mut archive = operands.remove(0);
     // As Info-ZIP does, a name without an extension gets .zip.
@@ -111,6 +116,7 @@ pub fn zip_args(args: &[String]) -> Result<Job, String> {
         recursive,
         verbose,
         directory: None,
+        links,
     })
 }
 
@@ -172,6 +178,7 @@ pub fn unzip_args(args: &[String]) -> Result<Job, String> {
 pub fn tar_args(args: &[String]) -> Result<Job, String> {
     let mut mode = None;
     let (mut gzip, mut verbose, mut existing) = (false, false, Existing::Replace);
+    let mut links = true;
     let (mut file, mut directory) = (None, None);
     let mut operands = Vec::new();
     let mut rest: std::collections::VecDeque<String> = args.iter().cloned().collect();
@@ -209,6 +216,7 @@ pub fn tar_args(args: &[String]) -> Result<Job, String> {
                 "list" => set_mode(&mut mode, 't')?,
                 "gzip" | "gunzip" | "ungzip" => gzip = true,
                 "verbose" => verbose = true,
+                "dereference" => links = false,
                 "keep-old-files" => existing = Existing::Keep,
                 "skip-old-files" => existing = Existing::Skip,
                 "overwrite" => existing = Existing::Replace,
@@ -231,6 +239,7 @@ pub fn tar_args(args: &[String]) -> Result<Job, String> {
                 'c' | 'x' | 't' => set_mode(&mut mode, flag)?,
                 'z' => gzip = true,
                 'v' => verbose = true,
+                'h' => links = false,
                 'k' => existing = Existing::Keep,
                 'f' | 'C' => {
                     let value = rest
@@ -246,7 +255,7 @@ pub fn tar_args(args: &[String]) -> Result<Job, String> {
             }
         }
     }
-    let usage = "Usage: tar -c|-x|-t [-z] [-v] -f ARCHIVE [-C DIR] [PATH...]";
+    let usage = "Usage: tar -c|-x|-t [-z] [-v] [-h] -f ARCHIVE [-C DIR] [PATH...]";
     let archive = file.ok_or_else(|| {
         format!("tar: name the archive with -f; this terminal has no tape drive\n{usage}")
     })?;
@@ -266,6 +275,7 @@ pub fn tar_args(args: &[String]) -> Result<Job, String> {
                 recursive: true,
                 verbose,
                 directory,
+                links,
             })
         }
         Some('x') => Ok(Job::Extract {
@@ -345,8 +355,17 @@ mod tests {
                 recursive: true,
                 verbose: false,
                 directory: None,
+                links: false,
             }
         );
+        assert!(matches!(
+            zip_args(&args("-ry site site")).unwrap(),
+            Job::Create { links: true, .. }
+        ));
+        assert!(matches!(
+            tar_args(&args("-chf a.tar docs")).unwrap(),
+            Job::Create { links: false, .. }
+        ));
         assert!(zip_args(&args("only.zip")).is_err());
         assert!(zip_args(&args("-x a.zip b")).is_err());
         assert_eq!(
@@ -398,6 +417,7 @@ mod tests {
                     recursive: true,
                     verbose: false,
                     directory: None,
+                    links: true,
                 },
                 "{line}"
             );
@@ -433,6 +453,7 @@ mod tests {
                 recursive: true,
                 verbose: false,
                 directory: Some("src".into()),
+                links: true,
             }
         );
         for bad in [

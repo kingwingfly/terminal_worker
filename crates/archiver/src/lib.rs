@@ -22,8 +22,10 @@ const LEVEL: u32 = 6;
 pub enum Kind {
     File,
     Directory,
-    /// A symbolic or hard link, which the terminal's filesystem does not have.
-    Link,
+    /// A symbolic link, to `link`.
+    Symlink,
+    /// Another name for the earlier member `link`.
+    Hardlink,
     /// A device, FIFO or anything else.
     Other,
 }
@@ -37,6 +39,9 @@ pub struct Member {
     /// them has none.
     pub mode: Option<u32>,
     pub kind: Kind,
+    /// A link's target: a symbolic link's, as written, or the member a hard link names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
 }
 
 /// A member of an archive to build: a file's content on disk, or a directory.
@@ -58,6 +63,12 @@ pub struct Input {
     /// Whether to store it as it is, as for content already compressed.
     #[serde(default)]
     pub store: bool,
+    /// A symbolic link's target: it is a link, with no content.
+    #[serde(default)]
+    pub symlink: Option<String>,
+    /// The earlier member it is another name of, in a tar.
+    #[serde(default)]
+    pub hardlink: Option<String>,
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -133,12 +144,21 @@ pub fn list(path: &Path, unpack: Option<&Path>) -> Result<(Format, Vec<Member>),
                 let kind = if file.is_dir() {
                     Kind::Directory
                 } else if file.is_symlink() {
-                    Kind::Link
+                    Kind::Symlink
                 } else {
                     Kind::File
                 };
                 let mut size = file.size();
-                if kind == Kind::File
+                let mut link = None;
+                if kind == Kind::Symlink {
+                    // Its content is its target.
+                    let mut target = String::new();
+                    (&mut file)
+                        .take(4096)
+                        .read_to_string(&mut target)
+                        .map_err(err)?;
+                    link = Some(target);
+                } else if kind == Kind::File
                     && let Some(dir) = unpack
                 {
                     size = budget.copy(&mut file, &dir.join(index.to_string()))?;
@@ -148,6 +168,7 @@ pub fn list(path: &Path, unpack: Option<&Path>) -> Result<(Format, Vec<Member>),
                     size,
                     mode,
                     kind,
+                    link,
                 });
             }
         }
@@ -171,9 +192,14 @@ pub fn list(path: &Path, unpack: Option<&Path>) -> Result<(Format, Vec<Member>),
                 let kind = match header.entry_type() {
                     tar::EntryType::Regular | tar::EntryType::Continuous => Kind::File,
                     tar::EntryType::Directory => Kind::Directory,
-                    tar::EntryType::Symlink | tar::EntryType::Link => Kind::Link,
+                    tar::EntryType::Symlink => Kind::Symlink,
+                    tar::EntryType::Link => Kind::Hardlink,
                     _ => Kind::Other,
                 };
+                let link = entry
+                    .link_name_bytes()
+                    .map(|target| String::from_utf8_lossy(&target).into_owned())
+                    .filter(|_| matches!(kind, Kind::Symlink | Kind::Hardlink));
                 let mut size = header.size().unwrap_or(0);
                 if kind == Kind::File
                     && let Some(dir) = unpack
@@ -185,6 +211,7 @@ pub fn list(path: &Path, unpack: Option<&Path>) -> Result<(Format, Vec<Member>),
                     size,
                     mode,
                     kind,
+                    link,
                 });
             }
         }
@@ -243,6 +270,11 @@ pub fn build(
                 let options = zip::write::SimpleFileOptions::default()
                     .last_modified_time(dos_time(mtime))
                     .unix_permissions(input.mode & 0o777);
+                if let Some(target) = &input.symlink {
+                    zip.add_symlink(input.name.as_str(), target.as_str(), options)
+                        .map_err(err)?;
+                    continue;
+                }
                 if input.file.is_none() {
                     zip.add_directory(input.name.trim_end_matches('/'), options)
                         .map_err(err)?;
@@ -284,7 +316,17 @@ pub fn build(
                 header.set_gid(input.gid);
                 header.set_username(&input.owner).map_err(err)?;
                 header.set_groupname(&input.group).map_err(err)?;
-                if input.file.is_none() {
+                if let Some((kind, target)) = input
+                    .symlink
+                    .as_ref()
+                    .map(|t| (tar::EntryType::Symlink, t))
+                    .or(input.hardlink.as_ref().map(|t| (tar::EntryType::Link, t)))
+                {
+                    header.set_entry_type(kind);
+                    header.set_size(0);
+                    tar.append_link(&mut header, &input.name, target)
+                        .map_err(err)?;
+                } else if input.file.is_none() {
                     header.set_entry_type(tar::EntryType::Directory);
                     header.set_size(0);
                     let name = format!("{}/", input.name.trim_end_matches('/'));
@@ -377,6 +419,8 @@ mod tests {
             uid: 1000,
             gid: 1000,
             store,
+            symlink: None,
+            hardlink: None,
         };
         vec![
             Input {
@@ -388,6 +432,8 @@ mod tests {
                 uid: 1000,
                 gid: 1000,
                 store: false,
+                symlink: None,
+                hardlink: None,
             },
             file("docs/spéctrum notes.md", "0", 0o644, false),
             file("docs/run.sh", "1", 0o755, true),
@@ -449,6 +495,8 @@ mod tests {
                 uid: 1000,
                 gid: 1000,
                 store: false,
+                symlink: None,
+                hardlink: None,
             };
             build(
                 format,
@@ -460,6 +508,55 @@ mod tests {
             .unwrap();
             let (_, members) = list(&s.path("out"), None).unwrap();
             assert_eq!(members[0].mode.map(|m| m & 0o777), Some(0));
+        }
+    }
+
+    #[test]
+    fn links_are_kept_as_links() {
+        for format in [Format::Tar, Format::Zip] {
+            let s = Scratch::new(&format!("links-{format:?}"));
+            fs::write(s.path("in/0"), "data").unwrap();
+            let member = |name: &str,
+                          file: Option<&str>,
+                          symlink: Option<&str>,
+                          hardlink: Option<&str>| Input {
+                name: name.into(),
+                file: file.map(String::from),
+                mode: if symlink.is_some() { 0o777 } else { 0o644 },
+                owner: "alice".into(),
+                group: "team".into(),
+                uid: 1000,
+                gid: 1000,
+                store: false,
+                symlink: symlink.map(String::from),
+                hardlink: hardlink.map(String::from),
+            };
+            let mut inputs = vec![
+                member("a.txt", Some("0"), None, None),
+                member("to-a", None, Some("a.txt"), None),
+            ];
+            if format == Format::Tar {
+                inputs.push(member("a-too.txt", None, None, Some("a.txt")));
+            }
+            build(
+                format,
+                1_761_400_000,
+                &inputs,
+                &s.path("in"),
+                &s.path("out"),
+            )
+            .unwrap();
+            let (_, members) = list(&s.path("out"), None).unwrap();
+            assert_eq!(
+                (members[1].kind, members[1].link.as_deref()),
+                (Kind::Symlink, Some("a.txt"))
+            );
+            if format == Format::Tar {
+                assert_eq!(
+                    (members[2].kind, members[2].link.as_deref()),
+                    (Kind::Hardlink, Some("a.txt"))
+                );
+            }
         }
     }
 
@@ -508,7 +605,7 @@ mod tests {
         drop(tar);
         let (_, members) = list(&out, None).unwrap();
         assert_eq!(members[0].name, "../evil.txt");
-        assert_eq!(members[1].kind, Kind::Link);
+        assert_eq!(members[1].kind, Kind::Symlink);
         assert!(terminal_worker_core::archive::member_path("/x", &members[0].name).is_err());
         fs::write(s.path("junk"), b"not an archive at all").unwrap();
         assert!(list(&s.path("junk"), None).is_err());

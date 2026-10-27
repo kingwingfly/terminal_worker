@@ -2,7 +2,7 @@ use crate::db::{self, transact};
 use crate::{api, auth, jobs};
 use std::cell::Cell;
 use std::collections::BTreeSet;
-use terminal_worker_core::permissions::{EXEC, GUEST, Node, READ, Store, User};
+use terminal_worker_core::permissions::{EXEC, GUEST, GUEST_HOME, Node, READ, Store, User};
 use worker::*;
 
 /// The R2 object that marks the bucket as managed by an authority, so that a lost authority is
@@ -208,12 +208,33 @@ impl TerminalAuthority {
                     hash,
                 },
             );
-            for (name, id) in [("root", 0), ("wheel", 27), ("nogroup", GUEST)] {
+            // Who is signed out is guest, a real account that cannot sign in, as nobody is on
+            // Linux; the accounts guests make are in its group, with homes in /guest, which
+            // is shared, sticky as /tmp is.
+            db.set_user(
+                "guest",
+                &User {
+                    id: GUEST,
+                    group: GUEST,
+                    groups: BTreeSet::new(),
+                    home: GUEST_HOME.into(),
+                    locked: true,
+                    salt: String::new(),
+                    hash: String::new(),
+                },
+            );
+            for (name, id) in [("root", 0), ("wheel", 27), ("guest", GUEST)] {
                 db.set_group(name, id);
             }
-            for (path, mode) in [("/", 0o755), ("/home", 0o755), ("/root", 0o700)] {
-                db.set_node(path, &Node::directory(0, 0, mode));
+            for (path, group, mode) in [
+                ("/", 0, 0o755),
+                ("/home", 0, 0o755),
+                ("/root", 0, 0o700),
+                (GUEST_HOME, GUEST, 0o1777),
+            ] {
+                db.set_node(path, &Node::directory(0, group, mode));
             }
+            db.set_meta("schema", db::SCHEMA_VERSION);
             ((), true)
         })?;
         bucket

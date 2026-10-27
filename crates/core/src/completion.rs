@@ -6,7 +6,7 @@ pub const COMMANDS: &[&str] = &[
     "login", "logout", "exit", "clear", "help", "sudo", "su", "chmod", "chown", "useradd",
     "usermod", "userdel", "groupadd", "groupmod", "groupdel", "passwd", "id", "whoami", "groups",
     "users", "echo", "cat", "head", "tail", "grep", "wc", "sort", "uniq", "xargs", "zip", "unzip",
-    "tar", "jobs",
+    "tar", "jobs", "ln", "readlink", "chgrp", "getfacl", "setfacl", "getfattr", "setfattr",
 ];
 
 #[derive(Clone, Debug)]

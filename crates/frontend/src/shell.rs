@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use terminal_worker_core::completion::{self, Candidate, Query};
 use terminal_worker_core::glob::{self, Part};
 use terminal_worker_core::shell::{self as grammar, Delimiter, Word};
-use terminal_worker_core::{Entry, find, permissions::mode_text, resolve, split_command, text};
+use terminal_worker_core::{Entry, find, resolve, split_command, text};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
@@ -39,13 +39,15 @@ const GLOB_CONCURRENCY: usize = 8;
 /// Commands the server runs, through web/app.js's accountCommand; ls and mkdir too, with
 /// options or several paths.
 const SERVER: &[&str] = &[
-    "man", "vim", "touch", "sudo", "su", "login", "logout", "exit", "passwd", "chmod", "chown",
-    "useradd", "usermod", "userdel", "groupadd", "groupmod", "groupdel", "whoami", "id", "groups",
-    "users", "rm", "mv", "cp", "fd", "zip", "unzip", "tar",
+    "help", "man", "vim", "touch", "sudo", "su", "login", "logout", "exit", "passwd", "chmod",
+    "chown", "useradd", "usermod", "userdel", "groupadd", "groupmod", "groupdel", "whoami", "id",
+    "groups", "users", "rm", "mv", "cp", "fd", "zip", "unzip", "tar", "ln", "readlink", "chgrp",
+    "getfacl", "setfacl", "getfattr", "setfattr",
 ];
 /// Server commands that xargs and fd -x may run many of in one request.
 const BATCHED: &[&str] = &[
-    "touch", "rm", "mv", "cp", "chmod", "chown", "mkdir", "ls", "whoami", "id", "groups",
+    "touch", "rm", "mv", "cp", "chmod", "chown", "chgrp", "mkdir", "ls", "whoami", "id", "groups",
+    "ln", "readlink", "getfacl", "setfacl", "getfattr", "setfattr",
 ];
 
 #[derive(Clone)]
@@ -142,12 +144,16 @@ fn js_message(error: JsValue) -> String {
         .or_else(|| error.as_string())
         .unwrap_or_else(|| "Operation failed".into())
 }
+/// Commands for which -h is an option, as on Linux: chown, chgrp, getfattr and setfattr act on a
+/// link itself with it, tar follows links. Alone, it still asks for help.
+const H_OPTION: &[&str] = &["chown", "chgrp", "getfattr", "setfattr", "tar"];
 /// Whether `args` ask for help before `--`.
 fn wants_help(args: &[String]) -> bool {
+    let h_option = H_OPTION.contains(&args.first().map(String::as_str).unwrap_or_default());
     args.iter()
         .skip(1)
         .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+        .any(|arg| arg == "--help" || arg == "-h" && (!h_option || args.len() == 2))
 }
 /// Whether `args` are mv or cp -i, under sudo or not, which ask before replacing a file: run
 /// one by one, never in a batch, however xargs or fd -x start them.
@@ -167,12 +173,17 @@ fn listing_text(entries: &[Entry], long: bool) -> String {
         .map(|e| {
             if long {
                 format!(
-                    "{} {} {} {:>8} {}\n",
-                    mode_text(e.mode, e.directory),
+                    "{} {:>2} {} {} {:>8} {}{}\n",
+                    e.mode_line(),
+                    e.links,
                     e.owner,
                     e.group,
                     e.size,
-                    e.name
+                    e.name,
+                    e.link
+                        .as_ref()
+                        .map(|t| format!(" -> {t}"))
+                        .unwrap_or_default()
                 )
             } else {
                 format!("{}\n", e.name)
@@ -876,7 +887,6 @@ impl Shell {
         let arg = args.get(1).map(String::as_str);
         let path = self.path(arg.unwrap_or("."))?;
         match cmd {
-            "help" => Ok(Output::text(HELP)),
             "pwd" => Ok(Output::text(format!("{}\n", self.cwd.get_untracked()))),
             "clear" => {
                 self.lines.set(Vec::new());
@@ -1375,20 +1385,3 @@ impl Shell {
         }
     }
 }
-const HELP: &str = "ls [-l] [PATH]    cd [directory/~]    pwd    fd [PATTERN] [PATH...]
-open <FILE>  mkdir [-p] <DIR...>  touch <FILE...>  upload    vim <FILE> floating editor
-rm [-r] [-f] <PATH...>   mv [-f|-n|-i] SRC... DEST   cp [-r] [-f|-n|-i] SRC... DEST
-echo  cat  head  tail  grep  wc  sort  uniq  xargs    COMMAND | COMMAND pipes output
-fd -e md -X wc -l    fd -0 -t f | xargs -0 rm    ls | grep -i report | sort
-zip -r A.zip PATH...   unzip [-d DIR] A.zip   tar -czf A.tgz PATH... / -xf A.tgz   jobs
-login [USER]  su [-] [USER]  exit / logout  clear
-whoami / id [USER] / groups [USER] / sudo users
-chmod [-R] 640|o+w,g-x <PATH...>   chown [-R] USER:GROUP <PATH...>
-useradd [-m] [-d HOME] [-g GROUP] [-G GROUPS] USER
-usermod [-aG GROUPS] [-d HOME -m] [-l NEW] [-L|-U] USER
-userdel [-r] USER   groupadd GROUP   groupmod -n NEW OLD   groupdel GROUP
-passwd [USER] · change password in a dialog    sudo <COMMAND> / sudo -u USER / sudo -k
-COMMAND -h / man [COMMAND] for help · Ctrl+C stops a running command between steps
-Tab / Shift+Tab fuzzy completion · ↑↓ history · Alt+T new tab · Alt+W close · Alt+1-9 switch
-.slides.md Slides / .game Game / Markdown, text, code, PDF, images, video, audio, archives
-";

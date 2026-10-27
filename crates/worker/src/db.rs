@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use terminal_worker_core::permissions::{Id, Node, Session, Store, User};
 use wasm_bindgen::prelude::*;
@@ -31,15 +31,25 @@ extern "C" {
 /// The rollback a transaction asks for when its reply is an error, which is not a failure.
 const ROLLBACK: &str = "rollback";
 
-const SCHEMA: [&str; 16] = [
+/// The version of the tables below, which local state made by an older one does not have.
+pub const SCHEMA_VERSION: &str = "3";
+
+const SCHEMA: [&str; 19] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
     "CREATE TABLE IF NOT EXISTS sessions(key TEXT PRIMARY KEY, uid INTEGER NOT NULL, expires INTEGER NOT NULL, sudo_until INTEGER NOT NULL)",
-    // The root's parent is the empty string, so that it is nobody's child.
-    "CREATE TABLE IF NOT EXISTS nodes(path TEXT PRIMARY KEY, parent TEXT NOT NULL, owner INTEGER NOT NULL, grp INTEGER NOT NULL, mode INTEGER NOT NULL, directory INTEGER NOT NULL, file TEXT, size INTEGER NOT NULL)",
+    // Names, and the inodes they name: hard links are names of one inode. The root's parent is
+    // the empty string, so that it is nobody's child.
+    "CREATE TABLE IF NOT EXISTS nodes(path TEXT PRIMARY KEY, parent TEXT NOT NULL, ino INTEGER NOT NULL)",
     "CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent)",
-    "CREATE INDEX IF NOT EXISTS nodes_file ON nodes(file)",
+    "CREATE INDEX IF NOT EXISTS nodes_ino ON nodes(ino)",
+    // An inode: a directory, a file showing content, or a symbolic link to `link`; its ACLs as
+    // JSON (crate::acl).
+    "CREATE TABLE IF NOT EXISTS inodes(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, grp INTEGER NOT NULL, mode INTEGER NOT NULL, directory INTEGER NOT NULL, file TEXT, size INTEGER NOT NULL, link TEXT, acl TEXT, default_acl TEXT)",
+    "CREATE INDEX IF NOT EXISTS inodes_file ON inodes(file)",
+    // Extended attributes, their values in hexadecimal.
+    "CREATE TABLE IF NOT EXISTS xattrs(ino INTEGER NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(ino, name))",
     // A file's content: `size` bytes in chunks of `chunk_size`, chunk i at i × chunk_size, the
     // last one short. An upload names its target path, and the file it replaces there, if any.
     "CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY, size INTEGER NOT NULL, chunk_size INTEGER NOT NULL, state TEXT NOT NULL, sha256 TEXT, uploader INTEGER NOT NULL, target TEXT NOT NULL, base TEXT, touched INTEGER NOT NULL)",
@@ -83,8 +93,32 @@ fn fail(error: Error) {
     });
 }
 
-/// Create the tables, if they do not exist yet.
+/// Create the tables, if they do not exist yet; refuse tables an older version made, which
+/// nothing migrates, as nothing is deployed.
 pub fn create(sql: &SqlStorage) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Name {
+        name: String,
+    }
+    let tables: Vec<Name> = sql
+        .exec(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('users', 'meta')",
+            None,
+        )?
+        .to_array()?;
+    if tables.iter().any(|t| t.name == "users") {
+        let version: Vec<Value> = if tables.iter().any(|t| t.name == "meta") {
+            sql.exec("SELECT v FROM meta WHERE k = 'schema'", None)?
+                .to_array()?
+        } else {
+            Vec::new()
+        };
+        if version.first().map(|v| v.v.as_str()) != Some(SCHEMA_VERSION) {
+            return Err(Error::RustError(
+                "This storage was made by an older version of the terminal, whose tables are not migrated; delete the local state (.wrangler/state) and start again".into(),
+            ));
+        }
+    }
     for statement in SCHEMA {
         sql.exec(statement, None)?;
     }
@@ -138,24 +172,34 @@ pub fn transact<T: 'static>(
 #[derive(Deserialize)]
 struct NodeRow {
     path: String,
+    ino: u64,
     owner: u32,
     grp: u32,
     mode: u16,
     directory: u8,
     file: Option<String>,
     size: u64,
+    link: Option<String>,
+    acl: Option<String>,
+    default_acl: Option<String>,
+    links: u32,
 }
 impl NodeRow {
     fn pair(self) -> (String, Node) {
         (
             self.path,
             Node {
+                ino: self.ino,
                 owner: self.owner,
                 group: self.grp,
                 mode: self.mode,
                 directory: self.directory != 0,
                 file: self.file,
                 size: self.size,
+                link: self.link,
+                links: self.links,
+                acl: self.acl.and_then(|a| serde_json::from_str(&a).ok()),
+                default_acl: self.default_acl.and_then(|a| serde_json::from_str(&a).ok()),
             },
         )
     }
@@ -205,6 +249,10 @@ struct Value {
 #[derive(Deserialize)]
 struct Key {
     key: String,
+}
+#[derive(Deserialize)]
+struct Ino {
+    ino: u64,
 }
 
 /// A file's content, and the upload that is writing it.
@@ -417,13 +465,40 @@ impl Db {
         // A job still reading it keeps it too.
         let referenced = !self
             .rows::<Key>(
-                "SELECT path AS key FROM nodes WHERE file = ?1 UNION ALL SELECT job AS key FROM job_files WHERE file = ?1 LIMIT 1",
+                "SELECT CAST(id AS TEXT) AS key FROM inodes WHERE file = ?1 UNION ALL SELECT job AS key FROM job_files WHERE file = ?1 LIMIT 1",
                 vec![text(&file)],
             )
             .is_empty();
         if !referenced {
             self.drop_file(&file);
         }
+    }
+    /// The names of the inode `ino`.
+    fn names(&self, ino: u64) -> Vec<String> {
+        self.rows::<Key>(
+            "SELECT path AS key FROM nodes WHERE ino = ?",
+            vec![int(ino)],
+        )
+        .into_iter()
+        .map(|k| k.key)
+        .collect()
+    }
+    /// Let the inode `ino` go, and what it shows, if nothing names it.
+    fn forget(&mut self, ino: u64) {
+        if !self.names(ino).is_empty() {
+            return;
+        }
+        #[derive(Deserialize)]
+        struct Shown {
+            file: Option<String>,
+        }
+        let file = self
+            .rows::<Shown>("SELECT file FROM inodes WHERE id = ?", vec![int(ino)])
+            .pop()
+            .and_then(|s| s.file);
+        self.run("DELETE FROM inodes WHERE id = ?", vec![int(ino)]);
+        self.run("DELETE FROM xattrs WHERE ino = ?", vec![int(ino)]);
+        self.release(file);
     }
 
     pub fn create_job(
@@ -535,7 +610,7 @@ impl Db {
     /// The unfinished uploads that nodes in directory `dir` show.
     pub fn uploading_in(&self, dir: &str) -> Vec<File> {
         self.rows(
-            "SELECT DISTINCT f.id, f.size, f.chunk_size, f.state, f.sha256, f.uploader, f.target, f.base FROM files f JOIN nodes n ON n.file = f.id WHERE n.parent = ? AND f.state = 'uploading'",
+            "SELECT DISTINCT f.id, f.size, f.chunk_size, f.state, f.sha256, f.uploader, f.target, f.base FROM files f JOIN inodes i ON i.file = f.id JOIN nodes n ON n.ino = i.id WHERE n.parent = ? AND f.state = 'uploading'",
             vec![text(dir)],
         )
     }
@@ -578,7 +653,7 @@ impl Db {
     /// The paths of the nodes showing `file`.
     pub fn showing(&self, file: &str) -> Vec<String> {
         self.rows::<Key>(
-            "SELECT path AS key FROM nodes WHERE file = ?",
+            "SELECT n.path AS key FROM nodes n JOIN inodes i ON i.id = n.ino WHERE i.file = ?",
             vec![text(file)],
         )
         .into_iter()
@@ -636,7 +711,9 @@ impl Db {
     }
 }
 
-const NODE: &str = "SELECT path, owner, grp, mode, directory, file, size FROM nodes";
+/// Names and their inodes, with how many names each has: a directory, 2 and one for each
+/// directory in it.
+const NODE: &str = "SELECT n.path, i.id AS ino, i.owner, i.grp, i.mode, i.directory, i.file, i.size, i.link, i.acl, i.default_acl, CASE WHEN i.directory = 1 THEN 2 + (SELECT COUNT(*) FROM nodes c JOIN inodes ci ON ci.id = c.ino WHERE c.parent = n.path AND ci.directory = 1) ELSE (SELECT COUNT(*) FROM nodes m WHERE m.ino = i.id) END AS links FROM nodes n JOIN inodes i ON i.id = n.ino";
 const JOB: &str =
     "SELECT id, owner, actor, kind, spec, state, progress, question, created FROM jobs";
 
@@ -671,13 +748,13 @@ const USER: &str = "SELECT id, name, gid, groups, home, locked, salt, hash FROM 
 
 impl Store for Db {
     fn node(&self, path: &str) -> Option<Node> {
-        self.rows::<NodeRow>(&format!("{NODE} WHERE path = ?"), vec![text(path)])
+        self.rows::<NodeRow>(&format!("{NODE} WHERE n.path = ?"), vec![text(path)])
             .pop()
             .map(|r| r.pair().1)
     }
     fn children(&self, path: &str) -> Vec<(String, Node)> {
         self.rows::<NodeRow>(
-            &format!("{NODE} WHERE parent = ? ORDER BY path"),
+            &format!("{NODE} WHERE n.parent = ? ORDER BY n.path"),
             vec![text(path)],
         )
         .into_iter()
@@ -686,11 +763,11 @@ impl Store for Db {
     }
     fn subtree(&self, path: &str) -> Vec<(String, Node)> {
         let rows = if path == "/" {
-            self.rows::<NodeRow>(&format!("{NODE} ORDER BY path"), vec![])
+            self.rows::<NodeRow>(&format!("{NODE} ORDER BY n.path"), vec![])
         } else {
             // Every path starting with `path/`: '0' is the character after '/'.
             self.rows::<NodeRow>(
-                &format!("{NODE} WHERE path = ? OR (path >= ? AND path < ?) ORDER BY path"),
+                &format!("{NODE} WHERE n.path = ? OR (n.path >= ? AND n.path < ?) ORDER BY n.path"),
                 vec![
                     text(path),
                     text(&format!("{path}/")),
@@ -701,36 +778,109 @@ impl Store for Db {
         rows.into_iter().map(NodeRow::pair).collect()
     }
     fn set_node(&mut self, path: &str, node: &Node) {
+        #[derive(Deserialize)]
+        struct Id {
+            id: u64,
+        }
+        #[derive(Deserialize)]
+        struct Shown {
+            file: Option<String>,
+        }
         changes(path);
-        let old = self
-            .rows::<NodeRow>(&format!("{NODE} WHERE path = ?"), vec![text(path)])
+        let json = |value: Option<String>| -> SqlStorageValue { value.into() };
+        let values = vec![
+            int(node.owner),
+            int(node.group),
+            int(node.mode),
+            int(node.directory as u8),
+            node.file.as_deref().into(),
+            int(node.size),
+            node.link.as_deref().into(),
+            json(node.acl.as_ref().map(|a| serde_json::json!(a).to_string())),
+            json(
+                node.default_acl
+                    .as_ref()
+                    .map(|a| serde_json::json!(a).to_string()),
+            ),
+        ];
+        let ino = if node.ino == 0 {
+            self.rows::<Id>(
+                "INSERT INTO inodes(owner, grp, mode, directory, file, size, link, acl, default_acl) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                values,
+            )
             .pop()
-            .and_then(|r| r.file);
+            .map_or(0, |i| i.id)
+        } else {
+            let before = self
+                .rows::<Shown>("SELECT file FROM inodes WHERE id = ?", vec![int(node.ino)])
+                .pop()
+                .and_then(|s| s.file);
+            let mut values = values;
+            values.push(int(node.ino));
+            self.run(
+                "UPDATE inodes SET owner = ?, grp = ?, mode = ?, directory = ?, file = ?, size = ?, link = ?, acl = ?, default_acl = ? WHERE id = ?",
+                values,
+            );
+            // Every name of it shows the change.
+            for name in self.names(node.ino) {
+                changes(&name);
+            }
+            if before.is_some() && before != node.file {
+                self.release(before);
+            }
+            node.ino
+        };
+        let old = self
+            .rows::<Ino>("SELECT ino FROM nodes WHERE path = ?", vec![text(path)])
+            .pop()
+            .map(|r| r.ino);
         self.run(
-            "INSERT INTO nodes(path, parent, owner, grp, mode, directory, file, size) VALUES(?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET owner = excluded.owner, grp = excluded.grp, mode = excluded.mode, directory = excluded.directory, file = excluded.file, size = excluded.size",
-            vec![
-                text(path),
-                text(parent_of(path)),
-                int(node.owner),
-                int(node.group),
-                int(node.mode),
-                int(node.directory as u8),
-                node.file.as_deref().into(),
-                int(node.size),
-            ],
+            "INSERT INTO nodes(path, parent, ino) VALUES(?, ?, ?) ON CONFLICT(path) DO UPDATE SET ino = excluded.ino",
+            vec![text(path), text(parent_of(path)), int(ino)],
         );
-        if old.is_some() && old != node.file {
-            self.release(old);
+        if let Some(old) = old
+            && old != ino
+        {
+            self.forget(old);
         }
     }
     fn delete_node(&mut self, path: &str) {
         changes(path);
         let old = self
-            .rows::<NodeRow>(&format!("{NODE} WHERE path = ?"), vec![text(path)])
+            .rows::<Ino>("SELECT ino FROM nodes WHERE path = ?", vec![text(path)])
             .pop()
-            .and_then(|r| r.file);
+            .map(|r| r.ino);
         self.run("DELETE FROM nodes WHERE path = ?", vec![text(path)]);
-        self.release(old);
+        if let Some(old) = old {
+            self.forget(old);
+        }
+    }
+    fn xattrs(&self, ino: u64) -> BTreeMap<String, Vec<u8>> {
+        #[derive(Deserialize)]
+        struct Attr {
+            name: String,
+            value: String,
+        }
+        self.rows::<Attr>(
+            "SELECT name, value FROM xattrs WHERE ino = ? ORDER BY name",
+            vec![int(ino)],
+        )
+        .into_iter()
+        .filter_map(|a| Some((a.name, crate::files::decode_hex(&a.value)?)))
+        .collect()
+    }
+    fn set_xattrs(&mut self, ino: u64, attrs: &BTreeMap<String, Vec<u8>>) {
+        self.run("DELETE FROM xattrs WHERE ino = ?", vec![int(ino)]);
+        for (name, value) in attrs {
+            let hex: String = value.iter().map(|b| format!("{b:02x}")).collect();
+            self.run(
+                "INSERT INTO xattrs(ino, name, value) VALUES(?, ?, ?)",
+                vec![int(ino), text(name), text(&hex)],
+            );
+        }
+        for name in self.names(ino) {
+            changes(&name);
+        }
     }
 
     fn user(&self, name: &str) -> Option<User> {

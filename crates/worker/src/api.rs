@@ -103,6 +103,12 @@ macro_rules! acl {
         }
     };
 }
+/// `path` physically for `who`, a link at its end followed if `follow`, or the error reply.
+macro_rules! real {
+    ($db:expr, $who:expr, $path:expr, $follow:expr) => {
+        acl!($db.physical($who, $path, $follow), $who)
+    };
+}
 
 pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply> {
     let url = req.url()?;
@@ -130,8 +136,9 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         (Method::Get, "/api/session") => run(state, move |db| {
             let mut view = auth::session_view(db, key.as_deref());
             let who = auth::identity(db, key.as_deref());
+            let real = db.physical(&who, &path, true).unwrap_or_default();
             view["can_write"] = json!(
-                db.access(&who, &path, WRITE | EXEC)
+                db.access(&who, &real, WRITE | EXEC)
                     .is_ok_and(|n| n.directory)
             );
             Reply::ok(view)
@@ -146,6 +153,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         }),
         (Method::Post, "/api/sudo") => sudo(req, env, state, key).await,
         (Method::Post, "/api/passwd") => passwd(req, env, state, key, https).await,
+        (Method::Post, "/api/register") => register(req, env, state, key, https).await,
         (Method::Post, "/api/command") => {
             if !body_size(req, 1 << 20) {
                 return Ok(Reply::error(
@@ -193,11 +201,12 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let enter = flag("enter");
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
-                let n = acl!(db.access(&who, &path, if enter { EXEC } else { 0 }), &who);
+                let real = real!(db, &who, &path, true);
+                let n = acl!(db.access(&who, &real, if enter { EXEC } else { 0 }), &who);
                 if enter && !n.directory {
                     return Reply::error("Not a directory", 400);
                 }
-                let mut value = json!(commands::entry(db, &path, &n));
+                let mut value = json!(commands::entry(db, &who, &path, &real, &n));
                 value["writable"] = json!(who.allows(&n, WRITE));
                 value["readable"] = json!(who.allows(&n, READ));
                 Reply::ok(value)
@@ -205,17 +214,19 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         }
         (Method::Get, "/api/ls") => run(state, move |db| {
             let who = auth::identity(db, key.as_deref());
-            let n = acl!(db.access(&who, &path, READ | EXEC), &who);
+            let real = real!(db, &who, &path, true);
+            let n = acl!(db.access(&who, &real, READ | EXEC), &who);
             if !n.directory {
                 return Reply::error("Not a directory", 400);
             }
-            let entries = commands::entries(db, &path, &db.children(&path));
+            let entries = commands::entries(db, &who, &real, &path, &db.children(&real));
             Reply::ok(json!(Listing { path, entries }))
         }),
         (Method::Post, "/api/mkdir") => run(state, move |db| {
             let who = auth::identity(db, key.as_deref());
+            let real = real!(db, &who, &path, false);
             // Keep the original API's mkdir -p contract; CLI mkdir supports explicit -p.
-            acl!(db.mkdir(&who, &path, true), &who);
+            acl!(db.mkdir(&who, &real, true), &who);
             Reply::ok(json!({"path":path}))
         }),
         (Method::Delete, "/api/file") => {
@@ -225,13 +236,15 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 if path == "/" {
                     return Reply::error("Cannot remove the root directory", 403);
                 }
-                acl!(db.remove(&who, &path, recursive), &who);
+                let real = real!(db, &who, &path, false);
+                acl!(db.remove(&who, &real, recursive), &who);
                 Reply::ok(json!({"path":path}))
             })
         }
         (Method::Get, "/internal/read") => run(state, move |db| {
             let who = auth::identity(db, key.as_deref());
-            let node = acl!(db.access(&who, &path, READ), &who);
+            let real = real!(db, &who, &path, true);
+            let node = acl!(db.access(&who, &real, READ), &who);
             let Some(id) = node.file else {
                 return Reply::error("This is a directory", 400);
             };
@@ -245,7 +258,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 .collect();
             Reply::ok(json!({
                 "file": id, "size": file.size, "chunk_size": file.chunk_size,
-                "state": file.state, "etag": file.etag(), "mime": mime(&path), "chunks": chunks,
+                "state": file.state, "etag": file.etag(), "mime": mime(&real), "chunks": chunks,
                 "readable": db.readable(&file),
             }))
         }),
@@ -624,7 +637,7 @@ fn job_reply(
             Reply::ok(json!({"size": f.size, "chunk_size": f.chunk_size, "chunks": chunks}))
         }
         (Method::Post, "/internal/job/exists") => {
-            // What each path is, and its mode.
+            // What each path is, and its mode, the link itself for a link, as lstat(2).
             let mut existing = serde_json::Map::new();
             let mut modes = serde_json::Map::new();
             for path in body["paths"]
@@ -635,8 +648,9 @@ fn job_reply(
             {
                 // What lies where the job may not look is never told, not even whether it is
                 // there: writing it fails, as for a path that is not.
-                if db.traverse(&actor, path).is_ok()
-                    && let Some(node) = db.node(path)
+                if let Ok(real) = db.physical(&actor, path, false)
+                    && db.traverse(&actor, &real).is_ok()
+                    && let Some(node) = db.node(&real)
                 {
                     existing.insert(
                         path.into(),
@@ -649,15 +663,22 @@ fn job_reply(
         }
         (Method::Post, "/internal/job/mkdir") => {
             let path = body["path"].as_str().unwrap_or_default();
-            acl!(db.mkdir(&actor, path, true), &actor);
+            let real = real!(db, &actor, path, false);
+            acl!(db.mkdir(&actor, &real, true), &actor);
             Reply::ok(json!({"path": path}))
         }
         (Method::Post, "/internal/job/begin") => {
             let path = body["path"].as_str().unwrap_or_default().to_string();
             let replace = body["replace"] == true;
+            // Extraction removes a file in the way and makes it anew, as tar and unzip do, so
+            // that it is the extractor's, with the archive's mode, and other names of the old
+            // file keep it; a new archive (tar -c) writes over one, as open(2) does.
+            let unlink = body["unlink"] == true;
+            let real = real!(db, &actor, &path, false);
             // Only where the job may look is it told what is there.
-            acl!(db.traverse(&actor, &path), &actor);
-            if let Some(node) = db.node(&path) {
+            acl!(db.traverse(&actor, &real), &actor);
+            let mut overwrite = replace;
+            if let Some(node) = db.node(&real) {
                 if node.directory {
                     return Reply::error(
                         &format!("{path}: a directory with this name already exists"),
@@ -667,22 +688,51 @@ fn job_reply(
                 if !replace {
                     return Reply::ok(json!({"skipped": true}));
                 }
+                if unlink || node.is_link() {
+                    acl!(db.remove(&actor, &real, false), &actor);
+                    overwrite = false;
+                }
             }
             begin_upload(
                 db,
                 &actor,
-                &path,
+                &real,
                 Begun {
                     size: body["size"].as_u64().unwrap_or(0),
                     chunk_size: CHUNK_SIZE,
                     limit: MAX_FILE,
                     sha256: None,
-                    overwrite: replace,
+                    overwrite,
                     if_match: None,
                     if_none_match: None,
-                    mode: body["mode"].as_u64().map(|m| (m & 0o777) as u16),
+                    mode: body["mode"].as_u64().map(|m| (m & 0o7777) as u16),
                 },
             )
+        }
+        (Method::Post, "/internal/job/link") | (Method::Post, "/internal/job/symlink") => {
+            let path = body["path"].as_str().unwrap_or_default();
+            let target = body["target"].as_str().unwrap_or_default();
+            let real = real!(db, &actor, path, false);
+            acl!(db.traverse(&actor, &real), &actor);
+            if let Some(node) = db.node(&real) {
+                if node.directory {
+                    return Reply::error(
+                        &format!("{path}: a directory with this name already exists"),
+                        409,
+                    );
+                }
+                if body["replace"] != true {
+                    return Reply::ok(json!({"skipped": true}));
+                }
+                acl!(db.remove(&actor, &real, false), &actor);
+            }
+            if endpoint == "/internal/job/symlink" {
+                acl!(db.symlink(&actor, target, &real), &actor);
+            } else {
+                let source = real!(db, &actor, target, false);
+                acl!(db.link(&actor, &source, &real), &actor);
+            }
+            Reply::ok(json!({"path": path}))
         }
         (Method::Post, "/internal/job/commit") => commit_upload(
             db,
@@ -715,8 +765,10 @@ fn job_reply(
         }
         (Method::Post, "/internal/job/chmod") => {
             let path = body["path"].as_str().unwrap_or_default();
-            let mode = format!("{:03o}", body["mode"].as_u64().unwrap_or(0o644) & 0o777);
-            acl!(db.chmod(&actor, path, &mode, false), &actor);
+            let real = real!(db, &actor, path, true);
+            // Five digits: exactly this mode, a directory's setgid bit too.
+            let mode = format!("{:05o}", body["mode"].as_u64().unwrap_or(0o644) & 0o7777);
+            acl!(db.chmod(&actor, &real, &mode, false), &actor);
             Reply::ok(json!({"path": path}))
         }
         _ => Reply::error("Unknown endpoint or unsupported request method", 404),
@@ -803,6 +855,9 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
         if_none_match,
         mode,
     } = begin;
+    // A link is written through, as open(2) does: one leading nowhere makes what it names.
+    let real = real!(db, who, path, true);
+    let path = real.as_str();
     acl!(db.traverse(who, path), who);
     if path == "/" {
         return Reply::error("Cannot write to the root directory", 400);
@@ -876,9 +931,18 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
     let mode = match &old {
         Some(old) => old.mode,
         None => {
-            let mode = mode.unwrap_or(0o644);
-            db.set_node(path, &Node::file(who.id, who.group, mode, id.clone(), size));
-            mode
+            let Some(above) = db.node(terminal_worker_core::parent(path)) else {
+                return Reply::error("Parent directory does not exist", 404);
+            };
+            // Asked for rw-rw-rw-, less the umask; a mode from an archive is as it is.
+            let mut node = match mode {
+                Some(mode) => created(who, &above, mode, false, 0),
+                None => created(who, &above, 0o666, false, UMASK),
+            };
+            node.file = Some(id.clone());
+            node.size = size;
+            db.set_node(path, &node);
+            node.mode
         }
     };
     Reply::ok(json!({
@@ -1233,6 +1297,12 @@ async fn passwd(
         Ok(checked) => checked,
         Err(message) => return Ok(denied(&message, &who)),
     };
+    if target.id == GUEST {
+        return Ok(Reply::error(
+            "guest has no password: it is who is signed out",
+            400,
+        ));
+    }
     if actor.id != 0 && target.id != who.id {
         return Ok(Reply::error(
             "Only root can change another account's password",
@@ -1287,5 +1357,130 @@ async fn passwd(
         Reply::ok(
             json!({"output":format!("Password updated for {name}; previous sessions revoked")}),
         )
+    })
+}
+
+/// The most accounts guests may make, all told.
+const REGISTERED_MAX: usize = 1000;
+
+/// useradd NAME, signed out: an account of one's own, in its own group and in guest's, with a
+/// home in /guest that only it may enter, and the password given; signed in as it at once.
+async fn register(
+    req: &mut Request,
+    env: &Env,
+    state: &State,
+    key: Option<String>,
+    https: bool,
+) -> Result<Reply> {
+    let who = read(state, {
+        let key = key.clone();
+        move |db| auth::identity(db, key.as_deref())
+    })?;
+    if who.id != GUEST {
+        return Ok(Reply::error(
+            "useradd NAME makes an account for one who is signed out; signed in, use sudo useradd",
+            409,
+        ));
+    }
+    if auth::limited(req, env, "register").await? {
+        return Ok(Reply::error(
+            "Too many attempts; please try again later",
+            429,
+        ));
+    }
+    if !body_size(req, 2048) {
+        return Ok(Reply::error("Invalid account request", 400));
+    }
+    #[derive(Deserialize)]
+    struct Register {
+        username: String,
+        password: String,
+        #[serde(default)]
+        force: bool,
+    }
+    let Ok(wanted) = req.json::<Register>().await else {
+        return Ok(Reply::error("Invalid account request", 400));
+    };
+    let name = wanted.username;
+    if !valid_name(&name) {
+        return Ok(Reply::error(
+            "Username is invalid (start with a lowercase letter; up to 32 lowercase letters, digits, underscores, or hyphens)",
+            400,
+        ));
+    }
+    if wanted.password.is_empty() || wanted.password.len() > 512 {
+        return Ok(Reply::error(
+            "The password cannot be empty and must not exceed 512 bytes",
+            400,
+        ));
+    }
+    if !wanted.force && !auth::password_valid(&wanted.password) {
+        return Ok(Reply::error(
+            "Use at least 12 characters; useradd --force allows a short password",
+            400,
+        ));
+    }
+    // Refused before the slow hash, and again in the transaction that makes it.
+    let taken = |db: &Db, name: &str| {
+        if db.user(name).is_some() || db.group(name).is_some() {
+            Some(Reply::error("Username already exists", 409))
+        } else if db.node(GUEST_HOME).is_none_or(|n| !n.directory) {
+            Some(Reply::error(
+                "There is no /guest for homes; ask root to make it",
+                503,
+            ))
+        } else if db
+            .users()
+            .iter()
+            .filter(|(_, u)| u.home.starts_with(&format!("{GUEST_HOME}/")))
+            .count()
+            >= REGISTERED_MAX
+        {
+            Some(Reply::error(
+                "Guests have made as many accounts as they may",
+                503,
+            ))
+        } else {
+            db.node(&format!("{GUEST_HOME}/{name}"))
+                .map(|_| Reply::error("Something with that name is already in /guest", 409))
+        }
+    };
+    if let Some(reply) = read(state, {
+        let name = name.clone();
+        move |db| taken(db, &name)
+    })? {
+        return Ok(reply);
+    }
+    let salt = auth::random_token();
+    let hash = auth::hash(&wanted.password, &salt, env).await?;
+    run(state, move |db| {
+        if auth::identity(db, key.as_deref()).id != GUEST {
+            return Reply::error("Signed in meanwhile; please try again", 409);
+        }
+        if let Some(reply) = taken(db, &name) {
+            return reply;
+        }
+        let home = format!("{GUEST_HOME}/{name}");
+        let gid = db.next_id(Id::Group);
+        db.set_group(&name, gid);
+        let uid = db.next_id(Id::User);
+        db.set_user(
+            &name,
+            &User {
+                id: uid,
+                group: gid,
+                groups: [GUEST].into(),
+                home: home.clone(),
+                locked: false,
+                salt,
+                hash,
+            },
+        );
+        db.set_node(&home, &Node::directory(uid, gid, 0o700));
+        let (mut body, token) = auth::issue(db, key.as_deref(), uid);
+        body["home"] = json!(home);
+        Reply::ok(body)
+            .status(201)
+            .cookie(auth::cookie(https, &token, auth::TTL))
     })
 }
