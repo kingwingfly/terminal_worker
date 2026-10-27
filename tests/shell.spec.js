@@ -193,3 +193,41 @@ test('tabs run at once with their own directory and history, and Ctrl+C stops a 
   await expect(page.getByRole('tab')).toHaveCount(1);
   await expect(page.locator('.directory-bar')).toContainText(base);
 });
+
+test('cp and mv -i ask as well under sudo, xargs and fd -x, about each file they would replace', async ({ page, request }) => {
+  await terminal(page);
+  const busy = page.locator('.terminal-panel:not([hidden]) .busy');
+  const transcript = page.locator('.terminal-panel:not([hidden]) .transcript');
+  const answer = async text => { await expect(busy).toHaveText('Answer ↵'); await page.locator('#command').fill(text); await page.locator('#command').press('Enter'); };
+  const read = async path => (await request.get(file(base + '/' + path), { headers })).text();
+  const asked = path => `overwrite '${base}/${path}'? (y/n)`;
+  // xargs and fd -x run each cp -i on its own, which asks: no keeps the file, yes replaces it.
+  await run(page, 'echo a.md | xargs -I {} cp -i {} docs/b.md');
+  await expect(transcript).toContainText('cp: ' + asked('docs/b.md'));
+  await answer('n'); await expect(busy).toHaveText('↵');
+  expect(await read('docs/b.md')).toBe('one\ntwo\nthree\n');
+  await run(page, 'fd -F c.txt docs -x cp -i {} docs/b.md');
+  await answer('y'); await expect(busy).toHaveText('↵');
+  expect(await read('docs/b.md')).toBe('TODO later\ndone\nTODO now\n');
+  // sudo asks too, and replaces as root.
+  await run(page, 'sudo mv -iv a.md docs/b.md');
+  await expect(transcript).toContainText('mv: ' + asked('docs/b.md'));
+  await answer('y'); await expect(busy).toHaveText('↵');
+  await expect(last(page)).toContainText(`renamed '${base}/a.md' -> '${base}/docs/b.md'`);
+  expect(await read('docs/b.md')).toBe('alpha\nbeta\n');
+  // cp -ri asks about each file below that exists, and copies the others.
+  await run(page, 'cp -r docs copy'); await expect(busy).toHaveText('↵');
+  expect((await request.put(file(base + '/docs/deep/spéctrum notes.md') + '&overwrite=true', { headers, data: 'δ\n' })).ok()).toBe(true);
+  expect((await request.put(file(base + '/docs/deep/new.md'), { headers, data: 'new\n' })).status()).toBe(201);
+  await run(page, 'cp -ri docs/deep copy');
+  await expect(transcript).toContainText('cp: ' + asked('copy/deep/spéctrum notes.md'));
+  await answer('y'); await expect(busy).toHaveText('↵');
+  expect(await read('copy/deep/spéctrum notes.md')).toBe('δ\n');
+  expect(await read('copy/deep/new.md')).toBe('new\n');
+  // Ctrl+C at the question replaces nothing.
+  await run(page, 'mv -i docs/c.txt docs/b.md');
+  await expect(busy).toHaveText('Answer ↵');
+  await page.locator('#command').press('Control+c'); await expect(busy).toHaveText('↵');
+  expect(await read('docs/b.md')).toBe('alpha\nbeta\n');
+  expect((await request.head(file(base + '/docs/c.txt'), { headers })).status()).toBe(200);
+});

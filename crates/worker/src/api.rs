@@ -276,6 +276,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                         overwrite: begin.overwrite,
                         if_match: begin.if_match,
                         if_none_match: begin.if_none_match,
+                        mode: None,
                     },
                 )
             })
@@ -319,6 +320,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                         overwrite: start.overwrite,
                         if_match: start.if_match,
                         if_none_match: None,
+                        mode: None,
                     },
                 )
             })
@@ -394,7 +396,11 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                         400,
                     );
                 }
-                Reply::ok(json!({"key": chunk_key(&id, index), "mime": mime(&file.target)}))
+                let (path, _) = match destination(db, &who, &file) {
+                    Ok(found) => found,
+                    Err(reply) => return reply,
+                };
+                Reply::ok(json!({"key": chunk_key(&id, index), "mime": mime(&path)}))
             })
         }
         (Method::Post, "/internal/upload/commit") => {
@@ -625,7 +631,11 @@ fn job_reply(
                 .flatten()
                 .filter_map(Value::as_str)
             {
-                if let Some(node) = db.node(path) {
+                // What lies where the job may not look is never told, not even whether it is
+                // there: writing it fails, as for a path that is not.
+                if db.traverse(&actor, path).is_ok()
+                    && let Some(node) = db.node(path)
+                {
                     existing.insert(
                         path.into(),
                         json!(if node.directory { "directory" } else { "file" }),
@@ -642,6 +652,8 @@ fn job_reply(
         (Method::Post, "/internal/job/begin") => {
             let path = body["path"].as_str().unwrap_or_default().to_string();
             let replace = body["replace"] == true;
+            // Only where the job may look is it told what is there.
+            acl!(db.traverse(&actor, &path), &actor);
             if let Some(node) = db.node(&path) {
                 if node.directory {
                     return Reply::error(
@@ -665,6 +677,7 @@ fn job_reply(
                     overwrite: replace,
                     if_match: None,
                     if_none_match: None,
+                    mode: body["mode"].as_u64().map(|m| (m & 0o777) as u16),
                 },
             )
         }
@@ -770,6 +783,8 @@ struct Begun {
     overwrite: bool,
     if_match: Option<String>,
     if_none_match: Option<String>,
+    /// The mode a new file gets, if not 644, as one extracted from an archive.
+    mode: Option<u16>,
 }
 
 /// Start writing to `path`: a new file appears at once, still uploading, and can be read as it
@@ -783,6 +798,7 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
         overwrite,
         if_match,
         if_none_match,
+        mode,
     } = begin;
     acl!(db.traverse(who, path), who);
     if path == "/" {
@@ -810,6 +826,7 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
         return Reply::ok(json!({
             "id": file.id, "created": true, "resumed": true, "size": size,
             "chunk_size": file.chunk_size, "committed": committed,
+            "mode": old.as_ref().map(|n| n.mode),
         }));
     }
     if old.is_none() && if_match.is_some() {
@@ -851,13 +868,20 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
         now,
     );
     db.set_expiry("upload", &id, now + UPLOAD_TTL);
-    if old.is_none() {
-        db.set_node(
-            path,
-            &Node::file(who.id, who.group, 0o644, id.clone(), size),
-        );
-    }
-    Reply::ok(json!({"id":id,"created":old.is_none(),"size":size,"chunk_size":chunk_size.max(1)}))
+    // A new file has its mode from the start, so that nobody reads it as it arrives who may not
+    // once it is there; an overwritten one keeps its own.
+    let mode = match &old {
+        Some(old) => old.mode,
+        None => {
+            let mode = mode.unwrap_or(0o644);
+            db.set_node(path, &Node::file(who.id, who.group, mode, id.clone(), size));
+            mode
+        }
+    };
+    Reply::ok(json!({
+        "id": id, "created": old.is_none(), "size": size, "chunk_size": chunk_size.max(1),
+        "mode": mode,
+    }))
 }
 
 /// Record `chunk`, an index and the object written for it, as part of upload `id`, and complete
@@ -887,16 +911,19 @@ fn commit_upload(
         Some(file) if index >= file.chunk_count() => {
             Some(Reply::error("Chunk index is out of range", 400))
         }
-        Some(_) => match db.committed_hash(id, index) {
-            // Sent again: the chunk committed first stays.
-            Some(hash) if hash.is_none() || sha256.is_none() || hash == sha256 => {
-                Some(Reply::ok(json!({"committed":index})))
-            }
-            Some(_) => Some(Reply::error(
-                &format!("Chunk {index} was already committed with other content"),
-                409,
-            )),
-            None => None,
+        Some(file) => match destination(db, who, &file) {
+            Err(reply) => Some(reply),
+            Ok(_) => match db.committed_hash(id, index) {
+                // Sent again: the chunk committed first stays.
+                Some(hash) if hash.is_none() || sha256.is_none() || hash == sha256 => {
+                    Some(Reply::ok(json!({"committed":index})))
+                }
+                Some(_) => Some(Reply::error(
+                    &format!("Chunk {index} was already committed with other content"),
+                    409,
+                )),
+                None => None,
+            },
         },
     };
     if let Some(reply) = refused {
@@ -928,26 +955,16 @@ fn finish_upload(db: &mut Db, who: &Identity, id: &str, complete: bool) -> Reply
     if !complete {
         return Reply::ok(json!({"committed":null}));
     }
+    let (path, node) = match destination(db, who, &file) {
+        Ok(found) => found,
+        Err(reply) => return reply,
+    };
     if db.chunks(id).len() as u64 != file.chunk_count() {
         return Reply::error("Upload is missing chunks", 409);
     }
-    if let Some(base) = &file.base {
-        // Swap the content only if nobody replaced or removed it meanwhile.
-        let current = db.node(&file.target);
-        let Some(node) = current.filter(|n| n.file.as_deref() == Some(base.as_str())) else {
-            db.drop_file(id);
-            return Reply::error(
-                "File changed in another session during the upload; reopen it",
-                412,
-            )
-            .keep();
-        };
-        if let Err(message) = db.access(who, &file.target, WRITE) {
-            db.drop_file(id);
-            return denied(&message, who).keep();
-        }
+    if file.base.is_some() {
         db.set_node(
-            &file.target,
+            &path,
             &Node {
                 file: Some(id.into()),
                 size: file.size,
@@ -956,8 +973,50 @@ fn finish_upload(db: &mut Db, who: &Identity, id: &str, complete: bool) -> Reply
         );
     }
     db.finish_file(id);
-    Reply::ok(json!({"path":file.target,"size":file.size,"etag":file.etag()}))
+    Reply::ok(json!({"path":path,"size":file.size,"etag":file.etag()}))
         .status(if file.base.is_none() { 201 } else { 200 })
+}
+
+/// Where upload `file` writes, and the node there, if `who` may still write it: every chunk and
+/// the completion ask again, as permissions may have changed since the upload began. A new file
+/// is written at its node, wherever it was moved, while `who` may reach it, and owns it, as one
+/// who created a file goes on writing it, or may write it. An overwrite is written while `who`
+/// may write the file at its target, and that file is still the one it replaces; once it is not,
+/// the upload can never complete, and is dropped.
+fn destination(
+    db: &mut Db,
+    who: &Identity,
+    file: &File,
+) -> std::result::Result<(String, Node), Reply> {
+    let path = match &file.base {
+        Some(_) => file.target.clone(),
+        None => db
+            .showing(&file.id)
+            .pop()
+            .ok_or_else(|| Reply::error("Upload was cancelled or has expired", 409))?,
+    };
+    // What is there is not for those who may not reach it.
+    db.traverse(who, &path)
+        .map_err(|message| denied(&message, who))?;
+    let denial = || denied(&format!("Permission denied: {path}"), who);
+    match (&file.base, db.node(&path)) {
+        (Some(base), Some(node)) if node.file.as_ref() == Some(base) => {
+            if !who.allows(&node, WRITE) {
+                return Err(denial());
+            }
+            Ok((path, node))
+        }
+        (Some(_), _) => {
+            db.drop_file(&file.id);
+            Err(Reply::error(
+                "File changed in another session during the upload; reopen it",
+                412,
+            )
+            .keep())
+        }
+        (None, Some(node)) if node.owner == who.id || who.allows(&node, WRITE) => Ok((path, node)),
+        (None, _) => Err(denial()),
+    }
 }
 
 /// Abandon an upload: a new file disappears, an overwritten one keeps its old content.

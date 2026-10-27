@@ -54,13 +54,10 @@ futures = "0.3"
 regex = { version = "1.13", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
 # Uploads hash files, to resume them and so that R2 checks every chunk.
 sha2 = "0.10"
-# File previews: sanitized Markdown with maths as MathML, CSV tables, and ZIP and tar listings; PDF
-# pages, diagrams and highlighted code come from the preview workers.
+# File previews: sanitized Markdown with maths as MathML, and CSV tables; PDF pages, archive
+# listings, diagrams and highlighted code come from the preview workers.
 ammonia = "4.2"
 csv = "1.4"
-flate2 = "1.1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 pulldown-latex = "0.8"
-tar = { version = "0.4", default-features = false }
 terminal-worker-preview = { path = "../preview" }
-zip = { version = "9.1", default-features = false }

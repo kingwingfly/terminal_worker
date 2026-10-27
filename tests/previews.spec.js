@@ -88,6 +88,7 @@ test('Rust previews: highlighted code, diagrams, maths, links within the filesys
   await run(page,'open '+base+'/data.csv');await expect(page.locator('.table-preview td')).toHaveText(['Doe, Jane','admin','Bob','user']);await close(page);
   await run(page,'open '+base+'/bundle.zip');await expect(page.locator('.archive li',{hasText:'src/main.rs'})).toBeVisible();await close(page);
   await run(page,'open '+base+'/bundle.tar.gz');await expect(page.locator('.archive li',{hasText:'docs/a.txt'})).toBeVisible();await close(page);
+  expect(loaded).toContain('preview_archive');
   await run(page,'open '+base+'/contact.vcf');await expect(page.locator('.card h3')).toHaveText('Jane Doe');await close(page);
   await run(page,'open '+base+'/event.ics');await expect(page.locator('.card dd',{hasText:'2026-10-28 14:00 UTC'})).toBeVisible();await close(page);
   await run(page,'open '+base+'/change.diff');await expect(page.locator('.diff-added')).toHaveText('+new line');await close(page);
@@ -144,6 +145,41 @@ test('a link opens another file with a way back; slides, PDFs and text open wher
   await close(page);
   await run(page,'open '+base+'/long.txt');await expect(page.locator('.text-preview')).toBeVisible();
   await expect.poll(()=>page.locator('#viewer-content').evaluate(content=>content.scrollTop)).toBeGreaterThan(1500);
+  await close(page);
+ }finally{await request.delete(file(base)+'&recursive=true',{headers});}
+});
+
+// A gzipped tar of one member of `size` zero bytes: gzip members of a mebibyte each, which a
+// decompressor reads one after another, so that it is small to make and to send.
+function expanding(size){
+ const header=Buffer.alloc(512);
+ header.write('large.txt',0);header.write('0000644\0',100);header.write('0000000\0',108);header.write('0000000\0',116);header.write(size.toString(8).padStart(11,'0')+'\0',124);header.write('00000000000\0',136);header.write('        ',148);header.write('0',156);header.write('ustar\0',257);header.write('00',263);
+ let sum=0;for(const byte of header)sum+=byte;header.write(sum.toString(8).padStart(6,'0')+'\0 ',148);
+ const mebibyte=gzipSync(Buffer.alloc(1<<20)),whole=Math.floor(size/(1<<20)),rest=size-whole*(1<<20);
+ return Buffer.concat([gzipSync(header),...Array(whole).fill(mebibyte),gzipSync(Buffer.alloc(rest+(512-size%512)%512+1024))]);
+}
+
+test('an archive is listed off the page, within what it may expand to; a worker that cannot start says so, and starts again',async({page,context,request})=>{
+ const base='/preview-workers-'+Date.now();await request.post('/api/login',{headers,data:{password}});await request.post('/api/mkdir?path='+base,{headers});
+ try{
+  expect((await request.put(file(base+'/expanded.tgz'),{headers,data:expanding(1_200_000_000)})).status()).toBe(201);
+  expect((await request.put(file(base+'/one.pdf'),{headers,data:pdf()})).status()).toBe(201);
+  await context.route('**/preview_pdf_bg.wasm',route=>route.fulfill({status:404,body:'gone'}));
+  await page.goto('/');
+  await page.evaluate(()=>{window.longest=0;new PerformanceObserver(list=>{for(const task of list.getEntries())window.longest=Math.max(window.longest,task.duration);}).observe({type:'longtask'});});
+  // While its worker reads it, the page goes on: the preview closes at once.
+  await run(page,'open '+base+'/expanded.tgz');await expect(page.locator('#viewer-content')).toContainText('Listing the archive...');
+  const closing=Date.now();await close(page);expect(Date.now()-closing).toBeLessThan(2000);
+  await run(page,'open '+base+'/expanded.tgz');
+  await expect(page.locator('#viewer-content .no-preview')).toHaveText('Could not list the archive: the archive expands to more than 1 GB, more than the terminal lists',{timeout:60_000});
+  await close(page);
+  expect(await page.evaluate(()=>window.longest)).toBeLessThan(1000);
+  // Its code missing, the PDF worker says why; once it is there, the next PDF opens.
+  await run(page,'open '+base+'/one.pdf');
+  await expect(page.locator('.pdf-toolbar [role=status]')).toContainText('Could not open PDF: the preview could not start',{timeout:30_000});
+  await close(page);
+  await context.unroute('**/preview_pdf_bg.wasm');
+  await run(page,'open '+base+'/one.pdf');await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('1 / 1');await expect(page.locator('.pdf-page')).toBeVisible();
   await close(page);
  }finally{await request.delete(file(base)+'&recursive=true',{headers});}
 });

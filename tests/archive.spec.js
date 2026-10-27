@@ -1,5 +1,6 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { crc32 } from 'node:zlib';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -23,6 +24,33 @@ test.afterEach(async ({ request }) => {
   await request.post('/api/command', { headers, data: { args: ['chmod', '755', base + '/ro'] } });
   await request.delete(file(base) + '&recursive=true', { headers });
 });
+
+// A ZIP of stored files, as a system without Unix modes makes one, and a tar of
+// [name, text, mode, directory], as their formats lay them out.
+function zipOf(files) {
+  const parts = [], central = []; let offset = 0;
+  for (const [name, text] of files) {
+    const data = Buffer.from(text), path = Buffer.from(name), crc = crc32(data);
+    const local = Buffer.alloc(30); local.writeUInt32LE(0x04034b50, 0); local.writeUInt16LE(20, 4); local.writeUInt32LE(crc, 14); local.writeUInt32LE(data.length, 18); local.writeUInt32LE(data.length, 22); local.writeUInt16LE(path.length, 26);
+    const entry = Buffer.alloc(46); entry.writeUInt32LE(0x02014b50, 0); entry.writeUInt16LE(20, 4); entry.writeUInt16LE(20, 6); entry.writeUInt32LE(crc, 16); entry.writeUInt32LE(data.length, 20); entry.writeUInt32LE(data.length, 24); entry.writeUInt16LE(path.length, 28); entry.writeUInt32LE(offset, 42);
+    parts.push(local, path, data); central.push(entry, path); offset += 30 + path.length + data.length;
+  }
+  const directory = Buffer.concat(central), end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(files.length, 8); end.writeUInt16LE(files.length, 10); end.writeUInt32LE(directory.length, 12); end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...parts, directory, end]);
+}
+function tarOf(members) {
+  const blocks = [];
+  for (const [name, text, mode, directory] of members) {
+    const data = Buffer.from(text), header = Buffer.alloc(512);
+    header.write(name, 0); header.write(mode.toString(8).padStart(7, '0') + '\0', 100); header.write('0000000\0', 108); header.write('0000000\0', 116);
+    header.write(data.length.toString(8).padStart(11, '0') + '\0', 124); header.write('00000000000\0', 136); header.write('        ', 148);
+    header.write(directory ? '5' : '0', 156); header.write('ustar\0', 257); header.write('00', 263);
+    let sum = 0; for (const byte of header) sum += byte; header.write(sum.toString(8).padStart(6, '0') + '\0 ', 148);
+    blocks.push(header, data, Buffer.alloc((512 - data.length % 512) % 512));
+  }
+  return Buffer.concat([...blocks, Buffer.alloc(1024)]);
+}
 
 const form = page => page.locator('#command').locator('xpath=ancestor::form');
 async function run(page, text, { wait = true } = {}) {
@@ -128,4 +156,50 @@ test('Ctrl+C stops an extraction between files, and a closed tab leaves its job 
   await expect.poll(async () => (await ls(request, base + '/detached/docs/many')).length, { timeout: 180_000 }).toBe(40);
   await run(page, 'jobs');
   await expect(transcript(page).locator('pre').last()).toContainText('cancelled');
+});
+
+test('extracting nothing ends at once and says why; modes are those archived, 000 too; long listings come whole', async ({ page, request }) => {
+  const put = async (name, data) => expect((await request.put(file(base + '/' + name), { headers, data })).status()).toBe(201);
+  await put('empty.zip', zipOf([])); await put('empty.tar', tarOf([])); await put('one.zip', zipOf([['a.txt', 'a']]));
+  await put('modes.tar', tarOf([['normal.txt', 'new', 0o644], ['private.txt', 'new', 0], ['private-dir', '', 0, true]]));
+  await put('many.zip', zipOf(Array.from({ length: 700 }, (_, i) => [String(i).padStart(4, '0') + '.txt', 'x'])));
+  await terminal(page);
+  // Each ends once, rather than plan again and again.
+  const ends = async text => { await run(page, text, { wait: false }); await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 120_000 }); };
+  await ends('unzip -d out empty.zip');
+  await expect(transcript(page)).toContainText('warning [' + base + '/empty.zip]:  zipfile is empty');
+  await run(page, 'mkdir none'); await ends('tar -xf empty.tar -C none');
+  await ends('unzip one.zip missing.txt -d out');
+  await expect(transcript(page)).toContainText('caution: filename not matched:  missing.txt');
+  await ends('tar -xf modes.tar -C none private.txt nothing.txt');
+  await expect(transcript(page)).toContainText('tar: nothing.txt: Not found in archive');
+  expect(await transcript(page).evaluate(e => e.textContent.split('zipfile is empty').length - 1)).toBe(1);
+  // The modes archived, less group and other write; 644 for a file a zip says none of.
+  await run(page, 'mkdir dest');
+  expect((await request.put(file(base + '/dest/normal.txt'), { headers, data: 'old' })).status()).toBe(201);
+  expect((await request.post('/api/command', { headers, data: { args: ['chmod', '755', base + '/dest/normal.txt'] } })).ok()).toBe(true);
+  await ends('tar -xf modes.tar -C dest'); await ends('unzip -q one.zip -d dest');
+  const modes = Object.fromEntries((await ls(request, base + '/dest')).map(e => [e.name, e.mode]));
+  expect(modes).toEqual({ 'normal.txt': 0o644, 'private.txt': 0, 'private-dir': 0, 'a.txt': 0o644 });
+  const guest = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { 'CF-Connecting-IP': 'archive-guest-' + base } });
+  expect((await guest.get(file(base + '/dest/private.txt'))).status()).toBe(401);
+  await guest.dispose();
+  // A job's output comes page after page, to its end.
+  await ends('unzip -l many.zip | wc -l');
+  await expect(transcript(page).locator('pre').last()).toHaveText('705');
+});
+
+test('extraction tells a guest nothing of what lies where it may not look', async ({ page, request }) => {
+  expect((await request.post('/api/mkdir?path=' + encodeURIComponent(base + '/shared/private'), { headers })).ok()).toBe(true);
+  expect((await request.post('/api/command', { headers, data: { args: ['chmod', '777', base + '/shared'] } })).ok()).toBe(true);
+  expect((await request.post('/api/command', { headers, data: { args: ['chmod', '700', base + '/shared/private'] } })).ok()).toBe(true);
+  expect((await request.put(file(base + '/shared/private/exists.txt'), { headers, data: 'kept' })).status()).toBe(201);
+  expect((await request.put(file(base + '/probe.zip'), { headers, data: zipOf([['private/exists.txt', 'x'], ['private/missing.txt', 'y']]) })).status()).toBe(201);
+  await page.goto('/');
+  // Not asked whether to replace the file that is there: both fail alike.
+  await run(page, `unzip ${base}/probe.zip -d ${base}/shared`, { wait: false });
+  await expect(form(page).locator('.busy')).toHaveText('↵', { timeout: 120_000 });
+  await expect(transcript(page)).not.toContainText('replace ');
+  for (const name of ['exists.txt', 'missing.txt']) await expect(transcript(page)).toContainText(`${base}/shared/private/${name}: Permission denied`);
+  expect(await (await request.get(file(base + '/shared/private/exists.txt'), { headers })).text()).toBe('kept');
 });

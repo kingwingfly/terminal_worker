@@ -118,6 +118,25 @@ pub fn serve_pdf() {
     });
 }
 
+/// Serve [`Worker::Archive`](crate::Worker::Archive)'s requests.
+#[cfg(feature = "archive")]
+pub fn serve_archive() {
+    use js_sys::Uint8Array;
+
+    serve(|method, arguments| match method {
+        "list" => {
+            let bytes = Uint8Array::new(&arguments.get(0)).to_vec();
+            let (members, more) = crate::archive::list(&bytes)?;
+            let listed: Array = members
+                .into_iter()
+                .map(|m| Array::of3(&m.path.into(), &(m.size as f64).into(), &m.directory.into()))
+                .collect();
+            Ok(Reply::new(Array::of2(&listed, &more.into())))
+        }
+        _ => Err(format!("no method {method}")),
+    });
+}
+
 /// Serve [`Worker::Diagram`](crate::Worker::Diagram)'s requests.
 #[cfg(feature = "diagram")]
 pub fn serve_diagram() {

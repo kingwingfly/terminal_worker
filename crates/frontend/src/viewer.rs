@@ -201,7 +201,7 @@ fn render(preview: Preview, path: String) -> AnyView {
             }
             .into_any(),
             Kind::Table(table) => table_view(table),
-            Kind::Archive(entries) => archive_view(entries),
+            Kind::Archive => view! { <ArchiveView data /> }.into_any(),
             Kind::Cards(cards) => cards_view(cards),
             Kind::Diff(lines) => {
                 let diff = diff_view(lines);
@@ -968,12 +968,34 @@ fn table_view(table: preview::Table) -> AnyView {
     .into_any()
 }
 
-fn archive_view(entries: Vec<preview::Entry>) -> AnyView {
+/// The members of the archive `data`, as its worker lists them.
+#[component]
+fn ArchiveView(data: Vec<u8>) -> impl IntoView {
+    let listed = RwSignal::new(None::<Result<(Vec<preview::Entry>, bool), String>>);
+    spawn_local(async move {
+        let result = workers::list_archive(&data).await;
+        listed.try_set(Some(result));
+    });
+    move || match listed.get() {
+        None => view! { <p class="preview-note">"Listing the archive..."</p> }.into_any(),
+        Some(Ok((entries, more))) => archive_view(entries, more),
+        Some(Err(e)) => view! {
+            <div class="media-frame">
+                <p class="no-preview">{format!("Could not list the archive: {e}")}</p>
+            </div>
+        }
+        .into_any(),
+    }
+}
+
+/// `entries`, and whether the archive has more, which do not show.
+fn archive_view(entries: Vec<preview::Entry>, more: bool) -> AnyView {
     let files = entries.iter().filter(|entry| !entry.directory).count();
     let total: u64 = entries.iter().map(|entry| entry.size).sum();
+    let first = if more { "The first " } else { "" };
     view! {
         <div class="archive">
-            <p class="preview-note">{format!("{files} files, {} unpacked", size(total))}</p>
+            <p class="preview-note">{format!("{first}{files} files, {} unpacked", size(total))}</p>
             <ul>
                 {entries
                     .into_iter()

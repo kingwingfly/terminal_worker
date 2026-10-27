@@ -149,6 +149,17 @@ fn wants_help(args: &[String]) -> bool {
         .take_while(|arg| arg.as_str() != "--")
         .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
 }
+/// Whether `args` are mv or cp -i, under sudo or not, which ask before replacing a file: run
+/// one by one, never in a batch, however xargs or fd -x start them.
+fn asks(args: &[String]) -> bool {
+    let args = &args[usize::from(args.first().is_some_and(|a| a == "sudo"))..];
+    matches!(args.first().map(String::as_str), Some("mv" | "cp"))
+        && args
+            .iter()
+            .skip(1)
+            .take_while(|a| a.as_str() != "--")
+            .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('i'))
+}
 /// A listing as text, as ls writes into a pipe: one name a line.
 fn listing_text(entries: &[Entry], long: bool) -> String {
     entries
@@ -363,6 +374,11 @@ impl Shell {
                     self.log(text);
                 }
             }
+            // A page at a time: what a job wrote before it ended is all read before it is
+            // taken to have ended.
+            if view["more"] == true {
+                continue;
+            }
             match view["state"].as_str().unwrap_or_default() {
                 "done" => {
                     out.failed |= view["progress"]["errors"].as_u64().is_some_and(|e| e > 0);
@@ -543,7 +559,9 @@ impl Shell {
             return Output::default();
         };
         if BATCHED.contains(&first[0].as_str())
-            && commands.iter().all(|c| c[0] == first[0] && !wants_help(c))
+            && commands
+                .iter()
+                .all(|c| c[0] == first[0] && !wants_help(c) && !asks(c))
         {
             return self.batch(commands, trace).await;
         }
@@ -752,64 +770,43 @@ impl Shell {
         self.asking.set(false);
         answer
     }
-    /// mv or cp -i: ask before replacing each existing file.
+    /// mv or cp -i, under sudo too: the server does what replaces nothing, and names each file
+    /// that exists, which this asks about, in turn, before replacing it as the same account.
     async fn interactive(self, args: &[String]) -> Result<Output, String> {
-        let command = args[0].clone();
+        let sudo = usize::from(args[0] == "sudo");
+        let command = args[sudo].clone();
+        // The options again, for each replacement, less -i, which may come with others, as in -ri.
         let mut options = Vec::new();
-        let mut operands = Vec::new();
-        let mut ended = false;
-        for arg in &args[1..] {
-            if !ended && arg == "--" {
-                ended = true;
-            } else if !ended && arg.starts_with('-') && arg.len() > 1 {
-                // -i may come with others, as in -ri.
+        for arg in args[sudo + 1..].iter().take_while(|a| a.as_str() != "--") {
+            if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 1 {
                 let rest: String = arg[1..].chars().filter(|c| *c != 'i').collect();
                 if !rest.is_empty() {
                     options.push(format!("-{rest}"));
                 }
-            } else {
-                operands.push(arg.clone());
             }
         }
-        let Some((dest, sources)) = operands.split_last().filter(|(_, s)| !s.is_empty()) else {
-            return Err(format!("Usage: {command} -i [OPTION...] SOURCE... DEST"));
-        };
-        let dest = self.path(dest)?;
-        let into = request(&endpoint("stat", &dest), "GET")
-            .await
-            .is_ok_and(|v| v["directory"] == true);
-        if sources.len() > 1 && !into {
-            return Err(format!("{command}: target '{dest}' is not a directory"));
-        }
-        let mut out = Output::default();
-        for source in sources {
+        let value = self.call(args).await?;
+        let mut out = self.output(&value, true)?;
+        for pair in value["existing"].as_array().into_iter().flatten() {
             if self.cancelled() {
                 break;
             }
-            let src = self.path(source)?;
-            let target = if into {
-                let name = src.rsplit('/').next().unwrap_or_default();
-                if dest == "/" {
-                    format!("/{name}")
-                } else {
-                    format!("{dest}/{name}")
-                }
-            } else {
-                dest.clone()
+            let (Some(src), Some(target)) = (pair[0].as_str(), pair[1].as_str()) else {
+                continue;
             };
-            let mut run: Vec<String> = std::iter::once(command.clone())
-                .chain(options.iter().cloned())
-                .collect();
-            if request(&endpoint("stat", &target), "GET").await.is_ok() {
-                let answer = self
-                    .ask(format!("{command}: overwrite '{target}'? (y/n)"))
-                    .await;
-                if !answer.trim().to_lowercase().starts_with('y') {
-                    continue;
-                }
-                run.push("-f".into());
+            let answer = self
+                .ask(format!("{command}: overwrite '{target}'? (y/n)"))
+                .await;
+            if self.cancelled() || !answer.trim().to_lowercase().starts_with('y') {
+                continue;
             }
-            run.extend(["--".into(), src, target]);
+            let run: Vec<String> = args[..sudo]
+                .iter()
+                .cloned()
+                .chain([command.clone()])
+                .chain(options.iter().cloned())
+                .chain(["-f", "--", src, target].map(String::from))
+                .collect();
             match self.call(&run).await.and_then(|v| self.output(&v, true)) {
                 Ok(o) => {
                     out.stdout.push_str(&o.stdout);
@@ -821,6 +818,7 @@ impl Shell {
                 }
             }
         }
+        out.failed |= self.cancelled();
         self.refresh().await?;
         Ok(out)
     }
@@ -840,11 +838,6 @@ impl Shell {
             if wants_help(&args) {
                 return self.manage(&args, piped).await;
             }
-            let interactive = args
-                .iter()
-                .skip(1)
-                .take_while(|a| a.as_str() != "--")
-                .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('i'));
             let several = args.len() > 2 || args.get(1).is_some_and(|s| s.starts_with('-'));
             match cmd.as_str() {
                 "echo" => {
@@ -864,7 +857,7 @@ impl Shell {
                 {
                     self.fd_exec(&args).await
                 }
-                "mv" | "cp" if interactive => self.interactive(&args).await,
+                _ if asks(&args) => self.interactive(&args).await,
                 "jobs" => self.jobs(&args).await,
                 c if SERVER.contains(&c) || (matches!(c, "ls" | "mkdir") && several) => {
                     self.manage(&args, piped).await

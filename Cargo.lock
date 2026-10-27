@@ -3842,12 +3842,15 @@ dependencies = [
  "arborium-yaml",
  "arborium-zig",
  "console_error_panic_hook",
+ "flate2",
  "hayro",
  "js-sys",
  "merman",
  "serde_json",
+ "tar",
  "wasm-bindgen",
  "web-sys",
+ "zip",
 ]
 
 [[package]]
@@ -3857,7 +3860,6 @@ dependencies = [
  "ammonia",
  "console_error_panic_hook",
  "csv",
- "flate2",
  "futures",
  "gloo-net",
  "js-sys",
@@ -3869,13 +3871,11 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_json",
  "sha2 0.10.9",
- "tar",
  "terminal-worker-core",
  "terminal-worker-preview",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "zip",
 ]
 
 [[package]]

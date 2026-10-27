@@ -6,13 +6,17 @@
 //! to start them. The engines are features, each a worker's:
 //!
 //! - `pdf`: [`pdf`], PDF pages as pixels, drawn by hayro.
+//! - `archive`: [`archive`], the members of ZIP and tar archives.
 //! - `diagram`: [`diagram`], Mermaid diagrams as SVG, laid out and drawn by merman.
 //! - `code`: [`code`], code highlighted by tree-sitter, with arborium's grammars.
 //! - `worker`: [`worker`], serving a page's requests in a web worker.
 //!
 //! A page asks a worker `[id, method, ...arguments]`, and it answers `[id, true, value]`, or
-//! `[id, false, error]`; it says [`READY`] once it listens, as what comes before goes unheard.
+//! `[id, false, error]`; it says [`READY`] once it listens, as what comes before goes unheard,
+//! and one that cannot start, as when its code fails to load, answers `[0, false, error]`.
 
+#[cfg(feature = "archive")]
+pub mod archive;
 #[cfg(feature = "code")]
 pub mod code;
 #[cfg(feature = "diagram")]
@@ -35,6 +39,9 @@ pub enum Worker {
     /// `render(document, page, width)`: the page drawn `width` pixels wide, `[width, height,
     /// RGBA pixels]`; `close(document)`.
     Pdf,
+    /// `list(bytes)`: the archive's first members, `[[path, size, directory], ...]`, and whether
+    /// it has more.
+    Archive,
     /// `svg(source)`: the Mermaid diagram `source`, as SVG.
     Diagram,
     /// `highlight(language, text)`: `text`, highlighted as `language`, by its name in
@@ -47,6 +54,7 @@ impl Worker {
     pub fn script(self) -> &'static str {
         match self {
             Self::Pdf => "/preview_pdf_loader.js",
+            Self::Archive => "/preview_archive_loader.js",
             Self::Diagram => "/preview_diagram_loader.js",
             Self::Code(Group::Web) => "/preview_code_web_loader.js",
             Self::Code(Group::Systems) => "/preview_code_systems_loader.js",

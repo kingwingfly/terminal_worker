@@ -1,8 +1,8 @@
 //! The previews' web workers, of [`terminal_worker_preview`], each started when a preview first
-//! needs it: PDF pages, Mermaid diagrams, and code, highlighted by four workers, a group of
-//! languages each. A call waits for its worker to be ready, however long it takes to load; one
+//! needs it: PDF pages, archive listings, Mermaid diagrams, and code, highlighted by four
+//! workers, a group of languages each. A call waits for its worker to be ready, however long it takes to load; one
 //! that then takes more than [`TIMEOUT`], as a file might make it, stops the worker, failing what
-//! it was doing, and the next call starts it again.
+//! it was doing, and the next call starts it again, as it does after a worker failed to start.
 
 use std::{
     cell::{Cell, RefCell},
@@ -16,6 +16,7 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{Event, ImageData, MessageEvent};
 
+use crate::preview::Entry;
 use crate::viewer::js_error;
 
 /// How long a worker may take to answer: drawing a page or highlighting a file of the most it
@@ -90,9 +91,19 @@ fn running(kind: Worker) -> Result<Rc<Running>, String> {
                 return;
             }
             let reply = Array::from(&data);
-            if let Some(id) = reply.get(0).as_f64() {
-                calls.settle(id as u32, reply.get(1).is_truthy(), &reply.get(2));
+            let Some(id) = reply.get(0).as_f64() else {
+                return;
+            };
+            let ok = reply.get(1).is_truthy();
+            if id == 0.0 && !ok {
+                // It cannot start: stop it, later, as stopping drops this handler, failing what
+                // waits for it, so that the next call starts it again.
+                let reason = format!("the preview could not start: {}", failure(reply.get(2)));
+                let calls = calls.clone();
+                spawn_local(async move { stop(kind, &calls, &reason) });
+                return;
             }
+            calls.settle(id as u32, ok, &reply.get(2));
         })
     };
     let on_error = {
@@ -213,6 +224,34 @@ pub async fn highlight(language: &Language, text: &str) -> Result<String, String
     .0
     .as_string()
     .ok_or_else(|| "no HTML".to_string())
+}
+
+/// The first members of the archive `data`, and whether it has more. Off the page's thread, as
+/// a gzipped tar is decompressed whole to list it.
+pub async fn list_archive(data: &[u8]) -> Result<(Vec<Entry>, bool), String> {
+    let bytes = Uint8Array::from(data);
+    let transfer = Array::of1(&bytes.buffer());
+    let (reply, _) = call(
+        Worker::Archive,
+        None,
+        "list",
+        &[bytes.into()],
+        Some(transfer),
+    )
+    .await?;
+    let reply = Array::from(&reply);
+    let entries = Array::from(&reply.get(0))
+        .iter()
+        .map(|member| {
+            let member = Array::from(&member);
+            Entry {
+                path: member.get(0).as_string().unwrap_or_default(),
+                size: member.get(1).as_f64().unwrap_or(0.0) as u64,
+                directory: member.get(2).is_truthy(),
+            }
+        })
+        .collect();
+    Ok((entries, reply.get(1).is_truthy()))
 }
 
 /// The Mermaid diagram `source`, as SVG.
