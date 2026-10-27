@@ -97,7 +97,7 @@ Create `/shared/result.md` before the example chmod. All passwords are entered i
 
 ### Command reference
 
-Every command supports `-h` and `--help`, sharing the manual used by `man COMMAND`. Help runs before authentication or side effects, including `sudo chmod -h`. `--` terminates help/option interpretation where supported, as in `rm -- -h`.
+Every command supports `-h` and `--help`, generated, as is its page in `man COMMAND`, from the command's definition (`crates/core/src/cli`), which also parses its arguments. A wrong argument gets one line saying what was wrong, such as `rm: missing PATH...; rm -h shows how to use it`. Help runs before authentication or side effects, including `sudo chmod -h`. `--` terminates help/option interpretation where supported, as in `rm -- -h`.
 
 | Command | Implemented syntax |
 | --- | --- |
@@ -279,17 +279,16 @@ The manifest can select only a build-time registered entry. Its read permissions
 
 | Path | Responsibility |
 | --- | --- |
-| `crates/core` / `terminal-worker-core` | Paths, parsing, pipelines, text filters, fd matching, completion, permission rules over a `Store`, HTTP Range |
-| `crates/frontend` / `terminal-worker-ui` | Leptos CSR terminal: tabs (`lib.rs`), the shell and its pipelines (`shell.rs`), upload hashing (`uploads.rs`), file previews (`preview.rs`, `viewer.rs`) |
+| `crates/core` / `terminal-worker-core` | Every command's definition, parser, help and manual page (`cli/`, with clap); paths, pipelines, text filters, fd matching, completion, permission rules over a `Store`, HTTP Range |
+| `crates/frontend` / `terminal-worker-ui` | Leptos CSR terminal: tabs (`lib.rs`), the shell and its pipelines (`shell.rs`), the commands that run in the page (`shell/commands.rs`), upload hashing (`uploads.rs`), file previews (`preview.rs`, `viewer.rs`), man's pages for app.js (`manual.rs`) |
 | `crates/preview` / `terminal-worker-preview` | Preview web workers: PDF pages (hayro), Mermaid diagrams (merman), highlighted code (arborium, four language groups) |
-| `crates/worker` / `terminal-worker` | The Worker streams file bytes (`files.rs`); the `TerminalAuthority` Durable Object decides and records (`api.rs`, `commands.rs`) in SQLite tables (`db.rs`) |
+| `crates/worker` / `terminal-worker` | The Worker streams file bytes (`files.rs`); the `TerminalAuthority` Durable Object decides and records (`api.rs`; the commands it runs, one `ServerCommand` each, in `commands/`) in SQLite tables (`db.rs`) |
 | `web/app.js` | Browser bridge, authentication dialogs, the preview dialog's shell and games, focus handling |
 | `web/upload.mjs` | Chunked, resumable uploads |
 | `crates/archiver` / `terminal-worker-archiver` | The archive container's HTTP server: zip and tar, read and written deterministically |
 | `containers/archiver/Dockerfile` | Its image: a static binary, built from the workspace |
 | `crates/worker/src/runner.rs`, `jobs.rs` | Archive jobs: the `ArchiveRunner` Durable Object, and the authority's side of them |
 | `web/editor.mjs` | Lazy-loaded CodeMirror editor |
-| `web/manual.mjs` | Shared manual and command help |
 | `web/faststart.mjs` | MP4 structural inspection |
 | `scripts/` | Local setup, frontend build, sample seeding |
 | `wrangler.toml` | Worker, assets, FILES R2, AUTHORITY, ARCHIVES (with its container), and rate-limit bindings |

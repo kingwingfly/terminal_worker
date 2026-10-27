@@ -55,8 +55,8 @@ test('pipes join filters, fd finds what may be listed, and xargs and fd -x run c
   await run(page, 'fd -e tmp | xargs rm');
   await expect.poll(async () => (await (await request.get('/api/ls?path=' + encodeURIComponent(base))).json()).entries.map(e => e.name)).toEqual(['.hidden', 'docs', 'a.md']);
   // xargs with nothing to do still runs once, as GNU xargs does, unless -r.
-  await run(page, 'fd -e none | xargs rm'); await expect(last(page)).toContainText('Usage: rm');
-  expect(await output(page, 'fd -e none | xargs -r rm')).not.toContain('Usage');
+  await run(page, 'fd -e none | xargs rm'); await expect(last(page)).toContainText('rm: missing PATH');
+  expect(await output(page, 'fd -e none | xargs -r rm')).not.toContain('missing');
 });
 
 test('wildcards expand to sorted paths as bash expands them, and rm -rf * empties a directory', async ({ page, request }) => {

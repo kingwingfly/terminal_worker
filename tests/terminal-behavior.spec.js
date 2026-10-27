@@ -62,7 +62,7 @@ test('rm requires explicit login, handles quoted paths, refreshes lists and refu
   const base = '/rm-ui-' + Date.now();
   await page.goto('/');
   await command(page, 'rm');
-  await expect(page.locator('.transcript pre').last()).toContainText('Usage: rm');
+  await expect(page.locator('.transcript pre').last()).toContainText('rm: missing PATH');
   await command(page, 'su root');
   await expect(page.locator('#auth')).toBeVisible();
   await page.getByLabel('Password', { exact: true }).fill(password);

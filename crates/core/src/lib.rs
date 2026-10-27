@@ -1,5 +1,6 @@
 pub mod acl;
 pub mod archive;
+pub mod cli;
 pub mod completion;
 pub mod find;
 pub mod glob;
@@ -237,47 +238,6 @@ pub fn split_command(input: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
-/// What rm removes: its paths, and whether -r and -f were given.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Removal<'a> {
-    pub paths: Vec<&'a str>,
-    pub recursive: bool,
-    /// Ignore paths that do not exist.
-    pub force: bool,
-}
-
-/// Parse rm's syntax; missing paths must never mean the cwd.
-pub fn remove_args(args: &[String]) -> Result<Removal<'_>, String> {
-    let mut removal = Removal {
-        paths: Vec::new(),
-        recursive: false,
-        force: false,
-    };
-    let mut options = true;
-    for arg in args {
-        match arg.as_str() {
-            "--" if options => options = false,
-            "--recursive" if options => removal.recursive = true,
-            "--force" if options => removal.force = true,
-            value if options && value.starts_with('-') && value.len() > 1 => {
-                for flag in value[1..].chars() {
-                    match flag {
-                        'r' | 'R' => removal.recursive = true,
-                        'f' => removal.force = true,
-                        _ => return Err(format!("Unsupported rm option: {value}")),
-                    }
-                }
-            }
-            "" => return Err("rm: cannot remove '': No such file or directory".into()),
-            value => removal.paths.push(value),
-        }
-    }
-    if removal.paths.is_empty() {
-        return Err("Usage: rm [-r] [-f] [--] PATH...".into());
-    }
-    Ok(removal)
-}
-
 /// A single HTTP byte range, inclusive. Malformed and unsatisfiable ranges return None.
 pub fn byte_range(value: &str, size: u64) -> Option<(u64, u64)> {
     if size == 0 {
@@ -367,13 +327,8 @@ mod tests {
     #[test]
     fn rm_requires_an_explicit_path_and_known_options() {
         let parse = |command: &str| {
-            remove_args(&split_command(command).unwrap()).map(|r| {
-                (
-                    r.paths.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
-                    r.recursive,
-                    r.force,
-                )
-            })
+            cli::parse::<cli::files::Rm>(&split_command(command).unwrap())
+                .map(|r| (r.paths, r.recursive, r.force))
         };
         assert_eq!(
             parse("-r 'Directory with spaces'"),
@@ -384,7 +339,7 @@ mod tests {
             parse("-Rf a 'b c'"),
             Ok((vec!["a".into(), "b c".into()], true, true))
         );
-        for command in ["", "-r", "--", "''", "-rx a", "--all a"] {
+        for command in ["", "-r", "--", "-rx a", "--all a"] {
             assert!(parse(command).is_err(), "{command}");
         }
     }

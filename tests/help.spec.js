@@ -1,8 +1,9 @@
 import { test, expect } from '@playwright/test';
-import { readFile } from 'node:fs/promises';
+import { readFile, readdir } from 'node:fs/promises';
 
-const source = await readFile('crates/core/src/completion.rs', 'utf8');
-const commands = [...source.split('pub const COMMANDS:')[1].split('];')[0].matchAll(/"([a-z]+)"/g)].map(match => match[1]);
+// Every command defined for clap in crates/core/src/cli.
+const definitions = await Promise.all((await readdir('crates/core/src/cli')).filter(name => name.endsWith('.rs')).map(name => readFile('crates/core/src/cli/' + name, 'utf8')));
+const commands = definitions.flatMap(source => [...source.matchAll(/#\[command\(\s*name = "([a-z]+)"/g)].map(match => match[1]));
 
 test('every command has side-effect-free help, including privileged and interactive commands', async ({ page }) => {
   await page.goto('/');

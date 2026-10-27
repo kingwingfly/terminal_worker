@@ -1,3 +1,4 @@
+mod manual;
 mod preview;
 mod search;
 mod shell;
@@ -527,6 +528,7 @@ pub fn start() {
     console_error_panic_hook::set_once();
     viewer::register();
     uploads::register();
+    manual::register();
     let root = web_sys::window()
         .unwrap()
         .document()

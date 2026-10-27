@@ -115,27 +115,13 @@ async function sudoAuthenticate() {
     submit: fields => post('sudo', { password: fields.password }) });
 }
 async function accountCommand(args, cwd) {
-  // Help is resolved before authentication or any command effects. -- ends options.
-  const options = args.slice(1, args.indexOf('--') < 0 ? undefined : args.indexOf('--'));
-  // -h is an option of these, as on Linux (no dereference, or tar's dereference), unless alone.
-  // Under sudo, the command's own -h counts.
-  const at = args[0] === 'sudo' && args[1] && !args[1].startsWith('-') ? 1 : 0;
-  const hOption = ['chown', 'chgrp', 'getfattr', 'setfattr', 'tar'].includes(args[at]) && args.length - at > 2;
-  if (options.some(arg => arg === '--help' || (arg === '-h' && !hOption))) {
-    let topic = args[0];
-    if (topic === 'sudo' && args[1] && !args[1].startsWith('-')) topic = args[1];
-    const { help } = await import('./manual.mjs');
-    return { output: help(topic) };
-  }
-  if (args[0] === 'help') {
-    if (args.length > 2) throw new Error('Usage: help [COMMAND]');
-    const manual = await import('./manual.mjs');
-    return { output: args[1] ? manual.help(args[1]) : manual.commands() };
-  }
+  // Help (-h, help) is the terminal's own, from the commands' definitions in Rust, as are the
+  // manual's pages; this shows them.
   if (args[0] === 'man') {
     if (args.length > 2) throw new Error('Usage: man [COMMAND]');
-    const { manual } = await import('./manual.mjs');
-    const text = manual(args[1]); const version = await cleanupViewer(); if (version !== viewerVersion) return {};
+    const text = args[1] ? window.terminalManual.page(args[1]) : window.terminalManual.index();
+    if (text === undefined || text === null) throw new Error(`No manual entry for ${args[1]}. Enter man for the index.`);
+    const version = await cleanupViewer(); if (version !== viewerVersion) return {};
     trail.length = 0; showTrail();
     viewerTitle(args[1] ? 'man · ' + args[1] : 'Terminal Worker · Manual'); $('download').hidden = true;
     const article = document.createElement('article'); article.className = 'markdown manual'; article.innerHTML = window.terminalPreview.markdown(text, '/'); $('viewer-content').replaceChildren(article);

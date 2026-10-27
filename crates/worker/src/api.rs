@@ -784,16 +784,8 @@ fn command_reply(db: &mut Db, key: Option<&str>, mut command: commands::Command)
     let actor = acl!(auth::elevated(db, key, command.sudo), &who);
     // `~` is the signed-in account's home, also under sudo, as the shell expands it before sudo.
     command.home = db.user_by_id(who.id).map(|(_, user)| user.home);
-    let result = if command
-        .args
-        .first()
-        .is_some_and(|c| jobs::ARCHIVERS.contains(&c.as_str()))
-    {
-        jobs::start(db, &actor, who.id, &command)
-    } else {
-        commands::execute(db, &actor, command)
-    };
-    match result {
+    // zip, unzip, tar and faststart start a job, whose owner is who is signed in.
+    match commands::execute(db, &actor, who.id, command) {
         Ok(value) => Reply::ok(value),
         Err(e) => denied(&e, &who),
     }

@@ -1,63 +1,6 @@
 //! Completion matching and tolerant parsing, independent of the browser.
 use crate::Entry;
 
-pub const COMMANDS: &[&str] = &[
-    "man",
-    "vim",
-    "ls",
-    "cd",
-    "pwd",
-    "open",
-    "mkdir",
-    "touch",
-    "rm",
-    "mv",
-    "cp",
-    "fd",
-    "upload",
-    "login",
-    "logout",
-    "exit",
-    "clear",
-    "help",
-    "sudo",
-    "su",
-    "chmod",
-    "chown",
-    "useradd",
-    "usermod",
-    "userdel",
-    "groupadd",
-    "groupmod",
-    "groupdel",
-    "passwd",
-    "id",
-    "whoami",
-    "groups",
-    "users",
-    "echo",
-    "cat",
-    "head",
-    "tail",
-    "grep",
-    "wc",
-    "sort",
-    "uniq",
-    "xargs",
-    "zip",
-    "unzip",
-    "tar",
-    "faststart",
-    "jobs",
-    "ln",
-    "readlink",
-    "chgrp",
-    "getfacl",
-    "setfacl",
-    "getfattr",
-    "setfattr",
-];
-
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub label: String,
@@ -270,8 +213,10 @@ fn query_words(context: &str, words: &[String], typed: &[String], first: bool) -
     let command = words[0].as_str();
     let auto_open = words.len() == 1 && first;
     if words.len() == 1 && (!command.is_empty() || !first) {
-        let mut commands: Vec<_> = COMMANDS
+        // Every command defined, as help lists them.
+        let mut commands: Vec<_> = crate::cli::names()
             .iter()
+            .map(String::as_str)
             .filter_map(|name| {
                 fuzzy_score(command, name).map(|score| {
                     (

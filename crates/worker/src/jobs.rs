@@ -12,9 +12,6 @@ use terminal_worker_core::{MAX_FILE, kind};
 use crate::commands::{self, command_path};
 use crate::db::{Db, Job};
 
-/// The commands that start jobs.
-pub const ARCHIVERS: [&str; 4] = ["zip", "unzip", "tar", "faststart"];
-
 /// An archive a job reads.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Source {
