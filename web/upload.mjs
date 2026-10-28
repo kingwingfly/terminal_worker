@@ -96,7 +96,7 @@ export async function uploadFile(file, destination, { progress = () => {}, signa
   // elsewhere or was cancelled (jobs cancel).
   const heartbeat = setInterval(async () => {
     try { await json(await fetch('/api/uploads/hold?' + held, { method: 'POST' })); }
-    catch (error) { if (error.status === 409 || error.status === 403) { failure ??= error; abort(); } }
+    catch (error) { if ([401, 403, 409].includes(error.status)) { failure ??= error; abort(); } }
   }, HEARTBEAT);
   try {
     await Promise.all(Array.from({ length: Math.min(PARALLEL, pending.length) }, async () => {
@@ -111,8 +111,11 @@ export async function uploadFile(file, destination, { progress = () => {}, signa
       }
     }));
     if (signal.aborted) throw new Cancelled();
+    // The heartbeat may stop the upload between chunks, when none is in flight to fail.
+    if (failure) throw failure;
   } catch (error) {
-    abort();
+    // Not heard from again once it lets go, which a heartbeat after would take back.
+    clearInterval(heartbeat); abort();
     // Only Cancel cancels the upload, and only the one this page holds; chunks stopped because
     // another failed keep it to resume.
     if (signal.aborted || (error instanceof Cancelled && !failure)) {

@@ -381,8 +381,14 @@ fn App() -> impl IntoView {
                 if after == before {
                     return;
                 }
+                // A session that ended leaves the cookie a guest's: one with an account after it
+                // is the new session another window of this browser signed in with, replacing it.
+                let reason = match reason.as_deref() {
+                    Some("ended") if after != "guest" => Some("window"),
+                    reason => reason,
+                };
                 for shell in tabs.get_untracked() {
-                    match reason.as_deref() {
+                    match reason {
                     Some("ended") => shell.log(format!("! Signed out: this session ended elsewhere (signed out, a password changed, the account locked or removed, or expired); now {after}")),
                     Some(_) => shell.log(format!("Account changed to {after} in another window")),
                     None if shell.id != active.get_untracked() => {
@@ -502,9 +508,9 @@ fn App() -> impl IntoView {
                         let linked = entry.link.is_some();
                         // What the account may not open shows dimmed, and says why when clicked.
                         let denied = entry.denied;
-                        let refusal = format!("Permission denied: {} is {} {}:{}", entry.name, entry.mode_line().trim_end(), entry.owner, entry.group);
+                        let refusal = denied.then(|| format!("Permission denied: {} is {} {}:{}", entry.name, entry.mode_line().trim_end(), entry.owner, entry.group));
                         let title = if denied { format!("{title} · permission denied") } else { title };
-                        view! { <button class="file" class:link=linked class:denied=denied aria-disabled=denied.then_some("true") data-kind=if entry.directory { "directory".to_string() } else { entry.kind.clone() } title=title on:click=move |_| { let shell = current.get_untracked(); if denied { shell.notice.set(refusal.clone()) } else { shell.run_from_panel(command.clone()) } }><span class="file-kind">{file_icon(&entry.kind, entry.directory)}</span><span class="filename"><span class="filename-text">{entry.name}{if entry.directory { "/" } else { "" }}</span></span><span class="file-size">{if linked { "→".to_string() } else { size }}</span></button> }
+                        view! { <button class="file" class:link=linked class:denied=denied aria-disabled=denied.then_some("true") data-kind=if entry.directory { "directory".to_string() } else { entry.kind.clone() } title=title on:click=move |_| { let shell = current.get_untracked(); match &refusal { Some(refusal) => shell.notice.set(refusal.clone()), None => shell.run_from_panel(command.clone()) } }><span class="file-kind">{file_icon(&entry.kind, entry.directory)}</span><span class="filename"><span class="filename-text">{entry.name}{if entry.directory { "/" } else { "" }}</span></span><span class="file-size">{if linked { "→".to_string() } else { size }}</span></button> }
                     }).collect_view()}
                     <p class="directory-error" role="status">{move || current.get().directory_error.get()}</p>
                     <Show when=move || current.get().entries.get().is_empty() && current.get().directory_error.get().is_empty()><p class="empty">"This directory is empty. Drop files here or use mkdir to create a directory."</p></Show>

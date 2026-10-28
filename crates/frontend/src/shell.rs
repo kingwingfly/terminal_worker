@@ -321,7 +321,6 @@ impl Shell {
     /// Run `command` for the file panel, which shows its errors, and says so when the tab is
     /// busy, rather than leave a click unanswered while the terminal may be hidden.
     pub fn run_from_panel(self, command: String) {
-        self.notice.set(String::new());
         if self.busy.get_untracked() || self.asking.get_untracked() {
             self.notice.set(
                 "A command is running in this tab; wait for it, or stop it with Ctrl+C".into(),
@@ -939,6 +938,8 @@ impl Shell {
         }
         self.reset_completion();
         self.input.set(String::new());
+        // What the panel said of the last click is old news once another line runs.
+        self.notice.set(String::new());
         self.push(LogLine::Command {
             user: self.account.username.get_untracked(),
             cwd: self.cwd.get_untracked(),
