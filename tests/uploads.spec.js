@@ -20,8 +20,9 @@ function content() {
   return bytes;
 }
 const slices = bytes => Array.from({ length: Math.ceil(bytes.length / CHUNK) }, (_, i) => bytes.subarray(i * CHUNK, (i + 1) * CHUNK));
-async function chunk(client, id, index, bytes, sha = sha256(bytes)) {
-  return client.put(`/api/uploads/chunk?id=${id}&index=${index}`, { headers: { 'X-Chunk-SHA256': sha, 'Content-Type': 'application/octet-stream' }, data: bytes });
+// A chunk of upload `id`, sent by the page holding it with `hold`.
+async function chunk(client, id, hold, index, bytes, sha = sha256(bytes)) {
+  return client.put(`/api/uploads/chunk?id=${id}&index=${index}`, { headers: { 'X-Chunk-SHA256': sha, 'X-Upload-Hold': hold, 'Content-Type': 'application/octet-stream' }, data: bytes });
 }
 async function login(page) {
   await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'uploads-ui-' + Date.now() });
@@ -35,28 +36,28 @@ async function login(page) {
 }
 
 test('chunked uploads check every chunk, are readable while they arrive, resume, and cancel', async () => {
-  const admin = await root(), reader = await root();
+  const admin = await root(), reader = await root(), other = await root();
   const base = '/uploads-' + Date.now().toString(36), path = base + '/data.bin';
   const bytes = content(), parts = slices(bytes);
   try {
     expect((await admin.post('/api/mkdir?path=' + encodeURIComponent(base))).status()).toBe(200);
     const begin = await admin.post('/api/uploads?path=' + encodeURIComponent(path), { data: { size: bytes.length, sha256: sha256(bytes) } });
     expect(begin.status(), await begin.text()).toBe(200);
-    const { id, chunk_size } = await begin.json();
-    expect(chunk_size).toBe(CHUNK);
+    const { id, chunk_size, hold } = await begin.json();
+    expect(chunk_size).toBe(CHUNK); expect(hold).toBeTruthy();
     // A wrong checksum or length is refused, and nothing is committed.
-    expect((await chunk(admin, id, 0, parts[0], sha256(parts[1]))).status()).toBe(400);
-    expect((await chunk(admin, id, 2, parts[1])).status()).toBe(400);
-    expect((await chunk(admin, id, 3, parts[0])).status()).toBe(400);
-    expect((await chunk(admin, id, 0, parts[0])).status()).toBe(200);
+    expect((await chunk(admin, id, hold, 0, parts[0], sha256(parts[1]))).status()).toBe(400);
+    expect((await chunk(admin, id, hold, 2, parts[1])).status()).toBe(400);
+    expect((await chunk(admin, id, hold, 3, parts[0])).status()).toBe(400);
+    expect((await chunk(admin, id, hold, 0, parts[0])).status()).toBe(200);
     // A chunk is committed once: sending it again is harmless, other content is refused.
-    expect((await chunk(admin, id, 0, parts[0])).status()).toBe(200);
-    expect((await chunk(admin, id, 0, parts[1])).status()).toBe(409);
+    expect((await chunk(admin, id, hold, 0, parts[0])).status()).toBe(200);
+    expect((await chunk(admin, id, hold, 0, parts[1])).status()).toBe(409);
     // Another account cannot write to this upload, or see it.
     expect((await reader.get('/api/uploads?id=' + id)).status()).toBe(200);
     const status = await (await admin.get('/api/uploads?id=' + id)).json();
     expect(status.committed).toEqual([0]);
-    // The file is listed while uploading, with what is readable so far.
+    // The file is listed while uploading, with what has arrived so far.
     const entry = (await (await reader.get(ls(base))).json()).entries[0];
     expect(entry.name).toBe('data.bin'); expect(entry.uploaded).toBe(CHUNK);
     const head = await reader.head(file(path));
@@ -68,16 +69,32 @@ test('chunked uploads check every chunk, are readable while they arrive, resume,
     // ... and a whole download follows the upload as it continues.
     const whole = reader.get(file(path), { headers: { 'Accept-Encoding': 'identity' }, timeout: 60_000 });
     await new Promise(r => setTimeout(r, 1500));
-    // Starting the same file again, without the browser's record, resumes this upload.
-    const again = await (await admin.post('/api/uploads?path=' + encodeURIComponent(path), { data: { size: bytes.length, sha256: sha256(bytes) } })).json();
+    // One page sends an upload at a time: while this one holds it, the same file from another
+    // session is refused, and so are chunks without its hold, or a Ctrl+C there.
+    const start = client => client.post('/api/uploads?path=' + encodeURIComponent(path), { data: { size: bytes.length, sha256: sha256(bytes) } });
+    const refused = await start(other);
+    expect(refused.status()).toBe(409); expect((await refused.json()).error).toContain('another tab or device');
+    expect((await chunk(other, id, 'not-the-hold', 1, parts[1])).status()).toBe(409);
+    expect((await other.delete(`/api/uploads?id=${id}&hold=not-the-hold`)).status()).toBe(409);
+    expect((await other.post(`/api/uploads/hold?id=${id}&hold=${hold}`)).status()).toBe(200);
+    // Let go of, as a page does when it stops, the upload resumes elsewhere, which then holds
+    // it: the first page may not go on.
+    expect((await admin.post(`/api/uploads/release?id=${id}&hold=${hold}`)).status()).toBe(200);
+    const again = await (await start(other)).json();
     expect(again).toMatchObject({ id, resumed: true, committed: [0] });
-    expect((await chunk(admin, id, 2, parts[2])).status()).toBe(200);
-    expect((await admin.post('/api/uploads/complete?id=' + id)).status()).toBe(409);
-    expect((await chunk(admin, id, 1, parts[1])).status()).toBe(200);
+    expect(again.hold).not.toBe(hold);
+    const stopped = await chunk(admin, id, hold, 2, parts[2]);
+    expect(stopped.status()).toBe(409); expect((await stopped.json()).error).toContain('another tab or device');
+    expect((await chunk(other, id, again.hold, 2, parts[2])).status()).toBe(200);
+    // Progress counts every chunk that arrived, as the uploading page does, not only those
+    // readable from the start.
+    expect((await (await reader.get(ls(base))).json()).entries[0].uploaded).toBe(CHUNK + parts[2].length);
+    expect((await other.post(`/api/uploads/complete?id=${id}&hold=${again.hold}`)).status()).toBe(409);
+    expect((await chunk(other, id, again.hold, 1, parts[1])).status()).toBe(200);
     // A chunk sent while the upload completes never changes the completed file.
-    const late = chunk(admin, id, 1, parts[0]);
+    const late = chunk(other, id, again.hold, 1, parts[0]);
     await new Promise(r => setTimeout(r, 50));
-    expect((await admin.post('/api/uploads/complete?id=' + id)).status()).toBe(201);
+    expect((await other.post(`/api/uploads/complete?id=${id}&hold=${again.hold}`)).status()).toBe(201);
     expect((await late).status()).toBe(409);
     const downloaded = await whole;
     expect(downloaded.status()).toBe(200);
@@ -85,13 +102,14 @@ test('chunked uploads check every chunk, are readable while they arrive, resume,
     expect(Buffer.compare(await (await reader.get(file(path), { headers: { 'Accept-Encoding': 'identity' } })).body(), bytes)).toBe(0);
     expect((await reader.head(file(path))).headers()['x-upload-state']).toBeUndefined();
     expect((await admin.get('/api/uploads?id=' + id)).status()).toBe(404);
-    // Cancelling removes a new file at once.
+    // Cancelling removes a new file at once; jobs cancel, which holds nothing, cancels it from
+    // any session of its account.
     const cancelled = await (await admin.post('/api/uploads?path=' + encodeURIComponent(base + '/gone.bin'), { data: { size: 10, sha256: sha256(Buffer.alloc(10)) } })).json();
-    expect((await admin.delete('/api/uploads?id=' + cancelled.id)).status()).toBe(200);
+    expect((await other.delete('/api/uploads?id=' + cancelled.id)).status()).toBe(200);
     expect((await (await reader.get(ls(base))).json()).entries.map(e => e.name)).toEqual(['data.bin']);
   } finally {
     await admin.delete(file(base) + '&recursive=true');
-    await admin.dispose(); await reader.dispose();
+    await admin.dispose(); await reader.dispose(); await other.dispose();
   }
 });
 
@@ -135,5 +153,19 @@ test('the browser resumes an interrupted upload from the chunks already sent, an
   await expect(transcript).toContainText('✕ other.log: Upload cancelled', { timeout: 15_000 });
   await expect.poll(async () => (await (await page.request.get(ls(folder))).json()).entries.map(e => e.name)).toEqual(['data.log']);
   await page.unroute('**/api/uploads/chunk?**');
+  // Any file uploads: media are served as such, what is neither text nor media as bytes.
+  for (const [name, type] of [['tone.aac', 'audio/aac'], ['report.docx', 'application/octet-stream']]) {
+    const chooser = page.waitForEvent('filechooser'); await page.getByRole('button', { name: '↑ Upload files' }).click();
+    await (await chooser).setFiles({ name, mimeType: 'application/octet-stream', buffer: Buffer.from([0xFF, 0xF1, 0x50, 0x80, 0x00, 0x1F, 0xFC]) });
+    await expect(transcript).toContainText('✓ ' + name, { timeout: 15_000 });
+    expect((await page.request.head(file(folder + '/' + name))).headers()['content-type']).toBe(type);
+  }
+  // A chooser the browser closes without saying so, or never opens, leaves upload waiting
+  // until Ctrl+C, which gives it no files.
+  await page.evaluate(() => { HTMLInputElement.prototype.click = function () {}; });
+  await input.fill('upload'); await input.press('Enter');
+  await expect(page.locator('.busy')).toHaveText('Working...');
+  await page.locator('#command').press('Control+c');
+  await expect(page.locator('.busy')).toHaveText('↵');
   await page.request.delete(file(folder) + '&recursive=true', { headers: { Origin: origin } });
 });

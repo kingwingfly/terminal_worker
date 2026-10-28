@@ -13,14 +13,26 @@ const $ = id => document.getElementById(id);
 const fileUrl = path => '/api/file?path=' + encodeURIComponent(path);
 // Previews render in Rust (crates/frontend/src/viewer.rs), through window.terminalPreview.
 let directory = '/', opener, viewerVersion = 0, releasePreview;
-const changed = () => window.dispatchEvent(new Event('terminal:changed'));
+// Lists and the account may have changed: the tabs ask again. With a reason, the account changed
+// from elsewhere, which the tabs say: 'ended', this session ended; 'window', another window
+// of this browser signed in or out.
+const changed = (reason = null) => window.dispatchEvent(new CustomEvent('terminal:changed', { detail: reason }));
 async function api(url, options) {
   const response = await fetch(url, options);
   if (!response.ok) { let error; try { error = (await response.json()).error; } catch {} const failure = new Error(error || `Request failed (${response.status})`); failure.status = response.status; throw failure; }
   return response;
 }
 async function session(path = directory) { return (await api('/api/session?path=' + encodeURIComponent(path))).json(); }
+// Endpoints that change this browser's session. The session one replaces ends as it answers,
+// which this page hears of before its own identityChanged: until then, that is not news.
+const SESSION_CHANGES = new Set(['login', 'logout', 'passwd', 'register']);
+let changingSession = 0;
 async function post(endpoint, data) {
+  const changes = SESSION_CHANGES.has(endpoint);
+  if (changes) changingSession++;
+  try { return await postJson(endpoint, data); } catch (error) { if (changes) changingSession--; throw error; }
+}
+async function postJson(endpoint, data) {
   return (await api('/api/' + endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) })).json();
 }
 // One dialog at a time: a request made while another is open, as from another tab, waits for it
@@ -74,7 +86,12 @@ function listen() {
   let ping;
   socket.onopen = () => { if (eventsRetry) changed(); eventsRetry = 0; ping = setInterval(() => socket.send('ping'), 30000); };
   socket.onmessage = event => {
-    let dirs; try { dirs = JSON.parse(event.data).changed; } catch { return; }
+    // A line this page replaced, as its account changed, has nothing more to say.
+    if (events !== socket) return;
+    let message; try { message = JSON.parse(event.data); } catch { return; }
+    // This page's session ended elsewhere, not by its own sign in or out: it is a guest's now.
+    if (message.session === 'ended') { if (!changingSession) void identityChanged('ended'); return; }
+    const dirs = message.changed;
     if (!Array.isArray(dirs)) return;
     dirs.forEach(dir => pendingDirs.add(dir));
     clearTimeout(pendingTimer);
@@ -83,12 +100,18 @@ function listen() {
   socket.onclose = () => { clearInterval(ping); if (events === socket) setTimeout(listen, Math.min(30000, 1000 * 2 ** eventsRetry++)); };
 }
 listen();
-async function identityChanged() {
+// Windows of this browser share its session cookie: each tells the others when it changes it,
+// so that none goes on showing one account while its requests are another's.
+const windows = 'BroadcastChannel' in window ? new BroadcastChannel('terminal-session') : null;
+if (windows) windows.onmessage = () => void identityChanged('window');
+async function identityChanged(reason = null) {
+  if (!reason) changingSession = 0;
   // A new account hears of what it may list: the line opens again with its session.
   listen();
+  if (!reason) windows?.postMessage('changed');
   // A private preview must not survive switching to a less privileged account.
   if ($('viewer').open) await closeViewer();
-  changed();
+  changed(reason);
 }
 async function signIn(username, switching = false) {
   let result;
@@ -205,7 +228,6 @@ async function uploadFiles(files, path, progress) {
     for (const file of files) {
       if (controller.signal.aborted) { results.push(`✕ ${file.name}: Upload cancelled`); continue; }
       try {
-        if (!rust.uploadable(file.name)) throw new Error('Unsupported file type');
         if (file.size > rust.maxFile) throw new Error(`Exceeds the ${rust.maxFile / 1e9} GB limit`);
         // Not faststart is only a warning: such a file uploads, and plays once its index has.
         let warning = null;
@@ -242,6 +264,9 @@ function cancelUploads() { if (!uploading) return false; uploading.abort(); retu
 // phones refuse once a request has been awaited. Settles with the files chosen; none if closed.
 const chooser = Object.assign(document.createElement('input'), { type: 'file', multiple: true });
 let choosing = null;
+// Settle the chooser with no files, if it is open: Ctrl+C, as a browser may close it without
+// saying so (no cancel event), or not open it at all, which would leave its command waiting.
+function cancelChoosing() { if (!choosing) return false; choosing([]); return true; }
 function chooseFiles() {
   choosing?.([]);
   return new Promise(resolve => {
@@ -447,7 +472,7 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, unlock, chooseFiles, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
+window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, unlock, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]')) return;

@@ -55,8 +55,18 @@ impl DurableObject for TerminalAuthority {
                 match (kind.as_str(), db.file(&id), db.job(&id)) {
                     ("upload", Some(file), _) => api::cancel(db, &file),
                     ("job", _, Some(job)) if !job.finished() => {
-                        db.add_lines(&id, &[(true, "Cancelled after waiting a week".into())]);
+                        let why = if job.state == "question" {
+                            "Cancelled: its question went unanswered for an hour"
+                        } else {
+                            "Cancelled after waiting a week"
+                        };
+                        db.add_lines(&id, &[(true, why.into())]);
                         jobs::finish(db, &id, "cancelled");
+                    }
+                    // A session ends when it expires, and the pages holding it hear so.
+                    ("session", _, _) => {
+                        db.delete_session(&id);
+                        db.clear_expiry(&kind, &id);
                     }
                     _ => db.clear_expiry(&kind, &id),
                 }
@@ -114,7 +124,13 @@ impl TerminalAuthority {
         }
         let pair = WebSocketPair::new()?;
         self.state.accept_web_socket(&pair.server);
-        pair.server.serialize_attachment(auth::token_key(req))?;
+        // A cookie whose session is gone is a guest's, which has nothing to end.
+        let key = auth::token_key(req);
+        let live = transact(&self.state, {
+            let key = key.clone();
+            move |db| (auth::identity(db, key.as_deref()).id != GUEST, false)
+        })?;
+        pair.server.serialize_attachment(key.filter(|_| live))?;
         if self.state.get_websocket_auto_response().is_none()
             && let Ok(ping) = worker::worker_sys::WebSocketRequestResponsePair::new("ping", "pong")
         {
@@ -123,10 +139,13 @@ impl TerminalAuthority {
         Response::from_websocket(pair.client)
     }
     /// Tell the listening pages which directories changed, each only those its account may
-    /// list, so that they show what others did as it happens.
+    /// list, so that they show what others did as it happens; and those whose session ended
+    /// (signed out elsewhere, a password changed, the account locked or removed, expired) that it
+    /// did, once, as their account is a guest's from then on.
     fn broadcast(&self) {
         let changed = db::take_changes();
-        if changed.is_empty() {
+        let ended = db::take_ended();
+        if changed.is_empty() && !ended {
             return;
         }
         let sockets = self.state.get_websockets();
@@ -143,15 +162,17 @@ impl TerminalAuthority {
             })
             .collect();
         let visible = transact(&self.state, move |db| {
-            let visible: Vec<Vec<String>> = keys
+            let visible: Vec<(bool, Vec<String>)> = keys
                 .iter()
                 .map(|key| {
                     let who = auth::identity(db, key.as_deref());
-                    changed
+                    let gone = ended && key.is_some() && who.id == GUEST;
+                    let dirs = changed
                         .iter()
                         .filter(|dir| db.access(&who, dir, READ | EXEC).is_ok())
                         .cloned()
-                        .collect()
+                        .collect();
+                    (gone, dirs)
                 })
                 .collect();
             (visible, false)
@@ -159,7 +180,11 @@ impl TerminalAuthority {
         let Ok(visible) = visible else {
             return;
         };
-        for (ws, dirs) in sockets.iter().zip(visible) {
+        for (ws, (gone, dirs)) in sockets.iter().zip(visible) {
+            if gone {
+                let _ = ws.serialize_attachment(None::<String>);
+                let _ = ws.send_with_str(serde_json::json!({ "session": "ended" }).to_string());
+            }
             if !dirs.is_empty() {
                 let _ = ws.send_with_str(serde_json::json!({ "changed": dirs }).to_string());
             }

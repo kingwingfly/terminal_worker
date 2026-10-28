@@ -1,4 +1,6 @@
 //! Completion matching and tolerant parsing, independent of the browser.
+use clap::{Arg, Command, ValueHint};
+
 use crate::Entry;
 
 #[derive(Clone, Debug)]
@@ -133,15 +135,78 @@ pub enum Query {
     Paths(PathQuery),
     None,
 }
-/// Commands whose operands are paths, completed wherever they are typed after the options.
-const PATH_OPERANDS: &[&str] = &[
-    "touch", "rm", "mv", "cp", "cat", "head", "tail", "grep", "wc", "sort", "uniq", "fd", "chmod",
-    "chown", "zip", "unzip", "tar",
-];
-/// Commands taking one path, completed as their only argument ...
-const ONE_PATH: &[&str] = &["open", "vim", "cd", "ls", "upload", "mkdir"];
-/// ... some of them, only directories.
-const DIRECTORIES: &[&str] = &["cd", "ls", "upload", "mkdir"];
+/// Whether the word being typed, the last of `words`, is a path, as the command's definition
+/// says of the operand or option value it is: `Some(true)` a directory, `Some(false)` any path,
+/// `None` not a path (an option, a mode, a user, a pattern...).
+fn path_operand(words: &[String]) -> Option<bool> {
+    let mut command = crate::cli::definition(&words[0])?.command();
+    command.build();
+    let hint = |arg: &Arg| match arg.get_value_hint() {
+        ValueHint::DirPath => Some(true),
+        ValueHint::AnyPath | ValueHint::FilePath => Some(false),
+        _ => None,
+    };
+    let (last, before) = words[1..].split_last()?;
+    let mut operands = 0;
+    let mut ended = false;
+    let mut value_of = None;
+    for word in before {
+        if value_of.take().is_some() {
+            continue;
+        }
+        if !ended && word == "--" {
+            ended = true;
+        } else if let Some(option) = (!ended).then(|| option(&command, word)).flatten() {
+            value_of = option;
+        } else {
+            operands += 1;
+        }
+    }
+    if let Some(arg) = value_of {
+        return hint(arg);
+    }
+    if !ended && (last == "--" || option(&command, last).is_some()) {
+        return None;
+    }
+    // The operand at its place, or one before it that takes all that follow.
+    let mut place = operands;
+    for arg in command.get_positionals() {
+        if place == 0 || arg.get_num_args().is_some_and(|n| n.max_values() > 1) {
+            return hint(arg);
+        }
+        place -= 1;
+    }
+    None
+}
+
+/// Whether `word` is one of `command`'s options, and if so, the option whose value is the next
+/// word, if it takes one that is not attached (`-f` in `-czf a.tgz`, `--file a.tgz`). A word
+/// that is not an option is an operand, as a mode like -w is to chmod.
+fn option<'a>(command: &'a Command, word: &str) -> Option<Option<&'a Arg>> {
+    let takes = |arg: &Arg| arg.get_action().takes_values();
+    if let Some(long) = word.strip_prefix("--") {
+        let (name, attached) = long
+            .split_once('=')
+            .map_or((long, false), |(n, _)| (n, true));
+        let arg = command.get_arguments().find(|a| {
+            a.get_long() == Some(name) || a.get_all_aliases().is_some_and(|v| v.contains(&name))
+        });
+        return Some(arg.filter(|a| takes(a) && !attached));
+    }
+    let letters = word.strip_prefix('-').filter(|l| !l.is_empty())?;
+    // Flags, then perhaps one option taking a value: the rest of the word, or the next.
+    for (at, letter) in letters.char_indices() {
+        let arg = command.get_arguments().find(|a| {
+            a.get_short() == Some(letter)
+                || a.get_all_short_aliases()
+                    .is_some_and(|v| v.contains(&letter))
+        })?;
+        if takes(arg) {
+            return Some((at + letter.len_utf8() == letters.len()).then_some(arg));
+        }
+    }
+    Some(None)
+}
 
 /// `input` split before its last pipeline stage: what precedes it, with the `|`, and the stage.
 fn last_stage(input: &str) -> (&str, &str) {
@@ -243,35 +308,11 @@ fn query_words(context: &str, words: &[String], typed: &[String], first: bool) -
         let head = typed[..at].join(" ");
         return query_words(&after(&head), &words[at..], &typed[at..], false);
     }
-    let (head, raw) = if auto_open {
-        (String::new(), command)
-    } else if command == "rm" {
-        let mut index = 1;
-        while index < words.len()
-            && ["-r", "-R", "-f", "-rf", "-fr", "--recursive", "--force"]
-                .contains(&words[index].as_str())
-        {
-            index += 1;
-        }
-        if words.get(index).is_some_and(|v| v == "--") {
-            index += 1;
-        }
-        if index >= words.len() {
-            return Query::None;
-        }
-        (
-            typed[..words.len() - 1].join(" "),
-            words.last().unwrap().as_str(),
-        )
-    } else if PATH_OPERANDS.contains(&command) && words.len() > 1 {
-        let last = words.last().unwrap();
-        let ended = words[1..words.len() - 1].iter().any(|w| w == "--");
-        if last.starts_with('-') && !ended {
-            return Query::None;
-        }
-        (typed[..words.len() - 1].join(" "), last.as_str())
-    } else if ONE_PATH.contains(&command) && words.len() == 2 {
-        (command.to_string(), words[1].as_str())
+    let (head, raw, directories_only) = if auto_open {
+        (String::new(), command, false)
+    } else if let Some(directories) = path_operand(words) {
+        let last = words.last().map_or("", String::as_str);
+        (typed[..words.len() - 1].join(" "), last, directories)
     } else {
         return Query::None;
     };
@@ -282,7 +323,7 @@ fn query_words(context: &str, words: &[String], typed: &[String], first: bool) -
         head: if auto_open { head } else { after(&head) },
         prefix: prefix.into(),
         needle: needle.into(),
-        directories_only: DIRECTORIES.contains(&command) && !auto_open,
+        directories_only,
         auto_open,
     })
 }
@@ -436,6 +477,45 @@ mod tests {
         };
         assert_eq!(c[0].value, "open ");
     }
+    #[test]
+    fn operands_are_paths_where_the_definitions_say() {
+        let path = |input: &str| match query(input) {
+            Query::Paths(q) => Some((q.head, q.directories_only)),
+            _ => None,
+        };
+        let head = |input: &str| path(input).map(|(head, _)| head);
+        // Every command with a path operand completes it, faststart and ln included.
+        assert_eq!(head("faststart hol"), Some("faststart".into()));
+        assert_eq!(head("ln -s ../notes no"), Some("ln -s ../notes".into()));
+        assert_eq!(
+            head("setfacl -m u:bob:rw no"),
+            Some("setfacl -m u:bob:rw".into())
+        );
+        // What an option takes next: a directory, an archive, or not a path.
+        assert_eq!(path("unzip -d res"), Some(("unzip -d".into(), true)));
+        assert_eq!(path("tar -czf no"), Some(("tar -czf".into(), false)));
+        assert_eq!(path("tar -C res"), Some(("tar -C".into(), true)));
+        assert_eq!(
+            path("tar --directory=res -x -f no"),
+            Some(("tar --directory=res -x -f".into(), false))
+        );
+        assert_eq!(path("setfacl -m u:b"), None);
+        assert_eq!(
+            path("useradd -m -d /ho"),
+            Some(("useradd -m -d".into(), true))
+        );
+        // Operands that are not paths, and those after them that are.
+        assert_eq!(path("chmod 6"), None);
+        assert_eq!(head("chmod -w no"), Some("chmod -w".into()));
+        assert_eq!(path("chown bob"), None);
+        assert_eq!(path("fd notes do"), Some(("fd notes".into(), true)));
+        assert_eq!(path("fd no"), None);
+        assert_eq!(path("su bo"), None);
+        assert_eq!(path("cd do"), Some(("cd".into(), true)));
+        assert_eq!(path("open a b"), None);
+        assert_eq!(path("rm -rf"), None);
+    }
+
     #[test]
     fn quoted_nested_paths_and_rm_flags_survive_completion() {
         for input in [

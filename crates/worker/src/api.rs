@@ -290,6 +290,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                         if_match: begin.if_match,
                         if_none_match: begin.if_none_match,
                         mode: None,
+                        hold: false,
                     },
                 )
             })
@@ -334,8 +335,42 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                         if_match: start.if_match,
                         if_none_match: None,
                         mode: None,
+                        hold: true,
                     },
                 )
+            })
+        }
+        // The page sending an upload is still there: it keeps its hold.
+        (Method::Post, "/api/uploads/hold") => {
+            let id = param("id");
+            let hold = param("hold");
+            run(state, move |db| {
+                let who = auth::identity(db, key.as_deref());
+                let Some(file) = db.file(&id).filter(|f| !f.complete()) else {
+                    return Reply::error("Upload was cancelled or has expired", 409);
+                };
+                if file.uploader != who.id {
+                    return denied(
+                        "Permission denied: this upload belongs to another account",
+                        &who,
+                    );
+                }
+                match held(db, &id, Some(&hold)) {
+                    Ok(()) => Reply::ok(json!({"held": true})),
+                    Err(reply) => reply,
+                }
+            })
+        }
+        // The page stopped sending the upload, which another may now resume at once.
+        (Method::Post, "/api/uploads/release") => {
+            let id = param("id");
+            let hold = param("hold");
+            run(state, move |db| {
+                let who = auth::identity(db, key.as_deref());
+                if db.file(&id).is_some_and(|f| f.uploader == who.id) {
+                    db.release_hold(&id, &hold);
+                }
+                Reply::ok(json!({"released": true}))
             })
         }
         (Method::Get, "/api/uploads") => {
@@ -363,13 +398,15 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         }
         (Method::Post, "/api/uploads/complete") => {
             let id = param("id");
+            let hold = param("hold");
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
-                finish_upload(db, &who, &id, true)
+                finish_upload(db, &who, &id, Some(&hold), true)
             })
         }
         (Method::Delete, "/api/uploads") => {
             let id = param("id");
+            let hold = param("hold");
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
                 let Some(file) = db.file(&id).filter(|f| !f.complete()) else {
@@ -381,6 +418,11 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                         &who,
                     );
                 }
+                // A page's Ctrl+C cancels the upload it holds, not one another page took over;
+                // jobs cancel ID, which holds nothing, cancels it wherever it goes on.
+                if !hold.is_empty() && db.hold(&id).is_some_and(|(token, _)| token != hold) {
+                    return Reply::error(ELSEWHERE, 409);
+                }
                 cancel(db, &file);
                 Reply::ok(json!({"cancelled":true}))
             })
@@ -389,6 +431,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let id = param("id");
             let index = param("index").parse::<u64>().ok();
             let length = param("length").parse::<u64>().ok();
+            let hold = param("hold");
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
                 let Some(file) = db.file(&id).filter(|f| !f.complete()) else {
@@ -399,6 +442,9 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                         "Permission denied: this upload belongs to another account",
                         &who,
                     );
+                }
+                if let Err(reply) = held(db, &id, Some(&hold)) {
+                    return reply;
                 }
                 let Some(index) = index.filter(|i| *i < file.chunk_count()) else {
                     return Reply::error("Chunk index is out of range", 400);
@@ -425,6 +471,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 sha256: Option<String>,
                 #[serde(default)]
                 complete: bool,
+                hold: Option<String>,
             }
             let Ok(commit) = req.json::<Commit>().await else {
                 return Ok(Reply::error("Invalid upload request", 400));
@@ -437,6 +484,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     &commit.id,
                     commit.index.zip(commit.key),
                     commit.sha256,
+                    commit.hold.as_deref(),
                     commit.complete,
                 )
             })
@@ -526,7 +574,7 @@ fn job_reply(
         let uploads: Vec<Value> = db
             .uploads_of(who.id)
             .iter()
-            .map(|f| json!({"id": f.id, "path": f.target, "size": f.size, "readable": db.readable(f)}))
+            .map(|f| json!({"id": f.id, "path": f.target, "size": f.size, "received": db.received(f)}))
             .collect();
         return Reply::ok(json!({"jobs": jobs, "uploads": uploads}));
     }
@@ -560,6 +608,7 @@ fn job_reply(
                 db.set_job(id, JobColumn::Spec, Some(&json!(spec).to_string()));
                 db.set_job(id, JobColumn::Question, None);
                 db.set_job(id, JobColumn::State, Some("queued"));
+                db.set_expiry("job", id, auth::now() + jobs::WAITING);
                 Reply::ok(json!({"job": id, "state": "queued"}))
             }
             (Method::Post, "/api/jobs/answer") => {
@@ -598,6 +647,9 @@ fn job_reply(
             && job.state != "cancelling"
         {
             db.set_job(id, JobColumn::State, Some(state));
+            if state == "question" {
+                db.set_expiry("job", id, auth::now() + jobs::UNANSWERED);
+            }
         }
         return Reply::ok(json!({"state": db.job(id).map(|j| j.state)}));
     }
@@ -706,6 +758,7 @@ fn job_reply(
                     if_match: None,
                     if_none_match: None,
                     mode: body["mode"].as_u64().map(|m| (m & 0o7777) as u16),
+                    hold: false,
                 },
             )
         }
@@ -742,6 +795,7 @@ fn job_reply(
                 .as_u64()
                 .zip(body["key"].as_str().map(String::from)),
             body["sha256"].as_str().map(String::from),
+            None,
             body["complete"] == true,
         ),
         (Method::Post, "/internal/job/abort") => {
@@ -832,6 +886,8 @@ struct Begun {
     if_none_match: Option<String>,
     /// The mode a new file gets, if not 644, as one extracted from an archive.
     mode: Option<u16>,
+    /// Whether the page beginning it sends it in chunks, holding it (`HOLD`).
+    hold: bool,
 }
 
 /// Start writing to `path`: a new file appears at once, still uploading, and can be read as it
@@ -846,6 +902,7 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
         if_match,
         if_none_match,
         mode,
+        hold,
     } = begin;
     // A link is written through, as open(2) does: one leading nowhere makes what it names.
     let real = real!(db, who, path, true);
@@ -861,7 +918,9 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
         );
     }
     let old = db.node(path);
-    // The same file, to the same path, by the same account: resume its upload.
+    let now = auth::now();
+    // The same file, to the same path, by the same account: resume its upload, from this page
+    // or another, unless a page is sending it now.
     if sha256.is_some()
         && let Some(file) = old
             .as_ref()
@@ -872,11 +931,21 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
         && file.size == size
         && file.sha256 == sha256
     {
+        if db.hold(&file.id).is_some_and(|(_, held)| now < held + HOLD) {
+            return Reply::error(
+                &format!(
+                    "{path} is being uploaded from another tab or device; wait for it to finish, or stop it there"
+                ),
+                409,
+            );
+        }
+        let token = auth::random_token();
+        db.set_hold(&file.id, &token, now);
         let committed: Vec<u64> = db.chunks(&file.id).into_iter().map(|c| c.idx).collect();
         return Reply::ok(json!({
             "id": file.id, "created": true, "resumed": true, "size": size,
             "chunk_size": file.chunk_size, "committed": committed,
-            "mode": old.as_ref().map(|n| n.mode),
+            "mode": old.as_ref().map(|n| n.mode), "hold": token,
         }));
     }
     if old.is_none() && if_match.is_some() {
@@ -900,14 +969,25 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
             );
         }
         if !overwrite {
-            return Reply::error("File already exists; rename it before uploading", 409);
+            let uploading = old
+                .file
+                .as_deref()
+                .and_then(|id| db.file(id))
+                .is_some_and(|f| !f.complete());
+            return Reply::error(
+                if uploading {
+                    "A file of this name is still being uploaded; wait for it to finish, or upload under another name"
+                } else {
+                    "File already exists; rename it before uploading"
+                },
+                409,
+            );
         }
         old.file.clone()
     } else {
         acl!(db.writable_parent(who, path), who);
         None
     };
-    let now = auth::now();
     let id = db.create_file(
         size,
         chunk_size,
@@ -943,10 +1023,33 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
             node.mode
         }
     };
+    let token = hold.then(auth::random_token);
+    if let Some(token) = &token {
+        db.set_hold(&id, token, now);
+    }
     Reply::ok(json!({
         "id": id, "created": old.is_none(), "size": size, "chunk_size": chunk_size.max(1),
-        "mode": mode,
+        "mode": mode, "hold": token,
     }))
+}
+
+/// How long an upload stays with the page sending it after it was last heard from, which is
+/// every few seconds while it is there (upload.mjs): until then, no other page resumes it.
+const HOLD: u64 = 20;
+/// Why a page may not go on with an upload.
+const ELSEWHERE: &str = "the upload goes on from another tab or device";
+
+/// Whether the page that sent `hold` may go on with upload `file`: the page holding it, which
+/// is heard from again, or any, for an upload no page holds (one request, or a job's).
+fn held(db: &mut Db, file: &str, hold: Option<&str>) -> std::result::Result<(), Reply> {
+    let Some((token, _)) = db.hold(file) else {
+        return Ok(());
+    };
+    if hold != Some(token.as_str()) {
+        return Err(Reply::error(ELSEWHERE, 409));
+    }
+    db.set_hold(file, &token, auth::now());
+    Ok(())
 }
 
 /// Record `chunk`, an index and the object written for it, as part of upload `id`, and complete
@@ -958,10 +1061,11 @@ fn commit_upload(
     id: &str,
     chunk: Option<(u64, String)>,
     sha256: Option<String>,
+    hold: Option<&str>,
     complete: bool,
 ) -> Reply {
     let Some((index, key)) = chunk else {
-        return finish_upload(db, who, id, complete);
+        return finish_upload(db, who, id, hold, complete);
     };
     if !chunk_of(&key, id, index) {
         return Reply::error("Chunk key does not belong to this upload", 400);
@@ -976,7 +1080,7 @@ fn commit_upload(
         Some(file) if index >= file.chunk_count() => {
             Some(Reply::error("Chunk index is out of range", 400))
         }
-        Some(file) => match destination(db, who, &file) {
+        Some(file) => match held(db, id, hold).and_then(|()| destination(db, who, &file)) {
             Err(reply) => Some(reply),
             Ok(_) => match db.committed_hash(id, index) {
                 // Sent again: the chunk committed first stays.
@@ -1001,10 +1105,16 @@ fn commit_upload(
     if !complete {
         return Reply::ok(json!({"committed":index}));
     }
-    finish_upload(db, who, id, true)
+    finish_upload(db, who, id, hold, true)
 }
-/// Complete upload `id` if asked and every chunk is committed.
-fn finish_upload(db: &mut Db, who: &Identity, id: &str, complete: bool) -> Reply {
+/// Complete upload `id` if asked and every chunk is committed, by the page holding it.
+fn finish_upload(
+    db: &mut Db,
+    who: &Identity,
+    id: &str,
+    hold: Option<&str>,
+    complete: bool,
+) -> Reply {
     let Some(file) = db.file(id) else {
         return Reply::error("Upload was cancelled or has expired", 409);
     };
@@ -1019,6 +1129,9 @@ fn finish_upload(db: &mut Db, who: &Identity, id: &str, complete: bool) -> Reply
     }
     if !complete {
         return Reply::ok(json!({"committed":null}));
+    }
+    if let Err(reply) = held(db, id, hold) {
+        return reply;
     }
     let (path, node) = match destination(db, who, &file) {
         Ok(found) => found,

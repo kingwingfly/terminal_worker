@@ -38,16 +38,12 @@ fn hasher() -> js_sys::Object {
 
 /// Make `window.terminalUploads`.
 pub fn register() {
-    let uploadable = Closure::<dyn Fn(String) -> bool>::new(|name: String| {
-        terminal_worker_core::kind(&name) != "unknown"
-    });
     let digest =
         Closure::<dyn Fn(js_sys::Uint8Array) -> String>::new(|bytes: js_sys::Uint8Array| {
             hex(&Sha256::digest(bytes.to_vec()))
         });
     let new_hasher = Closure::<dyn Fn() -> js_sys::Object>::new(hasher);
     let api = js_sys::Object::new();
-    let _ = js_sys::Reflect::set(&api, &"uploadable".into(), &uploadable.into_js_value());
     let _ = js_sys::Reflect::set(&api, &"sha256".into(), &digest.into_js_value());
     let _ = js_sys::Reflect::set(&api, &"hasher".into(), &new_hasher.into_js_value());
     let _ = js_sys::Reflect::set(

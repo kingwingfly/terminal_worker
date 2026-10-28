@@ -34,7 +34,7 @@ const ROLLBACK: &str = "rollback";
 /// The version of the tables below, which local state made by an older one does not have.
 pub const SCHEMA_VERSION: &str = "3";
 
-const SCHEMA: [&str; 19] = [
+const SCHEMA: [&str; 20] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
@@ -54,6 +54,9 @@ const SCHEMA: [&str; 19] = [
     // last one short. An upload names its target path, and the file it replaces there, if any.
     "CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY, size INTEGER NOT NULL, chunk_size INTEGER NOT NULL, state TEXT NOT NULL, sha256 TEXT, uploader INTEGER NOT NULL, target TEXT NOT NULL, base TEXT, touched INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS chunks(file TEXT NOT NULL, idx INTEGER NOT NULL, key TEXT NOT NULL, sha256 TEXT, PRIMARY KEY(file, idx))",
+    // The page sending an upload in chunks, by the token it was given, and when it was last
+    // heard from: one page at a time (api::HOLD). A table of its own, made where it is missing.
+    "CREATE TABLE IF NOT EXISTS upload_holds(file TEXT PRIMARY KEY, token TEXT NOT NULL, held INTEGER NOT NULL)",
     // R2 objects nothing refers to any more, which the alarm deletes.
     "CREATE TABLE IF NOT EXISTS garbage(key TEXT PRIMARY KEY)",
     "CREATE TABLE IF NOT EXISTS expiries(kind TEXT NOT NULL, id TEXT NOT NULL, due INTEGER NOT NULL, PRIMARY KEY(kind, id))",
@@ -76,11 +79,18 @@ thread_local! {
     static CHANGING: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
     /// ... and those committed transactions changed, for the pages that show them.
     static CHANGED: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+    /// Whether a transaction ended sessions, which the pages holding them hear of.
+    static ENDED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// The directories whose listings committed transactions changed since this was last asked.
 pub fn take_changes() -> BTreeSet<String> {
     CHANGED.take()
+}
+
+/// Whether sessions ended since this was last asked: signed out, renewed, revoked or expired.
+pub fn take_ended() -> bool {
+    ENDED.replace(false)
 }
 
 /// Whether the alarm should run soon, clearing the request.
@@ -413,6 +423,44 @@ impl Db {
         }
         (next * file.chunk_size).min(file.size)
     }
+    /// How many bytes of `file` have arrived: its committed chunks, wherever they are, as an
+    /// upload's progress counts them.
+    pub fn received(&self, file: &File) -> u64 {
+        if file.complete() {
+            return file.size;
+        }
+        self.chunks(&file.id)
+            .iter()
+            .map(|chunk| file.chunk_len(chunk.idx))
+            .sum()
+    }
+    /// The token of the page sending upload `file`, and when it was last heard from.
+    pub fn hold(&self, file: &str) -> Option<(String, u64)> {
+        #[derive(Deserialize)]
+        struct Hold {
+            token: String,
+            held: u64,
+        }
+        self.rows::<Hold>(
+            "SELECT token, held FROM upload_holds WHERE file = ?",
+            vec![text(file)],
+        )
+        .pop()
+        .map(|hold| (hold.token, hold.held))
+    }
+    /// Let go of upload `file`, if `token` holds it.
+    pub fn release_hold(&mut self, file: &str, token: &str) {
+        self.run(
+            "DELETE FROM upload_holds WHERE file = ? AND token = ?",
+            vec![text(file), text(token)],
+        );
+    }
+    pub fn set_hold(&mut self, file: &str, token: &str, now: u64) {
+        self.run(
+            "INSERT OR REPLACE INTO upload_holds(file, token, held) VALUES(?, ?, ?)",
+            vec![text(file), text(token), int(now)],
+        );
+    }
     pub fn file(&self, id: &str) -> Option<File> {
         self.rows(
             "SELECT id, size, chunk_size, state, sha256, uploader, target, base FROM files WHERE id = ?",
@@ -448,6 +496,7 @@ impl Db {
             "UPDATE files SET state = 'complete' WHERE id = ?",
             vec![text(file)],
         );
+        self.run("DELETE FROM upload_holds WHERE file = ?", vec![text(file)]);
         self.clear_expiry("upload", file);
     }
     /// Delete `file` and send its chunks to the garbage, whatever refers to it: every object
@@ -456,6 +505,7 @@ impl Db {
         self.discard(&format!("chunks/{file}/"));
         self.run("DELETE FROM chunks WHERE file = ?", vec![text(file)]);
         self.run("DELETE FROM files WHERE id = ?", vec![text(file)]);
+        self.run("DELETE FROM upload_holds WHERE file = ?", vec![text(file)]);
         self.clear_expiry("upload", file);
         ALARM.set(true);
     }
@@ -981,15 +1031,19 @@ impl Store for Db {
                 int(session.sudo_until),
             ],
         );
+        self.set_expiry("session", key, session.expires);
     }
     fn delete_session(&mut self, key: &str) {
         self.run("DELETE FROM sessions WHERE key = ?", vec![text(key)]);
+        ENDED.set(true);
     }
     fn delete_sessions(&mut self, user: u32) {
         self.run("DELETE FROM sessions WHERE uid = ?", vec![int(user)]);
+        ENDED.set(true);
     }
     fn delete_expired_sessions(&mut self, now: u64) {
         self.run("DELETE FROM sessions WHERE expires <= ?", vec![int(now)]);
+        ENDED.set(true);
     }
 
     fn uploading(&self, file: &str) -> bool {

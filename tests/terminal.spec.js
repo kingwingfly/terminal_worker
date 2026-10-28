@@ -39,6 +39,9 @@ test('terminal, password modal, upload, sanitized Markdown, slides and media', a
   await run(page, 'open welcome.md'); await expect(page.locator('#viewer .markdown h1')).toContainText('R2 Terminal');
   await page.getByRole('button', { name: 'Close preview' }).click();
   await run(page, 'open dem'); await expect(page.locator('.transcript')).toContainText('File or directory does not exist');
+  // Every command completes the paths its definition takes: faststart's file, unzip -d's directory.
+  await input.fill('faststart dem'); await input.press('Tab'); await expect(input).toHaveValue('faststart "demo.slides.md"');
+  await input.fill('unzip -d med'); await input.press('Tab'); await expect(input).toHaveValue('unzip -d "media/"');
   await input.fill('open dem'); await input.press('Tab'); await expect(input).toHaveValue('open "demo.slides.md"');
   await input.press('Enter'); await expect(page.locator('.slides .slide')).toBeVisible();
   await page.keyboard.press('ArrowRight'); await expect(page.locator('.slides .slide')).toContainText('One filesystem');

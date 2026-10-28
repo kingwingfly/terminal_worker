@@ -137,32 +137,33 @@ test('an upload goes on only while its account may still write where the file is
  const f=await setup();const {root,alice,a}=f;const dir='/upload-'+a;
  const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
  const begin=async path=>(await ok(await alice.post('/api/uploads?path='+encodeURIComponent(path),{data:{size:4}}))).json();
- const chunk=(id,text)=>alice.put(`/api/uploads/chunk?id=${id}&index=0`,{headers:{'X-Chunk-SHA256':sha(Buffer.from(text)),'Content-Type':'application/octet-stream'},data:Buffer.from(text)});
- const complete=id=>alice.post('/api/uploads/complete?id='+id);
+ // Chunks and completion come from the page holding the upload, by the token it began with.
+ const chunk=(up,text)=>alice.put(`/api/uploads/chunk?id=${up.id}&index=0`,{headers:{'X-Chunk-SHA256':sha(Buffer.from(text)),'X-Upload-Hold':up.hold,'Content-Type':'application/octet-stream'},data:Buffer.from(text)});
+ const complete=up=>alice.post(`/api/uploads/complete?id=${up.id}&hold=${up.hold}`);
  try {
   await ok(await command(root,['mkdir',dir]));await ok(await command(root,['chown',a,dir]));
   // Shut out of the directory, the uploader may neither send nor publish the file.
   const revoked=await begin(dir+'/a.txt');
   await ok(await command(root,['chown','root',dir]));await ok(await command(root,['chmod','700',dir]));
   expect((await alice.get('/api/stat?path='+encodeURIComponent(dir+'/a.txt'))).status()).toBe(403);
-  expect((await chunk(revoked.id,'abcd')).status()).toBe(403);
-  expect((await complete(revoked.id)).status()).toBe(403);
+  expect((await chunk(revoked,'abcd')).status()).toBe(403);
+  expect((await complete(revoked)).status()).toBe(403);
   // Let back in, the file being still hers, it goes on.
   await ok(await command(root,['chmod','755',dir]));
-  await ok(await chunk(revoked.id,'abcd'));await ok(await complete(revoked.id),201);
+  await ok(await chunk(revoked,'abcd'));await ok(await complete(revoked),201);
   expect(await (await root.get(file(dir+'/a.txt'))).text()).toBe('abcd');
   // Moved while it uploads, a new file is written, and published, where it is now.
   await ok(await command(root,['chown',a,dir]));
   const moved=await begin(dir+'/b.txt');
   await ok(await command(alice,['mv',dir+'/b.txt',dir+'/c.txt']));
-  await ok(await chunk(moved.id,'wxyz'));
-  expect((await (await ok(await complete(moved.id),201)).json()).path).toBe(dir+'/c.txt');
+  await ok(await chunk(moved,'wxyz'));
+  expect((await (await ok(await complete(moved),201)).json()).path).toBe(dir+'/c.txt');
   expect(await (await alice.get(file(dir+'/c.txt'))).text()).toBe('wxyz');
   // Given to an account that alone may write it, it is the uploader's no more.
   const given=await begin(dir+'/d.txt');
   await ok(await command(root,['chown','root',dir+'/d.txt']));
-  expect((await chunk(given.id,'1234')).status()).toBe(403);
-  expect((await complete(given.id)).status()).toBe(403);
+  expect((await chunk(given,'1234')).status()).toBe(403);
+  expect((await complete(given)).status()).toBe(403);
  } finally {await command(root,['rm','-r',dir]);await f.cleanup();}
 });
 

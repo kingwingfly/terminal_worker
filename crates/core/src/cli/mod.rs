@@ -612,6 +612,28 @@ mod tests {
     }
 
     #[test]
+    fn path_operands_say_so_for_completion() {
+        // A path operand without a hint is not completed (faststart's FILE once was not).
+        for definition in DEFINITIONS {
+            let command = definition.command();
+            for arg in command.get_positionals() {
+                let named = arg.get_value_names().unwrap_or_default();
+                let path = named.iter().any(|n| {
+                    ["PATH", "FILE", "DIR", "SOURCE", "DEST", "TARGET", "ARCHIVE"]
+                        .iter()
+                        .any(|p| n.as_str().contains(p))
+                });
+                assert!(
+                    !path || arg.get_value_hint() != clap::ValueHint::Unknown,
+                    "{} {:?} needs a value_hint",
+                    command.get_name(),
+                    named
+                );
+            }
+        }
+    }
+
+    #[test]
     fn command_lines_are_checked_as_their_commands_read_them() {
         let line = |text: &str| text.split(' ').map(String::from).collect::<Vec<_>>();
         assert_eq!(check(&line("tar czf notes.tgz notes")), Ok(()));

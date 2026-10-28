@@ -1,7 +1,7 @@
 //! Accounts: whoami, id, groups, users, login, su, sudo, exit, logout, passwd, useradd, usermod,
 //! userdel, groupadd, groupmod and groupdel.
 
-use clap::Parser;
+use clap::{Parser, ValueHint};
 
 use super::{Manual, Section};
 
@@ -193,7 +193,7 @@ pub struct Useradd {
     #[arg(short = 'm', long = "create-home")]
     pub create_home: bool,
     /// its home
-    #[arg(short = 'd', long = "home-dir", value_name = "HOME")]
+    #[arg(value_hint = ValueHint::DirPath, short = 'd', long = "home-dir", value_name = "HOME")]
     pub home: Option<String>,
     /// its primary group
     #[arg(short = 'g', long = "gid", value_name = "GROUP")]
@@ -231,7 +231,7 @@ pub struct Usermod {
     #[arg(short = 'g', long = "gid", value_name = "GROUP")]
     pub group: Option<String>,
     /// home
-    #[arg(short = 'd', long = "home", value_name = "HOME")]
+    #[arg(value_hint = ValueHint::DirPath, short = 'd', long = "home", value_name = "HOME")]
     pub home: Option<String>,
     /// move the home there too
     #[arg(short = 'm', long = "move-home", requires = "home")]

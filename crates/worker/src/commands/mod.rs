@@ -93,7 +93,7 @@ pub fn entry(c: &Db, who: &Identity, shown: &str, path: &str, n: &Node) -> Entry
         .as_deref()
         .and_then(|id| c.file(id))
         .filter(|f| !f.complete())
-        .map(|f| c.readable(&f));
+        .map(|f| c.received(&f));
     let mut entry = described(
         c,
         who,
@@ -119,7 +119,7 @@ pub fn entries(
     let uploading: BTreeMap<String, u64> = c
         .uploading_in(dir)
         .into_iter()
-        .map(|f| (f.id.clone(), c.readable(&f)))
+        .map(|f| (f.id.clone(), c.received(&f)))
         .collect();
     let mut owners = BTreeMap::new();
     let mut groups = BTreeMap::new();
@@ -160,14 +160,21 @@ fn described(
     owner: String,
     group: String,
 ) -> Entry {
-    // A link to a directory opens as one, if `who` may get there.
-    let directory = n.directory
-        || n.is_link()
-            && c.physical(who, path, true)
+    // A link opens as what it leads to, if `who` may get there.
+    let target = n
+        .is_link()
+        .then(|| {
+            c.physical(who, path, true)
                 .ok()
                 .and_then(|real| c.node(&real))
-                .is_some_and(|target| target.directory);
+        })
+        .flatten();
+    let opened = target.as_ref().unwrap_or(n);
+    let directory = opened.directory;
+    // Opening it lists a directory, which takes r and x, or reads a file.
+    let denied = !who.allows(opened, if directory { READ | EXEC } else { READ });
     Entry {
+        denied,
         uploaded,
         name: path.rsplit('/').next().unwrap_or("").into(),
         path: path.into(),

@@ -30,6 +30,8 @@ extern "C" {
     fn upload_files(files: &JsValue, path: &str, progress: &js_sys::Function) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = cancelUploads)]
     fn cancel_uploads() -> bool;
+    #[wasm_bindgen(js_namespace = terminal, js_name = cancelChoosing)]
+    fn cancel_choosing() -> bool;
     #[wasm_bindgen(js_namespace = terminal, js_name = setDirectory)]
     fn set_directory(path: &str);
     #[wasm_bindgen(js_namespace = terminal, js_name = focusInput)]
@@ -126,6 +128,7 @@ fn render_line(line: LogLine) -> AnyView {
             view! { <pre class=if long { "listing-output listing-long" } else { "listing-output" }>
                 {entries.into_iter().map(|entry| {
                     let class = if entry.link.is_some() { "listing-entry entry-link" } else if entry.directory { "listing-entry entry-directory" } else if entry.mode & 0o111 != 0 { "listing-entry entry-executable" } else { "listing-entry entry-file" };
+                    let class = if entry.denied { format!("{class} entry-denied") } else { class.to_string() };
                     let meta = if long { format!("{} {:>2} {}:{} {:>6} ", entry.mode_line(), entry.links, entry.owner, entry.group, entry.size) } else { String::new() };
                     let uploading = upload_progress(&entry).map(|p| format!(" {p}"));
                     let suffix = entry.suffix();
@@ -362,25 +365,35 @@ fn App() -> impl IntoView {
             }
         });
     }
-    let listener = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
-        let before = account.username.get_untracked();
-        spawn_local(async move {
-            for shell in tabs.get_untracked() {
-                if let Err(e) = shell.refresh().await {
-                    shell.log(e);
-                }
-            }
-            // The account is the browser session's, so every tab changes with it.
-            let after = account.username.get_untracked();
-            if after != before {
+    let listener = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(
+        move |e: web_sys::CustomEvent| {
+            let before = account.username.get_untracked();
+            // Why, if it changed from elsewhere (app.js `changed`).
+            let reason = e.detail().as_string();
+            spawn_local(async move {
                 for shell in tabs.get_untracked() {
-                    if shell.id != active.get_untracked() {
-                        shell.log(format!("Account changed to {after} in another tab"));
+                    if let Err(e) = shell.refresh().await {
+                        shell.log(e);
                     }
                 }
-            }
-        });
-    });
+                // The account is the browser session's, so every tab changes with it.
+                let after = account.username.get_untracked();
+                if after == before {
+                    return;
+                }
+                for shell in tabs.get_untracked() {
+                    match reason.as_deref() {
+                    Some("ended") => shell.log(format!("! Signed out: this session ended elsewhere (signed out, a password changed, the account locked or removed, or expired); now {after}")),
+                    Some(_) => shell.log(format!("Account changed to {after} in another window")),
+                    None if shell.id != active.get_untracked() => {
+                        shell.log(format!("Account changed to {after} in another tab"))
+                    }
+                    None => {}
+                }
+                }
+            });
+        },
+    );
     let window = web_sys::window().unwrap();
     window
         .add_event_listener_with_callback("terminal:changed", listener.as_ref().unchecked_ref())
@@ -478,15 +491,20 @@ fn App() -> impl IntoView {
                 <div class="workspace-panes">
                 <section class="file-panel" aria-label="File manager">
                 <div class="directory-bar"><span>{move || current.get().cwd.get()}</span>
-                    <button on:click=move |_| current.get_untracked().run("upload".into())>"↑ Upload files"</button></div>
+                    <button on:click=move |_| current.get_untracked().run_from_panel("upload".into())>"↑ Upload files"</button></div>
+                <p class="file-notice" role="status">{move || current.get().notice.get()}</p>
                 <div class="files" aria-label="Current directory">
-                    <Show when=move || current.get().cwd.get() != "/"><button class="file" on:click=move |_| current.get_untracked().run("cd ..".into())><span class="file-kind">{file_icon("directory", true)}</span><span>"../"</span></button></Show>
+                    <Show when=move || current.get().cwd.get() != "/"><button class="file" on:click=move |_| current.get_untracked().run_from_panel("cd ..".into())><span class="file-kind">{file_icon("directory", true)}</span><span>"../"</span></button></Show>
                     {move || current.get().entries.get().into_iter().map(|entry| {
                         let command = format!("{} \"{}\"", if entry.directory { "cd" } else { "open" }, entry.path.replace('"', "\\\""));
                         let size = if entry.directory { String::new() } else { upload_progress(&entry).unwrap_or_else(|| format!("{:.1} KB", entry.size as f64 / 1000.0)) };
                         let title = format!("{} {}:{}{}", entry.mode_line(), entry.owner, entry.group, entry.link.as_ref().map(|t| format!(" -> {t}")).unwrap_or_default());
                         let linked = entry.link.is_some();
-                        view! { <button class="file" class:link=linked data-kind=if entry.directory { "directory".to_string() } else { entry.kind.clone() } title=title on:click=move |_| current.get_untracked().run(command.clone())><span class="file-kind">{file_icon(&entry.kind, entry.directory)}</span><span class="filename"><span class="filename-text">{entry.name}{if entry.directory { "/" } else { "" }}</span></span><span class="file-size">{if linked { "→".to_string() } else { size }}</span></button> }
+                        // What the account may not open shows dimmed, and says why when clicked.
+                        let denied = entry.denied;
+                        let refusal = format!("Permission denied: {} is {} {}:{}", entry.name, entry.mode_line().trim_end(), entry.owner, entry.group);
+                        let title = if denied { format!("{title} · permission denied") } else { title };
+                        view! { <button class="file" class:link=linked class:denied=denied aria-disabled=denied.then_some("true") data-kind=if entry.directory { "directory".to_string() } else { entry.kind.clone() } title=title on:click=move |_| { let shell = current.get_untracked(); if denied { shell.notice.set(refusal.clone()) } else { shell.run_from_panel(command.clone()) } }><span class="file-kind">{file_icon(&entry.kind, entry.directory)}</span><span class="filename"><span class="filename-text">{entry.name}{if entry.directory { "/" } else { "" }}</span></span><span class="file-size">{if linked { "→".to_string() } else { size }}</span></button> }
                     }).collect_view()}
                     <p class="directory-error" role="status">{move || current.get().directory_error.get()}</p>
                     <Show when=move || current.get().entries.get().is_empty() && current.get().directory_error.get().is_empty()><p class="empty">"This directory is empty. Drop files here or use mkdir to create a directory."</p></Show>
