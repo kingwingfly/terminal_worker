@@ -604,9 +604,14 @@ fn Slides(source: String, path: String) -> impl IntoView {
             {move || {
                 // Read here, where it is tracked: a component's children are built untracked.
                 let html = slide();
+                let class = if preview::image_slide(&html) {
+                    "slide markdown slide-image"
+                } else {
+                    "slide markdown"
+                };
                 view! {
                     <Enhanced>
-                        <div class="slide markdown" inner_html=html></div>
+                        <div class=class inner_html=html></div>
                     </Enhanced>
                 }
             }}
