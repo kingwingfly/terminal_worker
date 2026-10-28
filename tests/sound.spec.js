@@ -51,6 +51,13 @@ test('stream records the microphone into a file that grows as it is heard, and i
     await expect.poll(async () => (await stat()).recording, { timeout: 15_000 }).toBe(true);
     await expect.poll(async () => (await stat()).size, { timeout: 30_000, intervals: [1000] }).toBeGreaterThan(0);
     const grown = (await stat()).size;
+    // jobs, in another tab, says it is recording, and how much it has.
+    const other = await speaker.context.newPage(); await other.goto(origin + '/');
+    await run(other, 'jobs');
+    await expect(transcript(other)).toContainText(new RegExp(`recording  ${recording}  [\\d.]+ KB`));
+    await other.close();
+    // An upload that is not a recording says how big it will be.
+    expect((await root.post('/api/uploads?path=' + encodeURIComponent(home + '/sizeless.bin'), { data: {} })).status()).toBe(400);
     // What arrived may be read meanwhile, from its start.
     const partial = await (await root.get(file(recording), { headers: { 'Accept-Encoding': 'identity' } })).body();
     expect(partial.length).toBeGreaterThanOrEqual(grown);

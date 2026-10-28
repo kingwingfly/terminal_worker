@@ -208,18 +208,18 @@ test('a page of the account opens a deck where the account showed it last, on an
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
   expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
   const laptop = await device(browser, name, password);
+  let phone;
   try {
     await run(laptop.page, `open ${base}/deck.slides.md`);
     await expect(shown(laptop.page).locator('h1')).toHaveText('One');
     await laptop.page.keyboard.press('End'); await expect(shown(laptop.page).locator('h1')).toHaveText('Three');
     // Another device, signed in later, opens it there too, rather than where it left it.
-    const phone = await device(browser, name, password);
+    phone = await device(browser, name, password);
     await run(phone.page, `open ${base}/deck.slides.md`);
     await expect(shown(phone.page).locator('h1')).toHaveText('Three');
-    await phone.context.close();
   } finally {
     await command(['userdel', '-r', name]);
-    await laptop.context.close();
+    await laptop.context.close(); await phone?.context.close();
   }
 });
 

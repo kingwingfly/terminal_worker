@@ -548,12 +548,20 @@ impl Shell {
                     ));
                 }
                 for upload in &uploads {
-                    let size = upload["size"].as_u64().unwrap_or(0).max(1);
+                    let id = &upload["id"].as_str().unwrap_or_default()[..8];
+                    let path = upload["path"].as_str().unwrap_or_default();
+                    let size = upload["size"].as_u64().unwrap_or(0);
+                    // A recording has as many bytes as have arrived, and grows.
+                    if upload["recording"] == true {
+                        text.push_str(&format!(
+                            "{id}  recording  {path}  {}\n",
+                            crate::viewer::size(size)
+                        ));
+                        continue;
+                    }
                     text.push_str(&format!(
-                        "{}  uploading  {}  {}%\n",
-                        &upload["id"].as_str().unwrap_or_default()[..8],
-                        upload["path"].as_str().unwrap_or_default(),
-                        upload["received"].as_u64().unwrap_or(0) * 100 / size,
+                        "{id}  uploading  {path}  {}%\n",
+                        upload["received"].as_u64().unwrap_or(0) * 100 / size.max(1),
                     ));
                 }
                 if text.is_empty() {

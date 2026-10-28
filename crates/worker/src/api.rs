@@ -345,8 +345,8 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         (Method::Post, "/api/uploads") => {
             #[derive(Deserialize)]
             struct Start {
-                #[serde(default)]
-                size: u64,
+                /// What it will be; a recording has none yet.
+                size: Option<u64>,
                 sha256: Option<String>,
                 #[serde(default)]
                 overwrite: bool,
@@ -358,7 +358,13 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             if !body_size(req, 4096) {
                 return Ok(Reply::error("Invalid upload request", 400));
             }
-            let Ok(start) = req.json::<Start>().await else {
+            let Ok(start) = req.json::<Start>().await.map_err(|_| ()).and_then(|start| {
+                if start.record || start.size.is_some() {
+                    Ok(start)
+                } else {
+                    Err(())
+                }
+            }) else {
                 return Ok(Reply::error("Invalid upload request", 400));
             };
             if start
@@ -379,12 +385,12 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             }
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
-                let mut reply = begin_upload(
+                let reply = begin_upload(
                     db,
                     &who,
                     &path,
                     Begun {
-                        size: if start.record { 0 } else { start.size },
+                        size: start.size.filter(|_| !start.record).unwrap_or(0),
                         chunk_size: if start.record {
                             RECORDING_CHUNK
                         } else {
@@ -405,7 +411,6 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 {
                     db.record_file(&id);
                     db.set_expiry("upload", &id, auth::now() + RECORDING_IDLE);
-                    reply.body["chunk_size"] = json!(RECORDING_CHUNK);
                 }
                 reply
             })
@@ -688,7 +693,12 @@ fn job_reply(
         let uploads: Vec<Value> = db
             .uploads_of(who.id)
             .iter()
-            .map(|f| json!({"id": f.id, "path": f.target, "size": f.size, "received": db.received(f)}))
+            .map(|f| {
+                json!({
+                    "id": f.id, "path": f.target, "size": f.size, "received": db.received(f),
+                    "recording": f.recording(),
+                })
+            })
             .collect();
         return Reply::ok(json!({"jobs": jobs, "uploads": uploads}));
     }
@@ -1359,16 +1369,10 @@ pub fn finish_recording(db: &mut Db, file: &File) {
             devices::end(db, &device.name);
         }
     }
-    let arrived = db.readable(file);
-    if arrived == 0 {
+    // A recording takes only its next chunk, so what arrived is all there, in order.
+    if file.size == 0 {
         return cancel(db, file);
     }
-    for chunk in db.chunks(&file.id) {
-        if chunk.idx * file.chunk_size >= arrived {
-            db.discard(&chunk.key);
-        }
-    }
-    db.grow_file(&file.id, arrived, None);
     db.finish_file(&file.id);
 }
 

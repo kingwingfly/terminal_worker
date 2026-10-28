@@ -63,7 +63,8 @@ test('removing a file another device is uploading stops that upload, as rm does 
     await input.fill('cd ' + base); await input.press('Enter');
     await expect(page.locator('.directory-bar')).toContainText(base);
     // Slow chunks leave the other device time to remove the file.
-    await page.route('**/api/uploads/chunk?**', async route => { await new Promise(r => setTimeout(r, 1500)); await route.continue(); });
+    // A chunk the stopped upload aborted meanwhile is handled already, and continues nowhere.
+    await page.route('**/api/uploads/chunk?**', async route => { await new Promise(r => setTimeout(r, 1500)); await route.continue().catch(() => {}); });
     const chooser = page.waitForEvent('filechooser');
     await input.fill('upload'); await input.press('Enter');
     await (await chooser).setFiles({ name: 'big.log', mimeType: 'application/octet-stream', buffer: Buffer.alloc(3 * 8 * 1024 * 1024 + 100, 7) });
