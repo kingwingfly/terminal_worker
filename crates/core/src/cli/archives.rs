@@ -1,6 +1,6 @@
 //! Archives and video: zip, unzip, tar, faststart and jobs.
 
-use clap::{ArgGroup, Parser};
+use clap::{ArgGroup, Parser, ValueHint};
 
 use super::{Manual, Section};
 
@@ -31,9 +31,9 @@ pub struct Zip {
     /// name each member (the default)
     #[arg(short = 'v', long = "verbose", overrides_with = "quiet")]
     pub verbose: bool,
-    #[arg(value_name = "ARCHIVE")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "ARCHIVE")]
     pub archive: String,
-    #[arg(required = true, value_name = "PATH")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "PATH")]
     pub paths: Vec<String>,
 }
 impl Manual for Zip {
@@ -78,9 +78,9 @@ pub struct Unzip {
     #[arg(short = 'q')]
     pub quiet: bool,
     /// extract into DIR
-    #[arg(short = 'd', value_name = "DIR")]
+    #[arg(value_hint = ValueHint::DirPath, short = 'd', value_name = "DIR")]
     pub directory: Option<String>,
-    #[arg(value_name = "ARCHIVE")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "ARCHIVE")]
     pub archive: String,
     #[arg(value_name = "MEMBER")]
     pub members: Vec<String>,
@@ -136,10 +136,10 @@ pub struct Tar {
     #[arg(short = 'h', long = "dereference")]
     pub dereference: bool,
     /// the archive
-    #[arg(short = 'f', long = "file", value_name = "ARCHIVE")]
+    #[arg(value_hint = ValueHint::AnyPath, short = 'f', long = "file", value_name = "ARCHIVE")]
     pub file: Option<String>,
     /// work in DIR
-    #[arg(short = 'C', long = "directory", value_name = "DIR")]
+    #[arg(value_hint = ValueHint::DirPath, short = 'C', long = "directory", value_name = "DIR")]
     pub directory: Option<String>,
     /// keep files that exist, reporting each
     #[arg(short = 'k', long = "keep-old-files", overrides_with_all = ["skip_old_files", "overwrite"])]
@@ -150,7 +150,7 @@ pub struct Tar {
     /// replace them (the default)
     #[arg(long = "overwrite", overrides_with_all = ["keep_old_files", "skip_old_files"])]
     pub overwrite: bool,
-    #[arg(value_name = "PATH")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "PATH")]
     pub paths: Vec<String>,
 }
 impl Manual for Tar {
@@ -183,7 +183,7 @@ impl Manual for Tar {
 #[derive(Parser, Debug)]
 #[command(name = "faststart")]
 pub struct Faststart {
-    #[arg(value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE")]
     pub file: String,
 }
 impl Manual for Faststart {

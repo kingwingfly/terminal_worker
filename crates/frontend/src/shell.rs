@@ -18,8 +18,8 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::{
-    account_command, cancel_uploads, choose_files, completion_focus, endpoint, focus_input,
-    listing, request, set_directory,
+    account_command, cancel_choosing, cancel_uploads, choose_files, completion_focus, endpoint,
+    focus_input, listing, request, set_directory,
 };
 
 /// The most transcript lines kept, ...
@@ -102,6 +102,11 @@ pub struct Shell {
     pub input: RwSignal<String>,
     pub busy: RwSignal<bool>,
     pub directory_error: RwSignal<String>,
+    /// What the file panel says of the last thing clicked in it, which the terminal, perhaps
+    /// hidden, would say alone: a refusal, or the error of the line it ran ...
+    pub notice: RwSignal<String>,
+    /// ... while the running line is one the panel started.
+    panel: RwSignal<bool>,
     pub history: RwSignal<Vec<String>>,
     pub history_index: RwSignal<usize>,
     pub completion: RwSignal<Option<CompletionSession>>,
@@ -111,8 +116,10 @@ pub struct Shell {
     pub completion_offset: RwSignal<i64>,
     /// Whether Ctrl+C asked the running line to stop, ...
     cancelled: RwSignal<bool>,
-    /// ... which, for an upload, cancels it.
+    /// ... which, for an upload, cancels it, ...
     uploading: RwSignal<bool>,
+    /// ... and, waiting for files to upload, gives it none.
+    choosing: RwSignal<bool>,
     /// The files the next upload sends: chosen as the command started, or dropped.
     chosen: StoredValue<Option<js_sys::Promise>, LocalStorage>,
     /// Whether the tab was closed: its browser work stops, but not its server jobs.
@@ -264,6 +271,8 @@ impl Shell {
             input: RwSignal::new(String::new()),
             busy: RwSignal::new(false),
             directory_error: RwSignal::new(String::new()),
+            notice: RwSignal::new(String::new()),
+            panel: RwSignal::new(false),
             history: RwSignal::new(history),
             history_index: RwSignal::new(index),
             completion: RwSignal::new(None),
@@ -273,6 +282,7 @@ impl Shell {
             completion_offset: RwSignal::new(0),
             cancelled: RwSignal::new(false),
             uploading: RwSignal::new(false),
+            choosing: RwSignal::new(false),
             chosen: StoredValue::new_local(None),
             detached: RwSignal::new(false),
             prompt: StoredValue::new(None),
@@ -303,7 +313,23 @@ impl Shell {
         self.push(LogLine::Text(value));
     }
     fn error(self, message: impl AsRef<str>) {
+        if self.panel.get_untracked() {
+            self.notice.set(message.as_ref().into());
+        }
         self.log(format!("! {}", message.as_ref()));
+    }
+    /// Run `command` for the file panel, which shows its errors, and says so when the tab is
+    /// busy, rather than leave a click unanswered while the terminal may be hidden.
+    pub fn run_from_panel(self, command: String) {
+        self.notice.set(String::new());
+        if self.busy.get_untracked() || self.asking.get_untracked() {
+            self.notice.set(
+                "A command is running in this tab; wait for it, or stop it with Ctrl+C".into(),
+            );
+            return;
+        }
+        self.panel.set(true);
+        self.run(command);
     }
     pub async fn refresh(self) -> Result<(), String> {
         if let Ok(value) = request("/api/session", "GET").await {
@@ -525,7 +551,7 @@ impl Shell {
                         "{}  uploading  {}  {}%\n",
                         &upload["id"].as_str().unwrap_or_default()[..8],
                         upload["path"].as_str().unwrap_or_default(),
-                        upload["readable"].as_u64().unwrap_or(0) * 100 / size,
+                        upload["received"].as_u64().unwrap_or(0) * 100 / size,
                     ));
                 }
                 if text.is_empty() {
@@ -930,6 +956,7 @@ impl Shell {
             }
             self.busy.set(false);
             self.cancelled.set(false);
+            self.panel.set(false);
             crate::persist();
             focus_input();
         });
@@ -1134,6 +1161,9 @@ impl Shell {
         self.detached.set(true);
         self.cancelled.set(true);
         self.prompt.set_value(None);
+        if self.choosing.get_untracked() {
+            cancel_choosing();
+        }
     }
     /// Ctrl+C: clear the line, and stop what this tab is running at its next step.
     pub fn interrupt(self) {
@@ -1145,6 +1175,9 @@ impl Shell {
             self.cancelled.set(true);
             if self.uploading.get_untracked() {
                 cancel_uploads();
+            }
+            if self.choosing.get_untracked() {
+                cancel_choosing();
             }
             // A command waiting for an answer gets none.
             self.prompt.set_value(None);

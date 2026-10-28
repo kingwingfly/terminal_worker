@@ -357,6 +357,8 @@ pub async fn chunk(req: Request, env: &Env) -> Result<Response> {
         return error_response("Upload must include a content length", 411);
     };
     let sha256 = req.headers().get("X-Chunk-SHA256")?;
+    // The token of the page sending the upload, which holds it.
+    let hold = req.headers().get("X-Upload-Hold")?.unwrap_or_default();
     let digest = match &sha256 {
         Some(hex) => match decode_hex(hex) {
             Some(bytes) if bytes.len() == 32 => Some(bytes),
@@ -369,9 +371,10 @@ pub async fn chunk(req: Request, env: &Env) -> Result<Response> {
         &req,
         Method::Get,
         &format!(
-            "/internal/upload/chunk?id={}&index={}&length={length}",
+            "/internal/upload/chunk?id={}&index={}&length={length}&hold={}",
             encode(&id),
-            encode(&index)
+            encode(&index),
+            encode(&hold)
         ),
         None,
     )
@@ -396,7 +399,7 @@ pub async fn chunk(req: Request, env: &Env) -> Result<Response> {
         "/internal/upload/commit",
         Some(json!({
             "id": id, "index": index.parse::<u64>().ok(), "key": key, "sha256": sha256,
-            "complete": false,
+            "complete": false, "hold": hold,
         })),
     )
     .await

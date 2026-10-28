@@ -31,7 +31,7 @@ pub struct Entry {
     pub group: String,
     #[serde(default)]
     pub mode: u16,
-    /// For a file still uploading, the bytes readable so far.
+    /// For a file still uploading, the bytes that have arrived so far, as its upload counts them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uploaded: Option<u64>,
     /// A symbolic link's target, as written; `directory` then says whether it leads to one.
@@ -43,6 +43,10 @@ pub struct Entry {
     /// Whether it has an ACL beyond its mode, which ls -l marks with `+`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub acl: bool,
+    /// Whether the account it was listed for may not open it: list it, a directory (r and x),
+    /// or read it, a file; through a link, what it leads to.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub denied: bool,
 }
 
 impl Entry {
@@ -121,8 +125,8 @@ pub fn kind(path: &str) -> &'static str {
     match name.rsplit('.').next().unwrap_or("") {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "ico" => "image",
         "pdf" => "pdf",
-        "mp4" | "webm" | "mov" | "m4v" => "video",
-        "mp3" | "wav" | "ogg" | "m4a" | "flac" => "audio",
+        "mp4" | "webm" | "mov" | "m4v" | "ogv" => "video",
+        "mp3" | "wav" | "ogg" | "oga" | "opus" | "m4a" | "aac" | "flac" | "weba" => "audio",
         "md" | "markdown" => "markdown",
         "zip" | "tar" | "gz" | "tgz" => "archive",
         // Text the previews show as code, highlighted when they know the language, as tables
@@ -144,8 +148,11 @@ pub fn kind(path: &str) -> &'static str {
     }
 }
 
+/// The type a file is served as: its media type, text for text and for a name with no extension
+/// (README), and bytes to download for anything else, which any file may be.
 pub fn mime(path: &str) -> &'static str {
-    match path.to_lowercase().rsplit('.').next().unwrap_or("") {
+    let name = path.rsplit('/').next().unwrap_or("");
+    match name.to_lowercase().rsplit('.').next().unwrap_or("") {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
@@ -159,15 +166,21 @@ pub fn mime(path: &str) -> &'static str {
         "mp4" | "m4v" => "video/mp4",
         "webm" => "video/webm",
         "mov" => "video/quicktime",
+        "ogv" => "video/ogg",
         "mp3" => "audio/mpeg",
         "wav" => "audio/wav",
-        "ogg" => "audio/ogg",
+        "ogg" | "oga" | "opus" => "audio/ogg",
         "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "weba" => "audio/webm",
         "flac" => "audio/flac",
         "zip" => "application/zip",
         "gz" | "tgz" => "application/gzip",
         "tar" => "application/x-tar",
-        _ => "text/plain; charset=utf-8",
+        _ if !name.contains('.') || matches!(kind(path), "text" | "markdown" | "slides") => {
+            "text/plain; charset=utf-8"
+        }
+        _ => "application/octet-stream",
     }
 }
 
@@ -297,6 +310,14 @@ mod tests {
         assert_eq!(mime("/a.tar.gz"), "application/gzip");
         assert_eq!(mime("/logo.SVG"), "image/svg+xml");
         assert_eq!(kind("/report.docx"), "unknown");
+        // Any file uploads; what is not text or media downloads, as bytes.
+        assert_eq!(kind("/song.aac"), "audio");
+        assert_eq!(mime("/song.aac"), "audio/aac");
+        assert_eq!(mime("/voice.opus"), "audio/ogg");
+        assert_eq!(mime("/report.docx"), "application/octet-stream");
+        assert_eq!(mime("/notes/README"), "text/plain; charset=utf-8");
+        assert_eq!(mime("/src/main.rs"), "text/plain; charset=utf-8");
+        assert_eq!(mime("/v1.2/Makefile"), "text/plain; charset=utf-8");
     }
     #[test]
     fn quoted_paths_are_one_argument() {

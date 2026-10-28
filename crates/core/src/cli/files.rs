@@ -1,6 +1,6 @@
 //! Files: ls, cd, pwd, open, vim, mkdir, touch, rm, mv, cp, ln, readlink, fd and upload.
 
-use clap::Parser;
+use clap::{Parser, ValueHint};
 
 use super::{Manual, Section};
 
@@ -23,7 +23,7 @@ pub struct Ls {
     /// accepted for habit: names starting with a dot are always listed
     #[arg(short = 'a', long = "all")]
     pub all: bool,
-    #[arg(value_name = "PATH")]
+    #[arg(value_hint = ValueHint::DirPath, value_name = "PATH")]
     pub path: Option<String>,
 }
 impl Manual for Ls {
@@ -44,7 +44,7 @@ impl Manual for Ls {
 #[derive(Parser, Debug)]
 #[command(name = "cd")]
 pub struct Cd {
-    #[arg(value_name = "DIR")]
+    #[arg(value_hint = ValueHint::DirPath, value_name = "DIR")]
     pub dir: Option<String>,
 }
 impl Manual for Cd {
@@ -84,7 +84,7 @@ impl Manual for Pwd {
 #[derive(Parser, Debug)]
 #[command(name = "open")]
 pub struct Open {
-    #[arg(value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE")]
     pub file: String,
 }
 impl Manual for Open {
@@ -109,7 +109,7 @@ impl Manual for Open {
 #[derive(Parser, Debug)]
 #[command(name = "vim")]
 pub struct Vim {
-    #[arg(value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE")]
     pub file: String,
 }
 impl Manual for Vim {
@@ -135,7 +135,7 @@ pub struct Mkdir {
     /// make missing parents; a directory that exists is no error
     #[arg(short = 'p', long = "parents")]
     pub parents: bool,
-    #[arg(required = true, value_name = "DIR")]
+    #[arg(value_hint = ValueHint::DirPath, required = true, value_name = "DIR")]
     pub dirs: Vec<String>,
 }
 impl Manual for Mkdir {
@@ -161,7 +161,7 @@ pub struct Touch {
     /// make nothing; only check those that exist
     #[arg(short = 'c', long = "no-create")]
     pub no_create: bool,
-    #[arg(required = true, value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "FILE")]
     pub files: Vec<String>,
 }
 impl Manual for Touch {
@@ -192,7 +192,7 @@ pub struct Rm {
     /// say nothing of paths that do not exist
     #[arg(short = 'f', long = "force")]
     pub force: bool,
-    #[arg(required = true, value_name = "PATH")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "PATH")]
     pub paths: Vec<String>,
 }
 impl Manual for Rm {
@@ -230,9 +230,9 @@ pub struct Mv {
     /// say what moved
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
-    #[arg(required = true, value_name = "SOURCE")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "SOURCE")]
     pub sources: Vec<String>,
-    #[arg(value_name = "DEST")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "DEST")]
     pub dest: String,
 }
 impl Manual for Mv {
@@ -300,9 +300,9 @@ pub struct Cp {
     /// say what was copied
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
-    #[arg(required = true, value_name = "SOURCE")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "SOURCE")]
     pub sources: Vec<String>,
-    #[arg(value_name = "DEST")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "DEST")]
     pub dest: String,
 }
 impl Manual for Cp {
@@ -354,7 +354,7 @@ pub struct Ln {
     /// say what was linked
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
-    #[arg(required = true, value_name = "TARGET")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "TARGET")]
     pub operands: Vec<String>,
 }
 impl Manual for Ln {
@@ -390,7 +390,7 @@ pub struct Readlink {
     /// no newline after the last
     #[arg(short = 'n', long = "no-newline")]
     pub no_newline: bool,
-    #[arg(required = true, value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "FILE")]
     pub files: Vec<String>,
 }
 impl Manual for Readlink {
@@ -457,7 +457,7 @@ pub struct Fd {
     pub exec_batch: Option<Vec<String>>,
     #[arg(value_name = "PATTERN")]
     pub pattern: Option<String>,
-    #[arg(value_name = "PATH")]
+    #[arg(value_hint = ValueHint::DirPath, value_name = "PATH")]
     pub paths: Vec<String>,
 }
 impl Manual for Fd {
@@ -489,7 +489,7 @@ impl Manual for Fd {
 #[derive(Parser, Debug)]
 #[command(name = "upload")]
 pub struct Upload {
-    #[arg(value_name = "DIR")]
+    #[arg(value_hint = ValueHint::DirPath, value_name = "DIR")]
     pub dir: Option<String>,
 }
 impl Manual for Upload {

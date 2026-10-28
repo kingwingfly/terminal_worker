@@ -439,13 +439,18 @@ pub fn start(
         &id,
         &warnings.into_iter().map(|w| (true, w)).collect::<Vec<_>>(),
     );
-    // A job left waiting, for an answer or a runner, is cancelled after a week.
-    db.set_expiry("job", &id, now + 7 * 24 * 60 * 60);
+    // A job left waiting for a runner is cancelled after a week.
+    db.set_expiry("job", &id, now + WAITING);
     Ok(json!({"job": id, "kind": cmd}))
 }
 
 /// The most lines one view of a job carries.
 const LINES_MAX: u32 = 500;
+/// How long a job may wait to run, or be done, before it is cancelled ...
+pub const WAITING: u64 = 7 * 24 * 60 * 60;
+/// ... and for an answer to its question: then nobody is there to give one, as a process whose
+/// terminal closed is hung up.
+pub const UNANSWERED: u64 = 60 * 60;
 
 /// What a job's owner sees of it: its state, progress, question and new lines, a page of them,
 /// and whether more follow, which a job that has ended may still have.

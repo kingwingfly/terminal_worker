@@ -1,6 +1,6 @@
 //! Text: echo, the filters cat, head, tail, grep, wc, sort and uniq, and xargs.
 
-use clap::Parser;
+use clap::{Parser, ValueHint};
 
 use super::{Manual, Section};
 
@@ -35,7 +35,7 @@ impl Manual for Echo {
 #[derive(Parser, Debug)]
 #[command(name = "cat")]
 pub struct Cat {
-    #[arg(value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE")]
     pub files: Vec<String>,
 }
 impl Manual for Cat {
@@ -61,7 +61,7 @@ pub struct Head {
         allow_hyphen_values = true
     )]
     pub lines: Option<String>,
-    #[arg(value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE")]
     pub files: Vec<String>,
 }
 impl Manual for Head {
@@ -91,7 +91,7 @@ pub struct Tail {
         allow_hyphen_values = true
     )]
     pub lines: Option<String>,
-    #[arg(value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE")]
     pub files: Vec<String>,
 }
 impl Manual for Tail {
@@ -143,7 +143,7 @@ pub struct Grep {
         allow_hyphen_values = true
     )]
     pub patterns: Vec<String>,
-    #[arg(value_name = "PATTERN|FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "PATTERN|FILE")]
     pub operands: Vec<String>,
 }
 impl Manual for Grep {
@@ -172,7 +172,7 @@ pub struct Wc {
     /// bytes
     #[arg(short = 'c', long = "bytes")]
     pub bytes: bool,
-    #[arg(value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE")]
     pub files: Vec<String>,
 }
 impl Manual for Wc {
@@ -199,7 +199,7 @@ pub struct Sort {
     /// one of each equal line
     #[arg(short = 'u', long = "unique")]
     pub unique: bool,
-    #[arg(value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE")]
     pub files: Vec<String>,
 }
 impl Manual for Sort {
@@ -221,7 +221,7 @@ pub struct Uniq {
     /// prefix each with how many times it came
     #[arg(short = 'c', long = "count")]
     pub count: bool,
-    #[arg(value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE")]
     pub file: Option<String>,
 }
 impl Manual for Uniq {

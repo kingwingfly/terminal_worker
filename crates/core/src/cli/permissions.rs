@@ -1,6 +1,6 @@
 //! Permissions: chmod, chown, chgrp, getfacl, setfacl, getfattr and setfattr.
 
-use clap::Parser;
+use clap::{Parser, ValueHint};
 
 use super::{Manual, Section};
 
@@ -26,7 +26,7 @@ pub struct Chmod {
     pub recursive: bool,
     #[arg(value_name = "MODE", allow_hyphen_values = true)]
     pub mode: String,
-    #[arg(required = true, value_name = "PATH")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "PATH")]
     pub paths: Vec<String>,
 }
 impl Manual for Chmod {
@@ -57,7 +57,7 @@ pub struct Chown {
     pub no_dereference: bool,
     #[arg(value_name = "USER[:GROUP]")]
     pub owner: String,
-    #[arg(required = true, value_name = "PATH")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "PATH")]
     pub paths: Vec<String>,
 }
 impl Manual for Chown {
@@ -85,7 +85,7 @@ pub struct Chgrp {
     pub no_dereference: bool,
     #[arg(value_name = "GROUP")]
     pub group: String,
-    #[arg(required = true, value_name = "PATH")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "PATH")]
     pub paths: Vec<String>,
 }
 impl Manual for Chgrp {
@@ -129,7 +129,7 @@ pub struct Getfacl {
     /// a link itself
     #[arg(short = 'P', long = "physical")]
     pub physical: bool,
-    #[arg(required = true, value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "FILE")]
     pub files: Vec<String>,
 }
 impl Manual for Getfacl {
@@ -196,7 +196,7 @@ pub struct Setfacl {
     /// recompute the mask (the default)
     #[arg(long = "mask")]
     pub mask: bool,
-    #[arg(required = true, value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "FILE")]
     pub files: Vec<String>,
 }
 impl Manual for Setfacl {
@@ -247,7 +247,7 @@ pub struct Getfattr {
     /// keep the leading /
     #[arg(long = "absolute-names")]
     pub absolute: bool,
-    #[arg(required = true, value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "FILE")]
     pub files: Vec<String>,
 }
 impl Manual for Getfattr {
@@ -291,7 +291,7 @@ pub struct Setfattr {
     /// a link itself
     #[arg(short = 'h', long = "no-dereference")]
     pub no_dereference: bool,
-    #[arg(required = true, value_name = "FILE")]
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "FILE")]
     pub files: Vec<String>,
 }
 impl Manual for Setfattr {

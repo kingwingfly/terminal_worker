@@ -403,9 +403,10 @@ impl TerminalCommand for Upload {
             let chosen = shell.chosen.try_update_value(Option::take).flatten();
             let upload = cli::parse::<files::Upload>(rest(&args))?;
             let path = shell.path(upload.dir.as_deref().unwrap_or("."))?;
-            let files = JsFuture::from(chosen.unwrap_or_else(choose_files))
-                .await
-                .map_err(js_message)?;
+            shell.choosing.set(true);
+            let files = JsFuture::from(chosen.unwrap_or_else(choose_files)).await;
+            shell.choosing.set(false);
+            let files = files.map_err(js_message)?;
             if js_sys::Array::from(&files).length() == 0 {
                 return Ok(Output::default());
             }
