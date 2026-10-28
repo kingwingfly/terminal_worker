@@ -93,7 +93,7 @@ pub fn entry(c: &Db, who: &Identity, shown: &str, path: &str, n: &Node) -> Entry
         .as_deref()
         .and_then(|id| c.file(id))
         .filter(|f| !f.complete())
-        .map(|f| c.received(&f));
+        .map(|f| (c.received(&f), f.recording()));
     let mut entry = described(
         c,
         who,
@@ -116,10 +116,10 @@ pub fn entries(
     shown: &str,
     children: &[(String, Node)],
 ) -> Vec<Entry> {
-    let uploading: BTreeMap<String, u64> = c
+    let uploading: BTreeMap<String, (u64, bool)> = c
         .uploading_in(dir)
         .into_iter()
-        .map(|f| (f.id.clone(), c.received(&f)))
+        .map(|f| (f.id.clone(), (c.received(&f), f.recording())))
         .collect();
     let mut owners = BTreeMap::new();
     let mut groups = BTreeMap::new();
@@ -156,7 +156,7 @@ fn described(
     who: &Identity,
     path: &str,
     n: &Node,
-    uploaded: Option<u64>,
+    uploaded: Option<(u64, bool)>,
     owner: String,
     group: String,
 ) -> Entry {
@@ -175,7 +175,8 @@ fn described(
     let denied = !who.allows(opened, if directory { READ | EXEC } else { READ });
     Entry {
         denied,
-        uploaded,
+        uploaded: uploaded.map(|(received, _)| received),
+        recording: uploaded.is_some_and(|(_, recording)| recording),
         name: path.rsplit('/').next().unwrap_or("").into(),
         path: path.into(),
         directory,

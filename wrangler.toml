@@ -26,6 +26,14 @@ type = "ratelimit"
 namespace_id = "1001"
 simple = { limit = 12, period = 60 }
 
+# Hearing live sound (sound.rs): a room of listeners may come from one address, as venue Wi-Fi
+# does, and join at once.
+[[unsafe.bindings]]
+name = "LISTEN_LIMIT"
+type = "ratelimit"
+namespace_id = "1002"
+simple = { limit = 300, period = 60 }
+
 [dev]
 local_protocol = "http"
 port = 8787

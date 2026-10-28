@@ -36,8 +36,8 @@ test('preview enters fullscreen, toggles out, and closes cleanly while fullscree
 
 test('slides remain interactive inside the fullscreen surface', async ({ page }) => {
   await open(page, 'demo.slides.md');
-  await expect(page.locator('.slides .slide')).toBeVisible();
-  const scale = () => page.locator('.slides').evaluate(el => Number(getComputedStyle(el).getPropertyValue('--scale')));
+  await expect(page.locator('.slides-current .slide:visible')).toBeVisible();
+  const scale = () => page.locator('.slides-current').evaluate(el => Number(getComputedStyle(el).getPropertyValue('--scale')));
   const windowed = await scale();
   await enter(page);
   // Full screen, the slides scale up to the space they have.
@@ -53,7 +53,7 @@ test('slides remain interactive inside the fullscreen surface', async ({ page })
   await page.waitForTimeout(2500);
   expect(await shown()).toBe('1');
   await page.keyboard.press('ArrowRight');
-  await expect(page.locator('.slides .slide')).toContainText('One filesystem');
+  await expect(page.locator('.slides-current .slide:visible')).toContainText('One filesystem');
   await page.getByRole('button', { name: 'Close preview' }).click();
   await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
 });

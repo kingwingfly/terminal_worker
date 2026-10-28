@@ -2,6 +2,7 @@ pub mod acl;
 pub mod archive;
 pub mod cli;
 pub mod completion;
+pub mod devices;
 pub mod find;
 pub mod glob;
 pub mod permissions;
@@ -34,6 +35,9 @@ pub struct Entry {
     /// For a file still uploading, the bytes that have arrived so far, as its upload counts them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uploaded: Option<u64>,
+    /// Whether it is a recording still being made (`stream`), which grows as it is heard.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recording: bool,
     /// A symbolic link's target, as written; `directory` then says whether it leads to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,

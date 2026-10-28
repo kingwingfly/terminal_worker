@@ -43,8 +43,8 @@ test('terminal, password modal, upload, sanitized Markdown, slides and media', a
   await input.fill('faststart dem'); await input.press('Tab'); await expect(input).toHaveValue('faststart "demo.slides.md"');
   await input.fill('unzip -d med'); await input.press('Tab'); await expect(input).toHaveValue('unzip -d "media/"');
   await input.fill('open dem'); await input.press('Tab'); await expect(input).toHaveValue('open "demo.slides.md"');
-  await input.press('Enter'); await expect(page.locator('.slides .slide')).toBeVisible();
-  await page.keyboard.press('ArrowRight'); await expect(page.locator('.slides .slide')).toContainText('One filesystem');
+  await input.press('Enter'); await expect(page.locator('.slides-current .slide:visible')).toBeVisible();
+  await page.keyboard.press('ArrowRight'); await expect(page.locator('.slides-current .slide:visible')).toContainText('One filesystem');
   await page.getByRole('button', { name: 'Close preview' }).click();
   const folder = 'browser-test-' + Date.now();
   await run(page, 'su root'); await expect(page.locator('#auth')).toBeVisible();

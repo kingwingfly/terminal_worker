@@ -1,5 +1,7 @@
 import { inspectFaststart } from './faststart.mjs';
 import { uploadFile, Cancelled } from './upload.mjs';
+import { record } from './record.mjs';
+import { speak, listen as hearLive } from './sound.mjs';
 
 let configuration;
 export const ready = fetch('/terminal-config.json').then(async response => {
@@ -84,13 +86,26 @@ function listen() {
   events?.close();
   const socket = events = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/events`);
   let ping;
-  socket.onopen = () => { if (eventsRetry) changed(); eventsRetry = 0; ping = setInterval(() => socket.send('ping'), 30000); };
+  socket.onopen = () => {
+    if (eventsRetry) changed(); eventsRetry = 0; ping = setInterval(() => socket.send('ping'), 30000);
+    // A new line follows what the page follows, and asks what it waited to ask.
+    if (following || hearing) socket.send(JSON.stringify({ follow: followed() }));
+    for (const message of outbox.splice(0)) socket.send(JSON.stringify(message));
+  };
   socket.onmessage = event => {
     // A line this page replaced, as its account changed, has nothing more to say.
     if (events !== socket) return;
     let message; try { message = JSON.parse(event.data); } catch { return; }
     // This page's session ended elsewhere, not by its own sign in or out: it is a guest's now.
     if (message.session === 'ended') { if (!changingSession) void identityChanged('ended'); return; }
+    if (message.present) { presented(message.present); return; }
+    // The presentation followed ended, or may not be followed.
+    if (message.device) {
+      if (following?.device === message.device.name) following.ended = true;
+      if (hearing?.device === message.device.name) stopHearing();
+      window.dispatchEvent(new CustomEvent('terminal:device', { detail: message.device }));
+      return;
+    }
     const dirs = message.changed;
     if (!Array.isArray(dirs)) return;
     dirs.forEach(dir => pendingDirs.add(dir));
@@ -100,6 +115,55 @@ function listen() {
   socket.onclose = () => { clearInterval(ping); if (events === socket) setTimeout(listen, Math.min(30000, 1000 * 2 ** eventsRetry++)); };
 }
 listen();
+// Slides and PDFs presented follow each other (owner's request, 2026-10-28): the place a page
+// presents (viewer.rs calls present) shows in this browser's other windows showing that file,
+// and in the account's pages signed in elsewhere, which the authority tells (store.rs relay).
+const presenting = 'BroadcastChannel' in window ? new BroadcastChannel('terminal-present') : null;
+// The last place this page heard of or showed, by path, which a deck shown later starts at
+// (viewer.rs follow_presenting): one may come while its file is still being read.
+const heard = new Map();
+const presented = detail => { heard.set(detail.path, detail.at); window.dispatchEvent(new CustomEvent('terminal:present', { detail })); };
+if (presenting) presenting.onmessage = event => presented(event.data);
+function present(path, column, row) {
+  const place = { path, at: [column, row] };
+  heard.set(path, place.at);
+  presenting?.postMessage(place);
+  // While the line is down, only the last place of each file waits for it.
+  const waiting = outbox.findIndex(message => message.present?.path === path);
+  if (waiting >= 0) outbox.splice(waiting, 1);
+  say({ present: place });
+}
+// Said once the line is open, if it is not yet: what this page asks, as it opens a deck.
+const outbox = [];
+function say(message) { if (events?.readyState === WebSocket.OPEN) events.send(JSON.stringify(message)); else outbox.push(message); }
+// Where the account last showed the file at `path`, on any device, which the authority answers
+// with a present message; a page opens a deck there (viewer.rs).
+function ask(path) { say({ where: path }); }
+// The presentation this page follows (devices.rs), as /api/device described it: /dev/present/NAME,
+// the file it shows, whose it is, and whether this page's account turns it.
+let following = null;
+// The devices this page follows, which the authority tells it the end of.
+const followed = () => [following?.device, hearing?.device].filter(Boolean);
+const follows = () => say({ follow: followed() });
+async function attend(device) {
+  const info = await (await api('/api/device?path=' + encodeURIComponent(device))).json();
+  following = info; follows();
+  // Slides and sound together: the presenter's live sound of the same name, if any.
+  if (info.sound && hearing?.device !== info.sound) hear(info.sound).catch(error => console.warn('No live sound', error));
+  // Shown as the presenter shows it, from where they are.
+  if (info.kind === 'pdf') setPlace(info.path, { present: true, ...(info.place ? { page: info.place[0] } : {}) });
+  else setPlace(info.path, { slides: true, ...(info.place ? { slide: info.place } : {}) });
+  return open(info.path, info.kind, false, true);
+}
+function unfollow() { if (!following) return; following = null; follows(); }
+// A speaker view, which a deck's S opened (viewer.rs): it shows the deck its address names once
+// the terminal runs.
+export function started() {
+  const deck = new URLSearchParams(location.search).get('speaker');
+  if (!deck) return;
+  document.title = 'Speaker view · ' + deck.split('/').pop();
+  void open(deck, /\.slides\.md$/i.test(deck) ? 'slides' : 'markdown');
+}
 // Windows of this browser share its session cookie: each tells the others when it changes it,
 // so that none goes on showing one account while its requests are another's.
 const windows = 'BroadcastChannel' in window ? new BroadcastChannel('terminal-session') : null;
@@ -148,7 +212,7 @@ async function accountCommand(args, cwd) {
     trail.length = 0; showTrail();
     viewerTitle(args[1] ? 'man · ' + args[1] : 'Terminal Worker · Manual'); $('download').hidden = true;
     const article = document.createElement('article'); article.className = 'markdown manual'; article.innerHTML = window.terminalPreview.markdown(text, '/'); $('viewer-content').replaceChildren(article);
-    if (!$('viewer').open) { opener = document.activeElement; $('viewer').showModal(); }
+    if (!$('viewer').open) { opener = document.activeElement; $('viewer').showModal(); placePlayer(); }
     return {};
   }
   if (args[0] === 'vim') {
@@ -260,6 +324,63 @@ async function faststartWarning(file) {
 }
 // Cancel the uploads in progress, if any; whether there were.
 function cancelUploads() { if (!uploading) return false; uploading.abort(); return true; }
+// The microphone this page records (stream FILE), into `path`, and sends live as /dev/snd/NAME
+// when it may (sound.mjs); `progress` hears how it goes. Ctrl+C in its tab stops it
+// (stopRecording), which saves what was recorded. Settles with what was saved.
+let recording = null;
+async function recordSound(path, name, progress) {
+  if (recording) throw new Error('This page is recording already; stop it with Ctrl+C in its tab');
+  const controller = recording = new AbortController();
+  let microphone, live = null, liveNote = '', speaking = Promise.resolve();
+  try {
+    try { microphone = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
+    catch (error) { throw new Error('No microphone: ' + error.message); }
+    const saved = await record(path, microphone, { signal: controller.signal, progress: text => progress(text + liveNote),
+      // Live once the file is there, which its device links to; a recording all the same if not.
+      begun: () => { speaking = speak(path, name, microphone).then(sent => { live = sent; liveNote = ` · live as ${sent.device}`; }, error => { liveNote = ` · not live: ${error.message}`; }); } });
+    await speaking;
+    return { ...saved, device: live?.device ?? null, note: liveNote };
+  } finally {
+    recording = null;
+    microphone?.getTracks().forEach(track => track.stop());
+    // A recording that failed may still be connecting its live sound, which ends with it.
+    await speaking;
+    await live?.end();
+    changed();
+  }
+}
+function stopRecording() { if (!recording) return false; recording.abort(); return true; }
+// What this page hears live (/dev/snd/NAME), in a small player of its own, which goes on playing
+// whatever the viewer shows; one sound at a time.
+let hearing = null;
+// Which hear() is the latest: one stopped, or replaced by another, while it connects is let go.
+let hearings = 0;
+async function hear(device) {
+  stopHearing();
+  const turn = ++hearings;
+  // The sound plays from outside the player and the viewer, so that moving them never stops it.
+  const player = $('listening'), audio = Object.assign(document.createElement('audio'), { id: 'listening-audio', autoplay: true, hidden: true });
+  document.body.append(audio);
+  player.hidden = false; player.dataset.state = 'connecting'; $('listening-mute').textContent = 'Mute';
+  $('listening-name').textContent = device;
+  const stop = await hearLive(device, audio).catch(error => { if (turn === hearings) stopHearing(); throw error; });
+  if (turn !== hearings) { stop(); audio.remove(); return; }
+  hearing = { device, stop }; player.dataset.state = 'live'; follows();
+  // A browser that wants a tap to play sound shows Listen.
+  try { await audio.play(); } catch { if (turn === hearings) player.dataset.state = 'paused'; }
+}
+function stopHearing() {
+  hearings++;
+  hearing?.stop(); hearing = null; follows();
+  $('listening-audio')?.remove();
+  const player = $('listening'); player.hidden = true; delete player.dataset.state;
+}
+$('listening-play').onclick = () => { $('listening-audio')?.play().then(() => { $('listening').dataset.state = 'live'; }, () => {}); };
+$('listening-mute').onclick = () => { const audio = $('listening-audio'); if (!audio) return; audio.muted = !audio.muted; $('listening-mute').textContent = audio.muted ? 'Unmute' : 'Mute'; };
+$('listening-stop').onclick = stopHearing;
+// The player goes where it can be used: in the viewer while it is open, as the page around a
+// modal dialog takes no clicks, and full screen with it. The sound plays from outside both.
+function placePlayer() { ($('viewer').open ? $('viewer-surface') : document.body).append($('listening')); }
 // Open the file chooser now, while the tap or the key that asked for it lets a page open one:
 // phones refuse once a request has been awaited. Settles with the files chosen; none if closed.
 const chooser = Object.assign(document.createElement('input'), { type: 'file', multiple: true });
@@ -352,6 +473,7 @@ document.addEventListener('keydown', event => {
   if (dialog.dispatchEvent(new Event('cancel', { cancelable: true }))) dialog.close();
 });
 $('viewer').addEventListener('close', async () => {
+  unfollow(); placePlayer();
   const returnFocus = opener;
   // Start exiting before removing a fullscreen child (e.g. a video or iframe),
   // and restore focus after the browser finishes its fullscreen transition.
@@ -381,7 +503,7 @@ $('fullscreen').onclick = async () => {
 // Full screen, the preview's bars float over the content, hidden until the pointer moves, as a
 // video player's controls are; they stay while the pointer, or the keyboard's focus, is on one
 // (a button clicked keeps the focus, but not :focus-visible).
-const bars = ':is(.viewer-bar, .preview-bar, .slides-bar)';
+const bars = ':is(.viewer-bar, .preview-bar, .slides-bar, .pdf-toolbar)';
 let chromeTimer;
 function showChrome() {
   const surface = $('viewer-surface');
@@ -392,6 +514,9 @@ function showChrome() {
   }, 2000);
 }
 const fullscreen = () => document.fullscreenElement === $('viewer-surface');
+// A button clicked in the viewer leaves the focus where it was, so that keys go on turning slides
+// and pages: Space would press it again (Fullscreen, say). One tabbed to takes Space and Enter.
+$('viewer-surface').addEventListener('mousedown', event => { if (event.target instanceof Element && event.target.closest('button')) event.preventDefault(); });
 // A tap moves no pointer: pointerdown shows them on touch screens.
 for (const type of ['pointermove', 'pointerdown']) $('viewer-surface').addEventListener(type, () => { if (fullscreen()) showChrome(); });
 $('viewer-surface').addEventListener('focusin', event => { if (fullscreen() && event.target.closest(bars)) showChrome(); });
@@ -404,7 +529,10 @@ document.addEventListener('fullscreenchange', () => {
   else { clearTimeout(chromeTimer); $('viewer-surface').classList.remove('chrome'); }
 });
 window.addEventListener('message', event => { if (event.origin === location.origin && event.source === $('viewer-content').querySelector('iframe')?.contentWindow && event.data === 'close-game') closeViewer(); });
-async function open(path, kind, followed = false) {
+async function open(path, kind, followed = false, attending = false) {
+  if (/^\/dev\/present\/[^/]+$/.test(path)) return attend(path);
+  if (/^\/dev\/snd\/[^/]+$/.test(path)) return hear(path);
+  if (!attending && following?.path !== path) unfollow();
   if (!followed) trail.length = 0;
   const version = await cleanupViewer();
   if (version !== viewerVersion) return;
@@ -412,7 +540,7 @@ async function open(path, kind, followed = false) {
   const content = $('viewer-content'), dialog = $('viewer');
   $('download').hidden = false;
   viewerTitle(path); $('download').href = fileUrl(path); $('download').download = path.split('/').pop();
-  if (!dialog.open) { opener = document.activeElement; dialog.showModal(); }
+  if (!dialog.open) { opener = document.activeElement; dialog.showModal(); placePlayer(); }
   content.textContent = 'Loading...';
   try {
     if (kind === 'game') {
@@ -472,7 +600,7 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, unlock, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
+window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, present, presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, attending: path => following?.path === path ? following : null, unlock, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]')) return;

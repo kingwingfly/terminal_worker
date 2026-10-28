@@ -19,7 +19,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::{
     account_command, cancel_choosing, cancel_uploads, choose_files, completion_focus, endpoint,
-    focus_input, listing, request, set_directory,
+    focus_input, listing, request, set_directory, stop_recording,
 };
 
 /// The most transcript lines kept, ...
@@ -118,6 +118,8 @@ pub struct Shell {
     cancelled: RwSignal<bool>,
     /// ... which, for an upload, cancels it, ...
     uploading: RwSignal<bool>,
+    /// ... for a recording (`stream`), stops it, ...
+    recording: RwSignal<bool>,
     /// ... and, waiting for files to upload, gives it none.
     choosing: RwSignal<bool>,
     /// The files the next upload sends: chosen as the command started, or dropped.
@@ -282,6 +284,7 @@ impl Shell {
             completion_offset: RwSignal::new(0),
             cancelled: RwSignal::new(false),
             uploading: RwSignal::new(false),
+            recording: RwSignal::new(false),
             choosing: RwSignal::new(false),
             chosen: StoredValue::new_local(None),
             detached: RwSignal::new(false),
@@ -1176,6 +1179,9 @@ impl Shell {
             self.cancelled.set(true);
             if self.uploading.get_untracked() {
                 cancel_uploads();
+            }
+            if self.recording.get_untracked() {
+                stop_recording();
             }
             if self.choosing.get_untracked() {
                 cancel_choosing();

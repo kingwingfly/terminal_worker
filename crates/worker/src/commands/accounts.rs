@@ -247,6 +247,12 @@ impl ServerCommand for Userdel {
         }
         db.delete_user(name);
         db.delete_sessions(user.id);
+        // Its presentations end with it, and their followers hear so; where it showed decks is
+        // forgotten, as a new account may take its uid.
+        for device in db.devices_of(user.id) {
+            crate::devices::end(db, &device);
+        }
+        db.delete_places(user.id);
         Ok(format!("Deleted user {name}"))
     }
 }

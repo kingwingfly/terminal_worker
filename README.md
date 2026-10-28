@@ -173,7 +173,7 @@ The browser uploads in chunks of 8 MiB, three at a time, each with its SHA-256, 
 
 A file is listed as soon as its upload starts, with its progress (the bytes that have arrived, counted as the uploading tab counts them), and can be read while it arrives: a download, or a video, follows the upload, waiting for each chunk not sent yet (for up to 60 seconds without progress). An overwritten file shows its old content until the new upload completes.
 
-Every page keeps a WebSocket to the authority (`GET /api/events`, accepted only from this site's origin, hibernating while idle). After each change the authority tells each page which directories changed, only those the page's account may list, and the tabs showing one list it again: files created, moved, removed or uploaded on one device appear on the others as it happens. A line that drops opens again and lists what was missed. A page whose session ends elsewhere (signed out, a password changed, the account locked or removed, or the session expired) is told at once, and its tabs say so and show guest; windows of one browser, which share its session, follow each other's `su`, `login` and `exit`.
+Every page keeps a WebSocket to the authority (`GET /api/events`, accepted only from this site's origin, hibernating while idle). After each change the authority tells each page which directories changed, only those the page's account may list, and the tabs showing one list it again: files created, moved, removed or uploaded on one device appear on the others as it happens. A line that drops opens again and lists what was missed. Pages also say over it which slide, or presented PDF page, they show, which the authority keeps as where the account last showed it and passes to the account's pages signed in elsewhere and to the followers of its presentations; they ask where a deck was last shown, and which devices of /dev they follow (Presentations, below). A page whose session ends elsewhere (signed out, a password changed, the account locked or removed, or the session expired) is told at once, and its tabs say so and show guest; windows of one browser, which share its session, follow each other's `su`, `login` and `exit`.
 
 | API | Purpose |
 | --- | --- |
@@ -182,13 +182,18 @@ Every page keeps a WebSocket to the authority (`GET /api/events`, accepted only 
 | `POST /api/uploads/hold?id=&hold=` / `POST /api/uploads/release?id=&hold=` | Keep the upload (every few seconds), or let go of it for another page to resume |
 | `GET /api/uploads?id=` | The chunks committed so far |
 | `POST /api/uploads/complete?id=&hold=` / `DELETE /api/uploads?id=[&hold=]` | Finish, or cancel (with a hold, only if it is still this page's) |
+| `POST /api/uploads?path=` `{record: true}` | Start a recording: a new file that grows a chunk at a time; `/api/uploads/complete` takes its `sha256` at the end |
 | `PUT /api/file?path=` | A whole file in one request, up to 100 MB (the editor saves this way) |
+| `POST /api/present?path=&name=` / `DELETE /api/present?name=` | Present a deck or PDF as `/dev/present/NAME`, or stop |
+| `GET /api/device?path=/dev/present/NAME` | What a presentation shows, whose it is, where it is, and its sound, for one who may read the file |
+| `POST /api/sound?path=&name=` `{sdp, mid}` / `DELETE /api/sound?name=` | Send a recording's microphone live as `/dev/snd/NAME` (Realtime answers the offer), or stop |
+| `POST /api/sound/listen?path=/dev/snd/NAME` / `PUT /api/sound/answer?session=` `{sdp}` | Hear it: Realtime offers a session, which the page answers |
 
 Text, code, diffs and Markdown can be searched in the viewer: the search button or Ctrl/Cmd+F opens a panel that takes a regular expression (Rust syntax, as `grep` takes) or plain text, with a match-case toggle; Enter and Shift+Enter (or F3) step through the matches, which are highlighted without changing the preview, and Esc closes the panel.
 
 Previews render in Rust, as the terminal does; PDF pages, Mermaid diagrams, and code highlighting run in web workers (`crates/preview`), each loaded the first time a preview needs it.
 
-- PDF: one document that scrolls, every page in its place from the start; hayro draws the pages near the view, one at a time, and those far from it are released, so long documents stay light. The toolbar shows the page in view, goes up or down a page, and zooms (50–300%). Encrypted PDFs do not open; download them.
+- PDF: one document that scrolls, every page in its place from the start; hayro draws the pages near the view, one at a time, and those far from it are released, so long documents stay light. The toolbar shows the page in view, goes up or down a page, and zooms (50–300%). Its screen button presents the PDF, a deck exported from Beamer, PowerPoint or Keynote, say: one page at a time, filling the view, drawn as wide as it shows (up to 3840 pixels), the next and previous pages drawn ahead. The arrow keys, Space, Page Up and Down, N and P, Home and End, and a swipe turn it, and F shows it full screen, as with slides; other windows and devices presenting it follow, as slides do. Encrypted PDFs do not open; download them.
 - Markdown: GitHub's flavour with tables, task lists, footnotes, `$…$` / `$$…$$` maths as MathML, highlighted code blocks, and Mermaid diagrams drawn as images. Raw HTML is sanitized (ammonia, as DOMPurify did): no scripts, event handlers, styles, forms, or frames. The view switches to slides with the button in its corner.
 - Code: tree-sitter highlighting in 39 languages, chosen by extension or file name (`Makefile`, `Dockerfile`, ...), for text up to 1 MB; JSON is pretty-printed.
 - Tables: CSV and TSV, the first 1,000 rows. Cards: vCard contacts and iCalendar events. Diffs and patches are colored. ZIP and tar archives (gzipped too, up to 50 MB) list their files, in a worker of their own, as a gzipped tar is decompressed whole to list it: one that expands to more than 1 GB, as much as the terminal extracts, is not listed. A worker whose code cannot load says so, and the next preview starts it again.
@@ -228,7 +233,7 @@ Each job (zip, unzip, tar, faststart) has a `JobRunner` Durable Object and a con
 
 ### Presentations
 
-`open demo.slides.md` shows the slides. A standalone `---` starts the next slide and `--` one below it; separators inside fenced code are preserved. A `Note:` line hides the rest of its slide.
+`open demo.slides.md` shows the slides. A standalone `---` starts the next slide and `--` one below it; separators inside fenced code are preserved. A `Note:` line starts the slide's speaker notes, which show in the speaker view only.
 
 ````markdown
 # Title
@@ -241,9 +246,32 @@ First slide.
 
 - First point
 - Second point
+
+Note:
+What to say here, in Markdown too.
 ````
 
-Arrow keys move between slides, left/right and up/down, and F toggles fullscreen; the preview toolbar provides fullscreen and close. Slides have themes of their own, Light (the default), Dark, Sepia and Night, chosen in their bar and kept for every deck in this browser. Fullscreen, the bars float over the content and hide until the pointer moves. A title too long for the bar loses its start, so the file name stays in view. Escape closes a dialog and nothing else: the page takes the key, which Safari would otherwise also take to leave a full-screen window; a preview in element fullscreen leaves fullscreen first. Text slides are laid out at 1280 × 720 and scale to the space they have, in the dialog or fullscreen. A slide containing only one image fills the available viewer area with its aspect ratio preserved; it has no Markdown padding or 460px image limit. Relative Markdown links/images resolve within the virtual R2 filesystem, and linked files open in the viewer, with a Back button (←) to the file the link was in. Each preview opens where it was left: the slide, the PDF page and zoom, how far text was scrolled and media played, kept in this browser for the last 200 files. External links open separately. Text previews are limited to 2 MB; larger files can be downloaded.
+The keys are reveal.js's. The arrow keys move between slides, left/right and up/down; Space, N and Page Down go to the next slide in order, those below others included, and Shift+Space, P and Page Up back (a presenter's remote sends Page Up and Down); Home and End go to the first and last. On a touch screen, a swipe left or right does the same. F toggles fullscreen, O (or the grid button) shows an overview of every slide, and G (or a click on the slide number) asks for a slide by its number, `3` or `3.2`. A click on an image in a slide shows it large. Escape closes the overview or an enlarged image before the viewer. Slides near the one shown are drawn ahead and kept, so the next slide shows at once, its images loaded and its code highlighted.
+
+S opens the speaker view in a window of its own (pop-ups must be allowed), to keep on the laptop while the slides show on the projector: the slide, the next one, the slide's notes, which A− and A+ resize, the time since it opened (a click restarts it) and the time of day. The screen button in the slides' bar shows the speaker view in the window itself, as on a phone kept as a remote, where the notes go under the slide.
+
+Every window and device that shows a deck shows the same slide: the other windows of this browser, and the pages of the same account signed in elsewhere, which the authority tells. Turn the slides on a phone, and the laptop on the projector follows. A page of the account opens a deck where the account showed it last, on any device, so a phone picked up in the middle of a talk turns on from the slide shown. Signed out, a page is guest's, which anyone signed out shares, so it follows only the windows of its own browser.
+
+#### Presenting to others: /dev/present
+
+`present talk.slides.md` shows the deck (or Markdown as slides, or a PDF presented a page at a time) and makes `/dev/present/talk`, a link to it, owned by the presenter; `-n NAME` names it otherwise. Whoever may read the file follows it with `open /dev/present/talk`, guests too: each listener sees the slide shown, as it turns. A listener who turns elsewhere pauses following, and the button in the bar ("Follow NAME") brings them back to where the presenter is; what listeners do turns nothing of the presenter's. The presenter's own windows and devices turn it, as remotes. It lasts until `present --stop talk`, or 12 hours after its last turn; deleting the account ends it. Guests cannot present, as guest is everyone signed out.
+
+So for a talk whose files are `u:guest:r` (`setfacl -R -m u:guest:rX DIR`, so that its images may be read too): the laptop runs `present talk.slides.md` and presses S for the speaker view; the phone, signed in to the same account, opens the deck and turns it; the audience opens `/dev/present/talk` on their phones, signed in or not.
+
+#### Live sound: stream and /dev/snd
+
+`stream talk.weba` records the microphone into a new file, Opus in WebM, which every browser records (Chrome, Firefox, Safari 18.4+; none on Linux records AAC). The file is there at once, marked as recording, and grows a chunk (64 KiB, about eight seconds) at a time; it may be read meanwhile. Ctrl+C in its tab stops it, and the file is complete. A chunk that cannot be sent is sent again for as long as the network is down, while the recording goes on. A page that goes away mid-recording leaves what arrived: ten minutes later the authority completes the file with it.
+
+Signed in, the sound is also live, as `/dev/snd/talk`, through Cloudflare Realtime (WebRTC): whoever may read the recording hears it with `open /dev/snd/talk`, in a small player that goes on playing whatever the viewer shows, with Mute and ×; a browser that wants a tap to play shows Listen. Whoever follows `/dev/present/talk`, a presentation of the same name by the same account, hears it with the slides. Listeners in the same room as the speaker should use earphones, or the microphone hears them.
+
+Live sound needs the site's Cloudflare Realtime app: create an SFU app in the dashboard (Realtime), then give the Worker its App ID and secret, in `.dev.vars` locally (`REALTIME_APP_ID=…`, `REALTIME_APP_TOKEN=…`) and as secrets when deployed (`npx wrangler secret put REALTIME_APP_ID`, `npx wrangler secret put REALTIME_APP_TOKEN`). Pages never see the secret: the authority asks Realtime for them, once it has decided that they may. Without the app, `stream` records only, and says so.
+
+The preview toolbar provides fullscreen and close; a button clicked there or in the slides' bar leaves the focus where it was, so Space goes on turning slides rather than pressing it again. Slides have themes of their own, Light (the default), Dark, Sepia and Night, chosen in their bar and kept for every deck in this browser. Fullscreen, the bars float over the content and hide until the pointer moves. A title too long for the bar loses its start, so the file name stays in view. Escape closes a dialog and nothing else: the page takes the key, which Safari would otherwise also take to leave a full-screen window; a preview in element fullscreen leaves fullscreen first. Text slides are laid out at 1280 × 720 and scale to the space they have, in the dialog or fullscreen. A slide containing only one image fills the available viewer area with its aspect ratio preserved; it has no Markdown padding or 460px image limit. Relative Markdown links/images resolve within the virtual R2 filesystem, and linked files open in the viewer, with a Back button (←) to the file the link was in. Each preview opens where it was left: the slide, the PDF page and zoom, how far text was scrolled and media played, kept in this browser for the last 200 files. External links open separately. Text previews are limited to 2 MB; larger files can be downloaded.
 
 ### Optional games and custom branding
 
@@ -286,13 +314,15 @@ The manifest can select only a build-time registered entry. Its read permissions
 | `crates/worker` / `terminal-worker` | The Worker streams file bytes (`files.rs`); the `TerminalAuthority` Durable Object decides and records (`api.rs`; the commands it runs, one `ServerCommand` each, in `commands/`) in SQLite tables (`db.rs`) |
 | `web/app.js` | Browser bridge, authentication dialogs, the preview dialog's shell and games, focus handling |
 | `web/upload.mjs` | Chunked, resumable uploads |
+| `web/record.mjs`, `web/sound.mjs` | Recording the microphone into a growing file; live sound through Realtime |
+| `crates/worker/src/devices.rs`, `sound.rs` | /dev: presentations and live sound, and the authority's side of Realtime |
 | `crates/jobs` / `terminal-worker-jobs` | The job container's HTTP server: zip and tar, read and written deterministically, and MP4 faststart |
 | `containers/jobs/Dockerfile` | Its image: a static binary, built from the workspace |
 | `crates/worker/src/runner.rs`, `jobs.rs` | Jobs: the `JobRunner` Durable Object, and the authority's side of them |
 | `web/editor.mjs` | Lazy-loaded CodeMirror editor |
 | `web/faststart.mjs` | MP4 structural inspection |
 | `scripts/` | Local setup, frontend build, sample seeding |
-| `wrangler.toml` | Worker, assets, FILES R2, AUTHORITY, JOBS (with its container), and rate-limit bindings |
+| `wrangler.toml` | Worker, assets, FILES R2, AUTHORITY, JOBS (with its container), and rate-limit bindings (sign-ins; listening to live sound) |
 | `seed/` | English sample content |
 
 R2 stores bytes, as immutable chunk objects (`chunks/<file>/<index>-<random>`: each write has its own key, and the first one committed for an index is kept). `TerminalAuthority`, one Durable Object, keeps everything else in SQLite tables of its own storage (`crates/worker/src/db.rs`): accounts, groups, sessions, one row per path (`nodes`), and each file's content (`files`) with its committed chunks (`chunks`). A file has a fixed chunk size, so chunk *i* starts at *i* × the chunk size.

@@ -27,7 +27,7 @@ test('image-only slides fit the preview and fullscreen without shrinking into Ma
   await page.goto('/');
   const input=page.getByRole('combobox',{name:'Terminal command'});
   await input.fill('open /fit.slides.md');await input.press('Enter');
-  const slide=page.locator('.slides .slide'),image=slide.locator('img');
+  const slide=page.locator('.slides-current .slide:visible'),image=slide.locator('img');
   await expect(slide).toHaveClass(/slide-image/);
   const fitted=async()=>{
     await expect.poll(()=>image.evaluate(e=>e.naturalWidth)).toBeGreaterThan(0);

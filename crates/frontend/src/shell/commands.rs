@@ -15,7 +15,8 @@ use wasm_bindgen_futures::JsFuture;
 
 use super::{LogLine, Output, Shell, asks, js_message, listing_text};
 use crate::{
-    authorize, choose_files, endpoint, listing, open_file, request, set_directory, upload_files,
+    authorize, choose_files, endpoint, listing, open_file, record_sound, request, set_directory,
+    upload_files,
 };
 
 /// A command the tab runs.
@@ -55,6 +56,8 @@ pub static COMMANDS: &[&dyn TerminalCommand] = &[
     &Pwd,
     &Clear,
     &Open,
+    &Present,
+    &Stream,
     &Upload,
     &Help,
 ];
@@ -379,7 +382,114 @@ impl TerminalCommand for Open {
             }
             JsFuture::from(open_file(&path, &entry.kind))
                 .await
-                .map_err(|e| e.as_string().unwrap_or_else(|| "Open failed".into()))?;
+                .map_err(js_message)?;
+            Ok(Output::default())
+        }
+        .boxed_local()
+    }
+}
+
+struct Present;
+impl TerminalCommand for Present {
+    fn name(&self) -> &'static str {
+        "present"
+    }
+    fn run(
+        &self,
+        shell: Shell,
+        args: Vec<String>,
+        _: Option<String>,
+        _: bool,
+    ) -> LocalBoxFuture<'static, Result<Output, String>> {
+        async move {
+            let present = cli::parse::<files::Present>(rest(&args))?;
+            let encode = |text: &str| String::from(js_sys::encode_uri_component(text));
+            if let Some(name) = present.stop {
+                let stopped =
+                    request(&format!("/api/present?name={}", encode(&name)), "DELETE").await?;
+                let device = stopped["device"].as_str().unwrap_or(&name);
+                return Ok(Output::text(format!("Stopped {device}\n")));
+            }
+            let path = shell.path(present.file.as_deref().unwrap_or_default())?;
+            let mut url = endpoint("present", &path);
+            if let Some(name) = &present.name {
+                url.push_str(&format!("&name={}", encode(name)));
+            }
+            let started = request(&url, "POST").await?;
+            let device = started["device"].as_str().unwrap_or_default().to_string();
+            // Shown presented, a PDF a page at a time and Markdown as slides, from where the
+            // account showed it last.
+            let kind = terminal_worker_core::kind(&path);
+            let place = &started["place"];
+            let kept = match (kind, place.is_array()) {
+                ("pdf", true) => serde_json::json!({ "present": true, "page": place[0] }),
+                ("pdf", false) => serde_json::json!({ "present": true }),
+                (_, true) => serde_json::json!({ "slides": true, "slide": place }),
+                (_, false) => serde_json::json!({ "slides": true }),
+            };
+            crate::viewer::set_place(&path, kept);
+            JsFuture::from(open_file(&path, kind))
+                .await
+                .map_err(js_message)?;
+            let name = device.rsplit('/').next().unwrap_or_default();
+            Ok(Output::text(format!(
+                "Presenting {path} as {device}: whoever may read it follows it with open {device}; present --stop {name} ends it\n"
+            )))
+        }
+        .boxed_local()
+    }
+}
+
+struct Stream;
+impl TerminalCommand for Stream {
+    fn name(&self) -> &'static str {
+        "stream"
+    }
+    fn run(
+        &self,
+        shell: Shell,
+        args: Vec<String>,
+        _: Option<String>,
+        _: bool,
+    ) -> LocalBoxFuture<'static, Result<Output, String>> {
+        async move {
+            let stream = cli::parse::<files::Stream>(rest(&args))?;
+            let path = shell.path(&stream.file)?;
+            let lower = path.to_lowercase();
+            if !lower.ends_with(".weba") && !lower.ends_with(".webm") {
+                return Err(format!(
+                    "stream: {}: browsers record Opus in WebM; name the recording NAME.weba",
+                    stream.file
+                ));
+            }
+            // A line that follows the recording; Ctrl+C in this tab stops it, as it cancels an
+            // upload.
+            let line = RwSignal::new(String::from("● starting the microphone"));
+            shell.push(LogLine::Live(line));
+            let progress = Closure::<dyn Fn(String)>::new(move |text: String| line.set(text));
+            shell.recording.set(true);
+            let result = JsFuture::from(record_sound(
+                &path,
+                stream.name,
+                progress.as_ref().unchecked_ref(),
+            ))
+            .await;
+            shell.recording.set(false);
+            drop(progress);
+            let saved = result
+                .map_err(js_message)
+                .inspect_err(|e| line.set(format!("✕ {e}")))?;
+            let get = |name: &str| js_sys::Reflect::get(&saved, &name.into()).unwrap_or_default();
+            let seconds = get("seconds").as_f64().unwrap_or_default() as u64;
+            let size = get("size").as_f64().unwrap_or_default() as u64;
+            let note = get("note").as_string().unwrap_or_default();
+            line.set(format!(
+                "✓ {path} · {:02}:{:02} · {}{note}",
+                seconds / 60,
+                seconds % 60,
+                crate::viewer::size(size)
+            ));
+            shell.refresh().await?;
             Ok(Output::default())
         }
         .boxed_local()

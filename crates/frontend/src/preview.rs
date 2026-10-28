@@ -393,19 +393,40 @@ pub fn image_slide(html: &str) -> bool {
     image.starts_with("<img ") && image.find('>') == Some(image.len() - 1)
 }
 
-/// The slides of the reveal.js Markdown `source`, the file at `path`, as HTML, in columns: a
-/// `---` line starts the next column, and a `--` line the next slide in it, except in code
-/// blocks. Speaker notes, from a `Note:` line on, do not show.
-pub fn slides(source: &str, path: &str) -> Vec<Vec<String>> {
+/// A slide: what it shows, and its speaker notes, which show in the speaker view; both HTML.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Slide {
+    pub html: String,
+    pub notes: String,
+}
+
+/// The slides of the reveal.js Markdown `source`, the file at `path`, in columns: a `---` line
+/// starts the next column, and a `--` line the next slide in it, except in code blocks. A
+/// slide's speaker notes are what follows its `Note:` line.
+pub fn slides(source: &str, path: &str) -> Vec<Vec<Slide>> {
     split(source, "---")
         .iter()
         .map(|column| {
             split(column, "--")
                 .iter()
-                .map(|slide| markdown(without_notes(slide), path))
+                .map(|slide| {
+                    let (shown, notes) = notes(slide);
+                    Slide {
+                        html: markdown(shown, path),
+                        notes: markdown(notes, path),
+                    }
+                })
                 .collect()
         })
         .collect()
+}
+
+/// The place of the slide `text` names, as reveal.js numbers slides: `3` is the third column,
+/// `3.2` the second slide in it.
+pub fn slide_number(text: &str) -> Option<(usize, usize)> {
+    let (column, row) = text.trim().split_once('.').unwrap_or((text.trim(), "1"));
+    let number = |text: &str| text.parse::<usize>().ok()?.checked_sub(1);
+    Some((number(column)?, number(row)?))
 }
 
 /// `source` cut at each line that is `separator`, outside fenced code blocks.
@@ -442,17 +463,23 @@ fn split(source: &str, separator: &str) -> Vec<String> {
     parts
 }
 
-/// `slide` without its speaker notes.
-fn without_notes(slide: &str) -> &str {
+/// `slide` cut at its speaker notes, which start at a `Note:` (or `Notes:`) line: what shows,
+/// and the notes, without that word.
+fn notes(slide: &str) -> (&str, &str) {
     let mut start = 0;
     for line in slide.split_inclusive('\n') {
-        let lower = line.trim_start().to_lowercase();
-        if lower.starts_with("note:") || lower.starts_with("notes:") {
-            return &slide[..start];
+        let indent = line.len() - line.trim_start().len();
+        for word in ["note:", "notes:"] {
+            if line[indent..]
+                .get(..word.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(word))
+            {
+                return (&slide[..start], &slide[start + indent + word.len()..]);
+            }
         }
         start += line.len();
     }
-    slide
+    (slide, "")
 }
 
 /// The CSV `text`, separated by `delimiter`, as a table.
@@ -807,7 +834,10 @@ mod test {
             "![Wide](wide.svg)\n\nNote:\nNotes.\n\n---\n\nA caption ![x](a.png)\n\n---\n\n# Title\n\n![x](a.png)\n",
             "/deck.slides.md",
         );
-        let alone: Vec<bool> = deck.iter().map(|column| image_slide(&column[0])).collect();
+        let alone: Vec<bool> = deck
+            .iter()
+            .map(|column| image_slide(&column[0].html))
+            .collect();
         assert_eq!(alone, [true, false, false]);
         assert!(!image_slide(
             "<p><a href=\"/x\"><img src=\"a.png\"></a></p>"
@@ -816,19 +846,33 @@ mod test {
 
     #[test]
     fn slides_follow_reveal() {
-        let deck =
-            "# One\n\n---\n\n# Two\n\n--\n\n# Two, below\n\nNote: not shown\n\n---\n\n# Three\n";
+        let deck = "# One\n\n---\n\n# Two\n\n--\n\n# Two, below\n\nNote: said, *not* shown\n\nAt length.\n\n---\n\n# Three\n\nnotes:\nLower case.\n";
         let deck = slides(deck, "/deck.slides.md");
         assert_eq!(deck.iter().map(Vec::len).collect::<Vec<_>>(), [1, 2, 1]);
-        assert!(deck[1][1].contains("Two, below"));
-        assert!(!deck[1][1].contains("not shown"));
+        assert!(deck[1][1].html.contains("Two, below"));
+        assert!(!deck[1][1].html.contains("said"));
+        assert_eq!(
+            deck[1][1].notes,
+            "<p>said, <em>not</em> shown</p>\n<p>At length.</p>\n"
+        );
+        assert_eq!(deck[2][0].notes, "<p>Lower case.</p>\n");
+        assert_eq!(deck[0][0].notes, "");
         // Separators in code blocks are code.
         let deck = slides(
             "# Code\n\n```yaml\n---\nkey: value\n```\n\n---\n\n# Next\n",
             "/d.md",
         );
         assert_eq!(deck.len(), 2);
-        assert!(deck[0][0].contains("key: value"));
+        assert!(deck[0][0].html.contains("key: value"));
+    }
+
+    #[test]
+    fn slides_are_numbered_from_one() {
+        assert_eq!(slide_number("3"), Some((2, 0)));
+        assert_eq!(slide_number(" 3.2 "), Some((2, 1)));
+        for wrong in ["", "0", "3.0", "x", "3.", "-1", "3.2.1"] {
+            assert_eq!(slide_number(wrong), None, "{wrong}");
+        }
     }
 
     #[test]
