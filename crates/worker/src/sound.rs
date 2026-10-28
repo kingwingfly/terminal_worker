@@ -176,7 +176,9 @@ pub async fn speak(
     api::run(state, move |db| {
         let who = auth::identity(db, key.as_deref());
         match devices::start_sound(db, &who, &path, &device, &media) {
-            Ok(_) => Reply::ok(json!({ "device": device, "sdp": sdp })),
+            Ok(made) => {
+                Reply::ok(json!({ "device": device, "sdp": sdp, "version": made["version"] }))
+            }
             Err(message) => api::denied(&message, &who),
         }
     })

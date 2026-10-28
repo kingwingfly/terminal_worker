@@ -17,8 +17,9 @@ async function run(page, text) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill(text); await input.press('Enter');
 }
-async function device(browser, username, password) {
+async function device(browser, username, password, prepare = async () => {}) {
   const context = await browser.newContext({ permissions: ['microphone'], extraHTTPHeaders: { 'CF-Connecting-IP': address(username || 'guest') } });
+  await prepare(context);
   // The microphones a page takes, to end them as if unplugged.
   await context.addInitScript(() => {
     const take = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
@@ -138,5 +139,84 @@ test('live sound: /dev/snd/NAME is heard by whoever may read the recording, and 
     await root.delete(file(recording)); await root.delete(file(deck));
     await root.delete('/api/present?name=lecture');
     await speaker.context.close(); await guest.context.close();
+  }
+});
+
+test('jobs cancel stops a recording from another tab, keeping what arrived', async ({ browser }) => {
+  const speaker = await device(browser, name, password);
+  const page = speaker.page, recording = home + '/cancelled.weba';
+  const stat = async () => (await root.get('/api/stat?path=' + encodeURIComponent(recording))).json();
+  try {
+    await run(page, 'cd ~');
+    await run(page, 'stream cancelled.weba');
+    await expect.poll(async () => (await stat()).size, { timeout: 30_000, intervals: [1000] }).toBeGreaterThan(0);
+    const other = await speaker.context.newPage(); await other.goto(origin + '/');
+    await run(other, 'jobs');
+    await expect(transcript(other)).toContainText(`recording  ${recording}`);
+    const listed = (await transcript(other).textContent()).match(new RegExp(`([0-9a-f]{8})  recording  ${recording}`));
+    expect(listed).toBeTruthy();
+    await run(other, 'jobs cancel ' + listed[1]);
+    await expect(transcript(other)).toContainText(`Stopped the recording of ${recording}; what arrived is kept`);
+    // The recording's own tab hears that it was stopped; the file is there, whole.
+    await expect(transcript(page)).toContainText('✕ stopped elsewhere; what arrived is kept', { timeout: 30_000 });
+    const kept = await stat();
+    expect(kept.recording).toBeFalsy(); expect(kept.size).toBeGreaterThan(0);
+    const bytes = await (await root.get(file(recording), { headers: { 'Accept-Encoding': 'identity' } })).body();
+    expect(bytes.length).toBe(kept.size);
+    expect(bytes.subarray(0, 4).toString('hex')).toBe('1a45dfa3');
+  } finally {
+    await root.delete(file(recording));
+    await speaker.context.close();
+  }
+});
+
+test('a live sound that never connects leaves no device behind', async ({ browser }) => {
+  const live = await root.post('/api/sound/listen?path=' + encodeURIComponent('/dev/snd/nothing'));
+  test.skip(live.status() === 503, 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)');
+  // Relayed candidates only, and no relay: the connection never comes.
+  const speaker = await device(browser, name, password, context => context.addInitScript(() => {
+    const Real = window.RTCPeerConnection;
+    window.RTCPeerConnection = function (config) { return new Real({ ...config, iceTransportPolicy: 'relay' }); };
+    window.RTCPeerConnection.prototype = Real.prototype;
+  }));
+  const page = speaker.page, recording = home + '/unheard.weba';
+  const listed = async () => ((await (await root.get('/api/ls?path=' + encodeURIComponent('/dev/snd'))).json()).entries || []).map(entry => entry.name);
+  try {
+    await run(page, 'cd ~');
+    await run(page, 'stream unheard.weba');
+    await expect(transcript(page)).toContainText('not live: The sound did not connect', { timeout: 30_000 });
+    await expect.poll(listed, { timeout: 10_000 }).not.toContain('unheard');
+    await page.locator('#command').press('Control+c');
+    await expect(transcript(page)).toContainText(`✓ ${recording}`, { timeout: 30_000 });
+  } finally {
+    await root.delete(file(recording));
+    await speaker.context.close();
+  }
+});
+
+test('a page that stops its live sound leaves alone the one that took its name over', async ({ browser }) => {
+  const live = await root.post('/api/sound/listen?path=' + encodeURIComponent('/dev/snd/nothing'));
+  test.skip(live.status() === 503, 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)');
+  const laptop = await device(browser, name, password), phone = await device(browser, name, password);
+  const first = home + '/first.weba', second = home + '/second.weba';
+  const listed = async () => ((await (await root.get('/api/ls?path=' + encodeURIComponent('/dev/snd'))).json()).entries || []).map(entry => entry.name);
+  try {
+    await run(laptop.page, 'cd ~'); await run(phone.page, 'cd ~');
+    await run(laptop.page, 'stream -n shared first.weba');
+    await expect(transcript(laptop.page)).toContainText('live as /dev/snd/shared', { timeout: 20_000 });
+    // The phone, the same account, takes the name over.
+    await run(phone.page, 'stream -n shared second.weba');
+    await expect(transcript(phone.page)).toContainText('live as /dev/snd/shared', { timeout: 20_000 });
+    // The laptop stops: the phone's sound goes on.
+    await laptop.page.locator('#command').press('Control+c');
+    await expect(transcript(laptop.page)).toContainText(`✓ ${first}`, { timeout: 30_000 });
+    await laptop.page.waitForTimeout(1000);
+    expect(await listed()).toContain('shared');
+    await phone.page.locator('#command').press('Control+c');
+    await expect(transcript(phone.page)).toContainText(`✓ ${second}`, { timeout: 30_000 });
+    await expect.poll(listed, { timeout: 10_000 }).not.toContain('shared');
+  } finally {
+    await root.delete(file(first)); await root.delete(file(second));
+    await laptop.context.close(); await phone.context.close();
   }
 });

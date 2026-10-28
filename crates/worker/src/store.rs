@@ -141,12 +141,16 @@ impl TerminalAuthority {
         self.state.accept_web_socket(&pair.server);
         // A cookie whose session is gone is a guest's, which has nothing to end.
         let key = auth::token_key(req);
-        let live = transact(&self.state, {
+        let uid = transact(&self.state, {
             let key = key.clone();
-            move |db| (auth::identity(db, key.as_deref()).id != GUEST, false)
+            move |db| {
+                let id = auth::identity(db, key.as_deref()).id;
+                (Some(id).filter(|id| *id != GUEST), false)
+            }
         })?;
         pair.server.serialize_attachment(Line {
-            session: key.filter(|_| live),
+            session: key.filter(|_| uid.is_some()),
+            uid,
             follows: Vec::new(),
         })?;
         if self.state.get_websocket_auto_response().is_none()
@@ -196,6 +200,7 @@ impl TerminalAuthority {
         for ((ws, mut line), (gone, dirs)) in sockets.iter().zip(lines).zip(visible) {
             if gone {
                 line.session = None;
+                line.uid = None;
                 line.keep(ws);
                 let _ = ws.send_with_str(serde_json::json!({ "session": "ended" }).to_string());
             }
@@ -304,17 +309,21 @@ impl TerminalAuthority {
                     let told = lines
                         .iter()
                         .map(|line| {
-                            let other = line.session.as_deref().filter(|other| *other != key);
+                            // Another session of the presenter's account, as the line was opened
+                            // with (whose session is checked to be so still), or a follower: no
+                            // other line is looked up.
+                            let elsewhere = line.uid == Some(who.id)
+                                && line.session.as_deref().is_some_and(|other| other != key);
                             let watching: Vec<&String> = line
                                 .follows
                                 .iter()
                                 .filter(|device| presented.contains(device))
                                 .collect();
-                            if other.is_none() && watching.is_empty() {
+                            if !elsewhere && watching.is_empty() {
                                 return false;
                             }
                             let reader = auth::identity(db, line.session.as_deref());
-                            (other.is_some() && reader.id == who.id)
+                            (elsewhere && reader.id == who.id)
                                 || watching.into_iter().any(|device| {
                                     *may.entry((reader.id, device.as_str())).or_insert_with(|| {
                                         devices::followed(db, &reader, device).is_ok()
@@ -483,10 +492,13 @@ impl TerminalAuthority {
 }
 
 /// What a page's line keeps: the session it was opened with (none for a guest's, or once that
-/// session ended), and the devices it follows: a presentation, a sound.
+/// session ended), its account then, and the devices it follows: a presentation, a sound.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Line {
     session: Option<String>,
+    /// The account the session was, as the line was opened.
+    #[serde(default)]
+    uid: Option<u32>,
     #[serde(default)]
     follows: Vec<String>,
 }
@@ -500,6 +512,7 @@ impl Line {
                 let session = ws.deserialize_attachment::<Option<String>>().ok()??;
                 Some(Line {
                     session,
+                    uid: None,
                     follows: Vec::new(),
                 })
             })

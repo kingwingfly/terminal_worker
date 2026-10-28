@@ -4,15 +4,12 @@
 // upload (upload.mjs), and sends each chunk in order as soon as it is whole. Stopping sends the
 // rest as the last, short, chunk and completes the file. If the page goes, the authority keeps
 // what arrived (api::RECORDING_IDLE).
+import { json } from './http.mjs';
+
 const HEARTBEAT = 5000;
 const RETRIES = 3;
 export const RECORDED = 'audio/webm;codecs=opus';
 
-async function json(response) {
-  let body = {}; try { body = await response.json(); } catch {}
-  if (!response.ok) { const error = new Error(body.error || `Request failed (${response.status})`); error.status = response.status; throw error; }
-  return body;
-}
 // `bytes`, in the unit they make at least one of.
 const size = bytes => bytes < 1e3 ? `${bytes} B` : bytes < 1e6 ? `${(bytes / 1e3).toFixed(1)} KB` : `${(bytes / 1e6).toFixed(1)} MB`;
 const clock = seconds => `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
@@ -26,22 +23,24 @@ export async function record(destination, microphone, { progress = () => {}, beg
   const held = `id=${encodeURIComponent(begun.id)}&hold=${encodeURIComponent(begun.hold)}`;
   const chunkSize = begun.chunk_size;
   there(begun);
-  let failure = null, sent = 0, index = 0, pending = new Uint8Array(0);
+  // `full`: the file reached the largest a file may be, and takes no more.
+  let failure = null, full = false, sent = 0, index = 0, pending = new Uint8Array(0);
   // Chunks go one at a time, in order: the file is what arrived, from its start.
   let queue = Promise.resolve();
   const send = bytes => {
-    whole.update(bytes);
     const at = index++;
     queue = queue.then(async () => {
       for (let attempt = 0; ; attempt++) {
-        // Failed meanwhile (the hold lost, say): nothing more goes.
-        if (failure) return;
+        // Failed meanwhile (the hold lost, say), or full: nothing more goes.
+        if (failure || full) return;
         try {
           const response = await fetch(`/api/uploads/chunk?id=${encodeURIComponent(begun.id)}&index=${at}`, { method: 'PUT', headers: { 'X-Chunk-SHA256': rust.sha256(bytes), 'X-Upload-Hold': begun.hold }, body: bytes });
-          await json(response); sent += bytes.length; return;
+          // Its hash is of what arrived, in order.
+          await json(response); sent += bytes.length; whole.update(bytes); return;
         } catch (error) {
           // Refused, it is over. Unreachable, it goes again, for as long as the network is down,
           // while what is recorded meanwhile waits its turn; once stopped, a few times more.
+          if (error.status === 413) { full = true; return; }
           if ((error.status >= 400 && error.status < 500) || (signal.aborted && attempt + 1 >= RETRIES)) { failure = error; return; }
           await new Promise(resolve => setTimeout(resolve, Math.min(10000, 1000 * 2 ** attempt)));
         }
@@ -75,17 +74,18 @@ export async function record(destination, microphone, { progress = () => {}, beg
   try {
     recorder.start(1000);
     // Until stopped, here or by the recorder itself, or a chunk or the hold fails.
-    await new Promise(resolve => { const check = setInterval(() => { if (failure || signal.aborted || ended || recorder.state === 'inactive') { clearInterval(check); resolve(); } }, 250); });
-    const itself = !signal.aborted && !failure;
+    await new Promise(resolve => { const check = setInterval(() => { if (failure || full || signal.aborted || ended || recorder.state === 'inactive') { clearInterval(check); resolve(); } }, 250); });
+    const itself = !signal.aborted && !failure && !full;
     if (recorder.state !== 'inactive') recorder.stop();
     // A recorder that failed may say so without stopping as it should; it is not waited for long.
     await Promise.race([stopped, new Promise(resolve => setTimeout(resolve, 2000))]); await reading;
     // What is left is the last chunk, short.
     if (pending.length) { send(pending); pending = new Uint8Array(0); }
     await queue;
-    if (failure) throw failure;
+    // Stopped elsewhere (jobs cancel), or taken from this page: the file is what arrived.
+    if (failure) throw failure.status === 409 ? new Error('stopped elsewhere; what arrived is kept') : failure;
     const done = await json(await fetch(`/api/uploads/complete?${held}&sha256=${whole.hex()}`, { method: 'POST' }));
-    return { ...done, seconds: (performance.now() - started) / 1000, ...(itself ? { stopped: 'the microphone stopped' } : {}) };
+    return { ...done, seconds: (performance.now() - started) / 1000, ...(full ? { stopped: 'it reached the largest a file may be (1 GB)' } : itself ? { stopped: 'the microphone stopped' } : {}) };
   } finally {
     clearInterval(ticking); clearInterval(heartbeat);
     if (recorder.state !== 'inactive') recorder.stop();

@@ -3,13 +3,10 @@
 // from there. The authority (api.rs, sound) speaks to Realtime with the app's secret, and decides
 // who may: the speaker's account, which records the sound into a file, and whoever may read that
 // file.
+import { json } from './http.mjs';
+
 const ICE = [{ urls: 'stun:stun.cloudflare.com:3478' }];
 
-async function json(response) {
-  let body = {}; try { body = await response.json(); } catch {}
-  if (!response.ok) { const error = new Error(body.error || `Request failed (${response.status})`); error.status = response.status; throw error; }
-  return body;
-}
 const post = (url, body, method = 'POST') => fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(json);
 
 // Until `pc` connects, or fails, or ten seconds pass.
@@ -28,19 +25,28 @@ function connected(pc) {
  * and what ends it. */
 export async function speak(path, name, microphone) {
   const pc = new RTCPeerConnection({ iceServers: ICE, bundlePolicy: 'max-bundle' });
+  let published = null;
+  // Ends the device this page made, while it is still that one: another page of the account may
+  // have taken its name over since (devices::stop, by version).
+  const end = async () => {
+    pc.close();
+    if (!published) return;
+    const query = 'name=' + encodeURIComponent(published.device) + '&version=' + encodeURIComponent(published.version ?? '');
+    await fetch('/api/sound?' + query, { method: 'DELETE' }).catch(() => {});
+  };
   try {
     const transceiver = pc.addTransceiver(microphone.getAudioTracks()[0], { direction: 'sendonly' });
     await pc.setLocalDescription(await pc.createOffer());
     const query = 'path=' + encodeURIComponent(path) + (name ? '&name=' + encodeURIComponent(name) : '');
-    const published = await post('/api/sound?' + query, { sdp: pc.localDescription.sdp, mid: transceiver.mid });
+    published = await post('/api/sound?' + query, { sdp: pc.localDescription.sdp, mid: transceiver.mid });
     await pc.setRemoteDescription({ type: 'answer', sdp: published.sdp });
     await connected(pc);
-    const end = async () => {
-      pc.close();
-      await fetch('/api/sound?name=' + encodeURIComponent(published.device), { method: 'DELETE' }).catch(() => {});
-    };
     return { device: published.device, end };
-  } catch (error) { pc.close(); throw error; }
+  } catch (error) {
+    // A sound that never connected is no device for listeners to find.
+    await end();
+    throw error;
+  }
 }
 
 /** Hear the sound /dev/snd/NAME live in `audio`; settles with what stops it, and what the device

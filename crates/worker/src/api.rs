@@ -19,6 +19,8 @@ pub const RECORDING_CHUNK: u64 = 64 * 1024;
 /// How long a recording's page may go unheard (chunks, its hold) before the recording is
 /// completed with what arrived, in seconds.
 pub const RECORDING_IDLE: u64 = 10 * 60;
+/// What a recording that reached the largest a file may be is told: it takes no more.
+const RECORDING_FULL: &str = "The recording reached the largest a file may be (1 GB)";
 
 pub struct Reply {
     pub status: u16,
@@ -252,7 +254,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let name = param("name");
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
-                Reply::ok(acl!(devices::stop(db, &who, PRESENT, &name), &who))
+                Reply::ok(acl!(devices::stop(db, &who, PRESENT, &name, None), &who))
             })
         }
         // Live sound (sound.rs): send it, as the recording at `path` is made; stop it; hear the
@@ -263,9 +265,11 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         }
         (Method::Delete, "/api/sound") => {
             let name = param("name");
+            let version = Some(param("version")).filter(|version| !version.is_empty());
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
-                Reply::ok(acl!(devices::stop(db, &who, SOUND, &name), &who))
+                let stopped = devices::stop(db, &who, SOUND, &name, version.as_deref());
+                Reply::ok(acl!(stopped, &who))
             })
         }
         (Method::Post, "/api/sound/listen") => sound::listen(req, env, state, key, path).await,
@@ -521,6 +525,12 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 if !hold.is_empty() && db.hold(&id).is_some_and(|(token, _)| token != hold) {
                     return Reply::error(ELSEWHERE, 409);
                 }
+                // A recording is stopped, not cancelled: it keeps what arrived, as when its page
+                // goes, and its live sound ends.
+                if file.recording() {
+                    finish_recording(db, &file);
+                    return Reply::ok(json!({"stopped":true}));
+                }
                 cancel(db, &file);
                 Reply::ok(json!({"cancelled":true}))
             })
@@ -554,6 +564,9 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                             &format!("A recording's chunk is at most {} bytes", file.chunk_size),
                             400,
                         );
+                    }
+                    if file.size + length.unwrap_or_default() > MAX_FILE {
+                        return Reply::error(RECORDING_FULL, 413);
                     }
                     let (path, _) = match destination(db, &who, &file) {
                         Ok(found) => found,
@@ -1214,6 +1227,9 @@ fn commit_upload(
             held(db, id, hold).and_then(|()| destination(db, who, &file)),
         ) {
             (None, _) => Some(Reply::error("A recording's chunk must say its length", 400)),
+            (Some(length), _) if file.size + length > MAX_FILE => {
+                Some(Reply::error(RECORDING_FULL, 413))
+            }
             (_, Err(reply)) => Some(reply),
             _ => None,
         };

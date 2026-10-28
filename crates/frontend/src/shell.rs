@@ -577,12 +577,15 @@ impl Shell {
                     Ok(Output::text(format!("Cancelling job {}\n", &id[..8])))
                 } else if let Some(upload) = uploads.iter().find(|u| starts(u)) {
                     let id = upload["id"].as_str().unwrap_or_default();
+                    let path = upload["path"].as_str().unwrap_or_default();
                     request(&format!("/api/uploads?id={id}"), "DELETE").await?;
                     self.refresh().await?;
-                    Ok(Output::text(format!(
-                        "Cancelled the upload of {}\n",
-                        upload["path"].as_str().unwrap_or_default()
-                    )))
+                    // A recording stops, keeping what arrived; an upload is cancelled.
+                    Ok(Output::text(if upload["recording"] == true {
+                        format!("Stopped the recording of {path}; what arrived is kept\n")
+                    } else {
+                        format!("Cancelled the upload of {path}\n")
+                    }))
                 } else {
                     Err(format!("jobs: no job or upload {wanted}"))
                 }

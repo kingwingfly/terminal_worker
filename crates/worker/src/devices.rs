@@ -85,7 +85,8 @@ pub fn start_sound(
     // it shows at), so that its heartbeat and its end find the device, also through a link.
     let real = db.physical(who, path, true)?;
     make(db, who, device, &real, Some(media.to_string()))?;
-    Ok(json!({ "device": device }))
+    let version = db.device(device).map(|made| version(&made));
+    Ok(json!({ "device": device, "version": version }))
 }
 
 /// Whether `who` may make the device `device`: it is free, or `who`'s (or root's), or its
@@ -152,8 +153,15 @@ fn make(
 }
 
 /// Stop the device `name` of `directory`, a presentation or a live sound, as its account or
-/// root.
-pub fn stop(db: &mut Db, who: &Identity, directory: &str, name: &str) -> Result<Value, String> {
+/// root; given a `version` (`version`), only while it is still that one: a page ending the
+/// sound it sent ends nothing that another page of the account has taken the name over with.
+pub fn stop(
+    db: &mut Db,
+    who: &Identity,
+    directory: &str,
+    name: &str,
+    version: Option<&str>,
+) -> Result<Value, String> {
     let device = device_path(directory, name)?;
     let Some(made) = db.device(&device) else {
         return Err(format!("{device}: No such device; it does not exist"));
@@ -162,6 +170,9 @@ pub fn stop(db: &mut Db, who: &Identity, directory: &str, name: &str) -> Result<
         return Err(format!(
             "{device}: Permission denied: it is another account's"
         ));
+    }
+    if version.is_some_and(|version| version != self::version(&made)) {
+        return Ok(json!({ "device": device, "kept": true }));
     }
     end(db, &device);
     Ok(json!({ "device": device }))
