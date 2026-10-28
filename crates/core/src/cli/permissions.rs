@@ -173,10 +173,10 @@ pub struct Setfacl {
     #[arg(long = "set", value_name = "ENTRIES")]
     pub set: Option<String>,
     /// entries to add, from a file (not supported here)
-    #[arg(short = 'M', long = "modify-file", value_name = "FILE", hide = true)]
+    #[arg(value_hint = ValueHint::AnyPath, short = 'M', long = "modify-file", value_name = "FILE", hide = true)]
     pub modify_file: Option<String>,
     /// entries to remove, from a file (not supported here)
-    #[arg(short = 'X', long = "remove-file", value_name = "FILE", hide = true)]
+    #[arg(value_hint = ValueHint::AnyPath, short = 'X', long = "remove-file", value_name = "FILE", hide = true)]
     pub remove_file: Option<String>,
     /// remove all extended entries
     #[arg(short = 'b', long = "remove-all")]

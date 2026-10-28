@@ -455,6 +455,24 @@ impl Db {
             vec![text(file), text(token)],
         );
     }
+    /// Delete the sessions `condition` selects, and their expiries; the pages holding them hear
+    /// that they ended, if any did.
+    fn end_sessions(&mut self, condition: &str, args: Vec<SqlStorageValue>) {
+        #[derive(Deserialize)]
+        struct Ended {
+            key: String,
+        }
+        let ended = self.rows::<Ended>(
+            &format!("DELETE FROM sessions WHERE {condition} RETURNING key"),
+            args,
+        );
+        for session in &ended {
+            self.clear_expiry("session", &session.key);
+        }
+        if !ended.is_empty() {
+            ENDED.set(true);
+        }
+    }
     pub fn set_hold(&mut self, file: &str, token: &str, now: u64) {
         self.run(
             "INSERT OR REPLACE INTO upload_holds(file, token, held) VALUES(?, ?, ?)",
@@ -1034,16 +1052,13 @@ impl Store for Db {
         self.set_expiry("session", key, session.expires);
     }
     fn delete_session(&mut self, key: &str) {
-        self.run("DELETE FROM sessions WHERE key = ?", vec![text(key)]);
-        ENDED.set(true);
+        self.end_sessions("key = ?", vec![text(key)]);
     }
     fn delete_sessions(&mut self, user: u32) {
-        self.run("DELETE FROM sessions WHERE uid = ?", vec![int(user)]);
-        ENDED.set(true);
+        self.end_sessions("uid = ?", vec![int(user)]);
     }
     fn delete_expired_sessions(&mut self, now: u64) {
-        self.run("DELETE FROM sessions WHERE expires <= ?", vec![int(now)]);
-        ENDED.set(true);
+        self.end_sessions("expires <= ?", vec![int(now)]);
     }
 
     fn uploading(&self, file: &str) -> bool {

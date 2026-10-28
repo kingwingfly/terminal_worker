@@ -355,6 +355,9 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                         &who,
                     );
                 }
+                // A hold let go of is not taken back: a heartbeat sent before the release may
+                // arrive after it. A page that goes on sending without one is refused once
+                // another resumes the upload, holding it.
                 match held(db, &id, Some(&hold)) {
                     Ok(()) => Reply::ok(json!({"held": true})),
                     Err(reply) => reply,
@@ -939,8 +942,10 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
                 409,
             );
         }
-        let token = auth::random_token();
-        db.set_hold(&file.id, &token, now);
+        let token = hold.then(auth::random_token);
+        if let Some(token) = &token {
+            db.set_hold(&file.id, token, now);
+        }
         let committed: Vec<u64> = db.chunks(&file.id).into_iter().map(|c| c.idx).collect();
         return Reply::ok(json!({
             "id": file.id, "created": true, "resumed": true, "size": size,
