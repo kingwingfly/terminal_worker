@@ -45,7 +45,7 @@ test.beforeAll(async () => {
   expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
   base = '/presenting-' + Date.now().toString(36);
   expect((await root.post('/api/mkdir?path=' + encodeURIComponent(base))).ok()).toBe(true);
-  for (const [name, data] of [['deck.slides.md', deck], ['other.slides.md', '# Bee\n\n---\n\n# Bee two\n'], ['figure.svg', figure], ['pages.pdf', pdf()]]) expect((await root.put(file(base + '/' + name), { data })).status()).toBe(201);
+  for (const [name, data] of [['deck.slides.md', deck], ['other.slides.md', '# Bee\n\n---\n\n# Bee two\n'], ['third.slides.md', '# Sea\n'], ['figure.svg', figure], ['pages.pdf', pdf()]]) expect((await root.put(file(base + '/' + name), { data })).status()).toBe(201);
 });
 test.afterAll(async () => { await root.delete(file(base) + '&recursive=true'); await root.dispose(); });
 
@@ -371,6 +371,75 @@ test('a presentation that comes to show another file takes its listeners with it
     await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
     await laptop.page.keyboard.press('ArrowRight');
     await expect(shown(guest.page).locator('h1')).toHaveText('Bee two');
+  } finally {
+    await root.delete('/api/present?name=' + stem);
+    await command(['userdel', '-r', name]);
+    await laptop.context.close(); await guest.context.close();
+  }
+});
+
+test('a listener whose line was down when the presentation came to show another file goes with it on its return', async ({ browser }) => {
+  const name = 'missed' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
+  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  expect((await command(['useradd', '-m', name])).ok()).toBe(true);
+  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  let line;
+  const laptop = await device(browser, name, password);
+  const guest = await device(browser, undefined, undefined, page => page.routeWebSocket(/\/api\/events$/, ws => { ws.connectToServer(); line = ws; }));
+  const stem = 'missed' + Date.now().toString(36);
+  try {
+    await run(laptop.page, `present -n ${stem} ${base}/deck.slides.md`);
+    await expect(shown(laptop.page).locator('h1')).toHaveText('One');
+    await run(guest.page, `open /dev/present/${stem}`);
+    await expect(shown(guest.page).locator('h1')).toHaveText('One');
+    // While the guest's line is down, the name comes to show another deck, which turns.
+    const dropped = line;
+    await dropped.close();
+    await laptop.page.getByRole('button', { name: 'Close preview' }).click();
+    await run(laptop.page, `present -n ${stem} ${base}/other.slides.md`);
+    await expect(shown(laptop.page).locator('h1')).toHaveText('Bee');
+    await laptop.page.keyboard.press('ArrowRight');
+    await expect(shown(laptop.page).locator('h1')).toHaveText('Bee two');
+    // Back on the line, the guest learns what it shows now, and follows it.
+    await expect.poll(() => line !== dropped, { timeout: 10_000 }).toBe(true);
+    await expect(guest.page.locator('#viewer-title')).toHaveText(`${base}/other.slides.md`, { timeout: 10_000 });
+    await expect(shown(guest.page).locator('h1')).toHaveText('Bee two');
+    await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+  } finally {
+    await root.delete('/api/present?name=' + stem);
+    await command(['userdel', '-r', name]);
+    await laptop.context.close(); await guest.context.close();
+  }
+});
+
+test('a replacement heard after the listener left the presentation does not take them back to it', async ({ browser }) => {
+  const name = 'left' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
+  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  expect((await command(['useradd', '-m', name])).ok()).toBe(true);
+  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  const laptop = await device(browser, name, password), guest = await device(browser);
+  const stem = 'left' + Date.now().toString(36);
+  try {
+    await run(laptop.page, `present -n ${stem} ${base}/deck.slides.md`);
+    await expect(shown(laptop.page).locator('h1')).toHaveText('One');
+    await run(guest.page, `open /dev/present/${stem}`);
+    await expect(shown(guest.page).locator('h1')).toHaveText('One');
+    // What the device shows after its replacement comes late, held by the test.
+    let asked = false, release;
+    const held = new Promise(resolve => { release = resolve; });
+    await guest.page.route('**/api/device?**', async route => { asked = true; await held; await route.continue().catch(() => {}); });
+    await laptop.page.getByRole('button', { name: 'Close preview' }).click();
+    await run(laptop.page, `present -n ${stem} ${base}/other.slides.md`);
+    await expect.poll(() => asked, { timeout: 10_000 }).toBe(true);
+    // Meanwhile the guest leaves it for another deck of their own.
+    await guest.page.getByRole('button', { name: 'Close preview' }).click();
+    await run(guest.page, `open ${base}/third.slides.md`);
+    await expect(shown(guest.page).locator('h1')).toHaveText('Sea');
+    release();
+    await guest.page.waitForTimeout(1500);
+    await expect(guest.page.locator('#viewer-title')).toHaveText(`${base}/third.slides.md`);
+    await expect(shown(guest.page).locator('h1')).toHaveText('Sea');
+    await expect(guest.page.locator('.presentation-badge')).toHaveCount(0);
   } finally {
     await root.delete('/api/present?name=' + stem);
     await command(['userdel', '-r', name]);

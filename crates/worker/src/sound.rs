@@ -204,12 +204,17 @@ pub async fn listen(
     let heard = api::run(state, move |db| {
         let who = auth::identity(db, key.as_deref());
         let media = devices::followed(db, &who, &device).and_then(|device| {
-            device
+            let media = device
                 .media
-                .ok_or_else(|| format!("{}: not a sound", device.name))
+                .ok_or_else(|| format!("{}: not a sound", device.name))?;
+            Ok((media, device.path))
         });
         match media {
-            Ok(media) => Reply::ok(serde_json::from_str(&media).unwrap_or_default()),
+            Ok((media, path)) => {
+                let mut heard: Value = serde_json::from_str(&media).unwrap_or_default();
+                heard["path"] = json!(path);
+                Reply::ok(heard)
+            }
             Err(message) => api::denied(&message, &who),
         }
     })?;
@@ -221,6 +226,9 @@ pub async fn listen(
         .unwrap_or_default()
         .to_string();
     let track = heard.body["track"].as_str().unwrap_or(TRACK).to_string();
+    // The recording it is the sound of, which tells a page whose line was down whether it was
+    // replaced meanwhile.
+    let path = heard.body["path"].clone();
     let offered = async {
         let session = session(env).await?;
         let tracks = json!({
@@ -244,7 +252,7 @@ pub async fn listen(
         // Only the page that asked answers it (`answer`).
         Ok((session, sdp)) => api::run(state, move |db| {
             db.set_expiry(LISTENER, &session, auth::now() + ANSWER_TTL);
-            Reply::ok(json!({ "session": session, "sdp": sdp }))
+            Reply::ok(json!({ "session": session, "sdp": sdp, "path": path }))
         }),
         Err(why) => Ok(Reply::error(&why, 502)),
     }

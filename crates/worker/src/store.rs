@@ -230,8 +230,8 @@ impl TerminalAuthority {
     ///   included. Guests, who are anyone signed out, say nothing to anyone.
     /// - `{"where": path}`: where its account last showed that file, which it opens at.
     /// - `{"follow": [name...]}`: it follows these devices, a presentation /dev/present/NAME and
-    ///   a sound /dev/snd/NAME, and no others; it is told where a presentation is, and hears when
-    ///   one ends.
+    ///   a sound /dev/snd/NAME, and no others; it is told what each shows (`followed`) and where
+    ///   a presentation is, and hears when one ends or is replaced.
     fn heard(&self, from: &WebSocket, text: &str) {
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "lowercase")]
@@ -363,6 +363,12 @@ impl TerminalAuthority {
                 for (name, device) in followed {
                     match device {
                         Ok((place, path)) => {
+                            // What it shows now, which a page whose line was down when it was
+                            // replaced did not hear of.
+                            reply(
+                                from,
+                                serde_json::json!({ "followed": { "name": name, "path": path } }),
+                            );
                             line.follows.push(name);
                             if let Some((column, row)) = place {
                                 reply(

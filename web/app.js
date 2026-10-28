@@ -106,11 +106,12 @@ function listen() {
     if (message.session === 'ended') { if (!changingSession) void identityChanged('ended'); return; }
     if (message.present) { presented(message.present); return; }
     // A device followed shows something else now: followed again, if it still may be.
-    if (message.device?.replaced) {
-      const { name } = message.device;
-      const again = error => window.dispatchEvent(new CustomEvent('terminal:device', { detail: { name, error: error.message } }));
-      if (following?.device === name) attend(name).catch(again);
-      if (hearing?.device === name) hear(name).catch(again);
+    if (message.device?.replaced) { followAgain(message.device.name, true, true); return; }
+    // What a device followed shows, as the authority says on following it: one replaced while
+    // this page's line was down shows another file than the page does.
+    if (message.followed) {
+      const { name, path } = message.followed;
+      followAgain(name, following?.device === name && following.path !== path, hearing?.device === name && hearing.path !== path);
       return;
     }
     // The presentation followed ended, or may not be followed.
@@ -156,11 +157,16 @@ function ask(path) { say({ where: path }); }
 // The presentation this page follows (devices.rs), as /api/device described it: /dev/present/NAME,
 // the file it shows, whose it is, and whether this page's account turns it.
 let following = null;
+// Each attend, and each unfollow, starts anew: an answer for an older one is not applied, as the
+// page has left the presentation, or gone to another, meanwhile.
+let followings = 0;
 // The devices this page follows, which the authority tells it the end of.
 const followed = () => [following?.device, hearing?.device].filter(Boolean);
 const follows = () => say({ follow: followed() });
 async function attend(device) {
+  const turn = ++followings;
   const info = await (await api('/api/device?path=' + encodeURIComponent(device))).json();
+  if (turn !== followings) return;
   following = info; follows();
   // Slides and sound together: the presenter's live sound of the same name, if any.
   if (info.sound && hearing?.device !== info.sound) hear(info.sound).catch(error => console.warn('No live sound', error));
@@ -169,7 +175,14 @@ async function attend(device) {
   else setPlace(info.path, { slides: true, ...(info.place ? { slide: info.place } : {}) });
   return open(info.path, info.kind, false, true);
 }
-function unfollow() { if (!following) return; following = null; follows(); }
+function unfollow() { followings++; if (!following) return; following = null; follows(); }
+// Follow the device `name` again, as it shows something else now: the presentation followed, the
+// sound heard, or both; if that may no longer be, the page says so.
+function followAgain(name, presentation, sound) {
+  const again = error => window.dispatchEvent(new CustomEvent('terminal:device', { detail: { name, error: error.message } }));
+  if (presentation && following?.device === name) attend(name).catch(again);
+  if (sound && hearing?.device === name) hear(name).catch(again);
+}
 // A speaker view, which a deck's S opened (viewer.rs): it shows the deck its address names once
 // the terminal runs.
 export function started() {
@@ -377,9 +390,9 @@ async function hear(device) {
   document.body.append(audio);
   player.hidden = false; player.dataset.state = 'connecting'; $('listening-mute').textContent = 'Mute';
   $('listening-name').textContent = device;
-  const stop = await hearLive(device, audio).catch(error => { if (turn === hearings) stopHearing(); throw error; });
+  const { stop, path } = await hearLive(device, audio).catch(error => { if (turn === hearings) stopHearing(); throw error; });
   if (turn !== hearings) { stop(); audio.remove(); return; }
-  hearing = { device, stop }; player.dataset.state = 'live'; follows();
+  hearing = { device, stop, path }; player.dataset.state = 'live'; follows();
   // A browser that wants a tap to play sound shows Listen.
   try { await audio.play(); } catch { if (turn === hearings) player.dataset.state = 'paused'; }
 }
