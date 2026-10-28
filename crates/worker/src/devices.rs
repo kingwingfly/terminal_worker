@@ -191,8 +191,25 @@ pub fn attend(db: &Db, who: &Identity, name: &str) -> Result<Value, String> {
     Ok(json!({
         "device": device.name, "path": device.path, "kind": kind(&device.path), "owner": owner,
         "controller": who.id == device.owner, "place": db.place(device.owner, &device.path),
-        "sound": sound,
+        "sound": sound, "version": version(&device),
     }))
+}
+
+/// What a device is, as an opaque word that changes exactly when a takeover replaces it (`make`):
+/// its account, the file it shows, its sound. A page compares the one it followed with the one
+/// it is told on following again, to know whether what it shows is still that device's.
+pub fn version(device: &Device) -> String {
+    use sha2::{Digest, Sha256};
+    let what = format!(
+        "{}\n{}\n{}",
+        device.owner,
+        device.path,
+        device.media.as_deref().unwrap_or_default()
+    );
+    Sha256::digest(what.as_bytes())[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The device `name`, if `who` may follow or hear it: it exists, its link is still there, `who`

@@ -107,11 +107,11 @@ function listen() {
     if (message.present) { presented(message.present); return; }
     // A device followed shows something else now: followed again, if it still may be.
     if (message.device?.replaced) { followAgain(message.device.name, true, true); return; }
-    // What a device followed shows, as the authority says on following it: one replaced while
-    // this page's line was down shows another file than the page does.
+    // What a device followed is, as the authority says on following it: one replaced while this
+    // page's line was down (another file, account or sound) is not what the page shows.
     if (message.followed) {
-      const { name, path } = message.followed;
-      followAgain(name, following?.device === name && following.path !== path, hearing?.device === name && hearing.path !== path);
+      const { name, version } = message.followed;
+      followAgain(name, following?.device === name && following.version !== version, hearing?.device === name && hearing.version !== version);
       return;
     }
     // The presentation followed ended, or may not be followed.
@@ -165,7 +165,10 @@ const followed = () => [following?.device, hearing?.device].filter(Boolean);
 const follows = () => say({ follow: followed() });
 async function attend(device) {
   const turn = ++followings;
-  const info = await (await api('/api/device?path=' + encodeURIComponent(device))).json();
+  // An answer, or a failure, for an attend the page has left since says nothing.
+  let info;
+  try { info = await (await api('/api/device?path=' + encodeURIComponent(device))).json(); }
+  catch (error) { if (turn === followings) throw error; return; }
   if (turn !== followings) return;
   following = info; follows();
   // Slides and sound together: the presenter's live sound of the same name, if any.
@@ -390,9 +393,12 @@ async function hear(device) {
   document.body.append(audio);
   player.hidden = false; player.dataset.state = 'connecting'; $('listening-mute').textContent = 'Mute';
   $('listening-name').textContent = device;
-  const { stop, path } = await hearLive(device, audio).catch(error => { if (turn === hearings) stopHearing(); throw error; });
-  if (turn !== hearings) { stop(); audio.remove(); return; }
-  hearing = { device, stop, path }; player.dataset.state = 'live'; follows();
+  // A sound, or a failure, for a hear the page has left since says nothing.
+  let heard;
+  try { heard = await hearLive(device, audio); }
+  catch (error) { if (turn !== hearings) { audio.remove(); return; } stopHearing(); throw error; }
+  if (turn !== hearings) { heard.stop(); audio.remove(); return; }
+  hearing = { device, stop: heard.stop, version: heard.version }; player.dataset.state = 'live'; follows();
   // A browser that wants a tap to play sound shows Listen.
   try { await audio.play(); } catch { if (turn === hearings) player.dataset.state = 'paused'; }
 }

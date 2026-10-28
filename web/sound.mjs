@@ -43,8 +43,8 @@ export async function speak(path, name, microphone) {
   } catch (error) { pc.close(); throw error; }
 }
 
-/** Hear the sound /dev/snd/NAME live in `audio`; settles with what stops it, and the recording it
- * is the sound of. */
+/** Hear the sound /dev/snd/NAME live in `audio`; settles with what stops it, and what the device
+ * is (its version), to know whether it is replaced while the page's line is down. */
 export async function listen(device, audio) {
   const pc = new RTCPeerConnection({ iceServers: ICE, bundlePolicy: 'max-bundle' });
   try {
@@ -54,6 +54,6 @@ export async function listen(device, audio) {
     await pc.setLocalDescription(await pc.createAnswer());
     await post('/api/sound/answer?session=' + encodeURIComponent(offered.session), { sdp: pc.localDescription.sdp }, 'PUT');
     await connected(pc);
-    return { stop: () => { pc.close(); audio.srcObject = null; }, path: offered.path };
+    return { stop: () => { pc.close(); audio.srcObject = null; }, version: offered.version };
   } catch (error) { pc.close(); throw error; }
 }

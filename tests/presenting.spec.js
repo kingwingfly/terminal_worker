@@ -446,3 +446,85 @@ test('a replacement heard after the listener left the presentation does not take
     await laptop.context.close(); await guest.context.close();
   }
 });
+
+test('a page whose line was down when its presentation changed hands learns it on its return, and turns it if now its own', async ({ browser }) => {
+  const name = 'hands' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
+  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  expect((await command(['useradd', '-m', name])).ok()).toBe(true);
+  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  let line;
+  const presenter = await device(browser, name, password), guest = await device(browser);
+  const listener = await device(browser, 'root', rootPassword, page => page.routeWebSocket(/\/api\/events$/, ws => { ws.connectToServer(); line = ws; }));
+  const other = await device(browser, 'root', rootPassword);
+  const stem = 'hands' + Date.now().toString(36);
+  try {
+    await run(presenter.page, `present -n ${stem} ${base}/deck.slides.md`);
+    await expect(shown(presenter.page).locator('h1')).toHaveText('One');
+    for (const { page } of [listener, guest]) {
+      await run(page, `open /dev/present/${stem}`);
+      await expect(page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+    }
+    // While the listener's line is down, root takes the presentation over, the same file, and
+    // turns it to its end.
+    const dropped = line;
+    await dropped.close();
+    await run(other.page, `present -n ${stem} ${base}/deck.slides.md`);
+    await expect(other.page.locator('.slides-current .slide:visible')).toBeVisible();
+    await other.page.keyboard.press('End');
+    await expect(shown(other.page).locator('h1')).toHaveText('Three');
+    await expect(guest.page.locator('.presentation-badge')).toHaveText('Following root');
+    await expect(shown(guest.page).locator('h1')).toHaveText('Three');
+    // Back on the line, the listener, root's, is its presenter now: no listener's badge, and
+    // its turns are the presentation's.
+    await expect.poll(() => line !== dropped, { timeout: 10_000 }).toBe(true);
+    await expect(listener.page.locator('.presentation-badge')).toHaveCount(0, { timeout: 10_000 });
+    await expect(shown(listener.page).locator('h1')).toHaveText('Three');
+    await listener.page.keyboard.press('Home');
+    await expect(shown(guest.page).locator('h1')).toHaveText('One');
+  } finally {
+    await root.delete('/api/present?name=' + stem);
+    await command(['userdel', '-r', name]);
+    for (const { context } of [presenter, guest, listener, other]) await context.close();
+  }
+});
+
+test('a failure heard for a replacement the listener has since gone past does not end what they follow now', async ({ browser }) => {
+  const name = 'stale' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
+  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  expect((await command(['useradd', '-m', name])).ok()).toBe(true);
+  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  // A deck the presenter may read and guests may not.
+  const secret = `${base}/secret-${name}.slides.md`;
+  expect((await root.put(file(secret), { data: '# Secret\n' })).status()).toBe(201);
+  for (const args of [['chmod', '600', secret], ['setfacl', '-m', `u:${name}:r`, secret]]) expect((await command(args)).ok()).toBe(true);
+  const laptop = await device(browser, name, password), guest = await device(browser);
+  const stem = 'stale' + Date.now().toString(36);
+  try {
+    await run(laptop.page, `present -n ${stem} ${base}/deck.slides.md`);
+    await expect(shown(laptop.page).locator('h1')).toHaveText('One');
+    await run(guest.page, `open /dev/present/${stem}`);
+    await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+    // The guest may not follow the secret deck; that refusal comes late, held by the test.
+    let asked = false, release;
+    const held = new Promise(resolve => { release = resolve; });
+    await guest.page.route('**/api/device?**', async route => { if (!asked) { asked = true; await held; } await route.continue().catch(() => {}); });
+    for (const deck of [secret, `${base}/third.slides.md`]) {
+      await laptop.page.getByRole('button', { name: 'Close preview' }).click();
+      await run(laptop.page, `present -n ${stem} ${deck}`);
+      await expect(laptop.page.locator('#viewer-title')).toHaveText(deck);
+      await expect.poll(() => asked, { timeout: 10_000 }).toBe(true);
+    }
+    // Meanwhile the name came to show a deck the guest may read, which they follow.
+    await expect(shown(guest.page).locator('h1')).toHaveText('Sea');
+    await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+    release();
+    await guest.page.waitForTimeout(1500);
+    await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+    await expect(guest.page.locator('.presentation-badge')).toBeEnabled();
+  } finally {
+    await root.delete('/api/present?name=' + stem);
+    await root.delete(file(secret));
+    await command(['userdel', '-r', name]);
+    await laptop.context.close(); await guest.context.close();
+  }
+});

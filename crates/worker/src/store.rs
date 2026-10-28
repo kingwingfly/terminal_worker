@@ -199,19 +199,28 @@ impl TerminalAuthority {
                 line.keep(ws);
                 let _ = ws.send_with_str(serde_json::json!({ "session": "ended" }).to_string());
             }
-            let (ended, following): (Vec<String>, Vec<String>) = std::mem::take(&mut line.follows)
-                .into_iter()
-                .partition(|device| removed.iter().any(|(name, _)| name == device));
-            line.follows = following;
-            if !ended.is_empty() {
+            // Ended: no longer followed. Replaced by one that shows something else: still
+            // followed, by name, so that a page attending it again hears of the next replacement
+            // too; what it relays is checked against each follower as it goes.
+            let told: Vec<(String, bool)> = line
+                .follows
+                .iter()
+                .filter_map(|device| {
+                    let replaced = removed.iter().any(|(name, again)| name == device && *again);
+                    let ended = removed.iter().any(|(name, again)| name == device && !again);
+                    (replaced || ended).then(|| (device.clone(), !ended))
+                })
+                .collect();
+            let following = line.follows.len();
+            line.follows.retain(|device| {
+                !told
+                    .iter()
+                    .any(|(name, replaced)| name == device && !replaced)
+            });
+            if line.follows.len() != following {
                 line.keep(ws);
             }
-            // Ended, or replaced by one that shows something else, which the page follows
-            // again, asking whether it may.
-            for device in ended {
-                let replaced = removed
-                    .iter()
-                    .any(|(name, again)| *name == device && *again);
+            for (device, replaced) in told {
                 let mut said = serde_json::json!({ "name": device });
                 said[if replaced { "replaced" } else { "ended" }] = true.into();
                 let _ = ws.send_with_str(serde_json::json!({ "device": said }).to_string());
@@ -349,8 +358,10 @@ impl TerminalAuthority {
                     let followed: Vec<_> = asked
                         .into_iter()
                         .map(|name| {
-                            let device = devices::followed(db, &who, &name)
-                                .map(|device| (db.place(device.owner, &device.path), device.path));
+                            let device = devices::followed(db, &who, &name).map(|device| {
+                                let version = devices::version(&device);
+                                (db.place(device.owner, &device.path), device.path, version)
+                            });
                             (name, device)
                         })
                         .collect();
@@ -362,12 +373,12 @@ impl TerminalAuthority {
                 line.follows.clear();
                 for (name, device) in followed {
                     match device {
-                        Ok((place, path)) => {
-                            // What it shows now, which a page whose line was down when it was
+                        Ok((place, path, version)) => {
+                            // What it is now, which a page whose line was down when it was
                             // replaced did not hear of.
                             reply(
                                 from,
-                                serde_json::json!({ "followed": { "name": name, "path": path } }),
+                                serde_json::json!({ "followed": { "name": name, "version": version } }),
                             );
                             line.follows.push(name);
                             if let Some((column, row)) = place {
