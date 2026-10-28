@@ -201,14 +201,20 @@ impl TerminalAuthority {
             }
             let (ended, following): (Vec<String>, Vec<String>) = std::mem::take(&mut line.follows)
                 .into_iter()
-                .partition(|device| removed.contains(device));
+                .partition(|device| removed.iter().any(|(name, _)| name == device));
             line.follows = following;
             if !ended.is_empty() {
                 line.keep(ws);
             }
+            // Ended, or replaced by one that shows something else, which the page follows
+            // again, asking whether it may.
             for device in ended {
-                let ended = serde_json::json!({ "device": { "name": device, "ended": true } });
-                let _ = ws.send_with_str(ended.to_string());
+                let replaced = removed
+                    .iter()
+                    .any(|(name, again)| *name == device && *again);
+                let mut said = serde_json::json!({ "name": device });
+                said[if replaced { "replaced" } else { "ended" }] = true.into();
+                let _ = ws.send_with_str(serde_json::json!({ "device": said }).to_string());
             }
             if !dirs.is_empty() {
                 let _ = ws.send_with_str(serde_json::json!({ "changed": dirs }).to_string());

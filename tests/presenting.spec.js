@@ -31,10 +31,10 @@ async function run(page, text) {
 const shown = page => page.locator('.slides-current .slide:visible');
 const status = page => page.locator('.slides-bar [role=status]');
 // A page of a browser of its own, signed in through the API, or a guest's.
-async function device(browser, username, password) {
+async function device(browser, username, password, prepare = async () => {}) {
   const context = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': address(username || 'guest') } });
   if (username) expect((await context.request.post('/api/login', { headers: { Origin: origin }, data: { username, password } })).ok()).toBe(true);
-  const page = await context.newPage(); await page.goto(origin + '/');
+  const page = await context.newPage(); await prepare(page); await page.goto(origin + '/');
   await expect(page.locator('.lock')).toContainText(username || 'guest');
   return { context, page };
 }
@@ -45,7 +45,7 @@ test.beforeAll(async () => {
   expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
   base = '/presenting-' + Date.now().toString(36);
   expect((await root.post('/api/mkdir?path=' + encodeURIComponent(base))).ok()).toBe(true);
-  for (const [name, data] of [['deck.slides.md', deck], ['figure.svg', figure], ['pages.pdf', pdf()]]) expect((await root.put(file(base + '/' + name), { data })).status()).toBe(201);
+  for (const [name, data] of [['deck.slides.md', deck], ['other.slides.md', '# Bee\n\n---\n\n# Bee two\n'], ['figure.svg', figure], ['pages.pdf', pdf()]]) expect((await root.put(file(base + '/' + name), { data })).status()).toBe(201);
 });
 test.afterAll(async () => { await root.delete(file(base) + '&recursive=true'); await root.dispose(); });
 
@@ -132,6 +132,16 @@ test('S opens the speaker view in a window of its own, and the two windows follo
   await page.keyboard.press('s');
   await page.waitForTimeout(300);
   expect(page.context().pages()).toHaveLength(2);
+  // Pressed in another deck, it takes that window to this deck.
+  await page.getByRole('button', { name: 'Close preview' }).click();
+  await run(page, `open ${base}/other.slides.md`);
+  await expect(shown(page).locator('h1')).toHaveText('Bee');
+  await page.keyboard.press('s');
+  await expect(speaker).toHaveTitle('Speaker view · other.slides.md');
+  await expect(shown(speaker).locator('h1')).toHaveText('Bee');
+  expect(page.context().pages()).toHaveLength(2);
+  await page.keyboard.press('ArrowRight');
+  await expect(shown(speaker).locator('h1')).toHaveText('Bee two');
   await speaker.close();
 });
 
@@ -310,5 +320,60 @@ test('present makes /dev/present/NAME, which whoever may read the file follows, 
     for (const user of [name, outsider]) await command(['userdel', '-r', user]);
     for (const { context } of [laptop, phone, guest, other]) await context.close();
     await root.delete(file(talk));
+  }
+});
+
+test('a page whose line dropped catches up, on its return, with the turns made meanwhile', async ({ browser }) => {
+  const name = 'line' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
+  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  expect((await command(['useradd', '-m', name])).ok()).toBe(true);
+  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  // The phone's line to the authority, which the test drops.
+  let line;
+  const laptop = await device(browser, name, password);
+  const phone = await device(browser, name, password, page => page.routeWebSocket(/\/api\/events$/, ws => { ws.connectToServer(); line = ws; }));
+  try {
+    for (const { page } of [laptop, phone]) {
+      await run(page, `open ${base}/deck.slides.md`);
+      await expect(shown(page).locator('h1')).toHaveText('One');
+    }
+    const dropped = line;
+    await dropped.close();
+    await laptop.page.keyboard.press('ArrowRight');
+    await expect(shown(laptop.page).locator('h1')).toHaveText('Two');
+    // Back on the line, the phone asks where the deck is, and shows it.
+    await expect.poll(() => line !== dropped, { timeout: 10_000 }).toBe(true);
+    await expect(shown(phone.page).locator('h1')).toHaveText('Two', { timeout: 10_000 });
+  } finally {
+    await command(['userdel', '-r', name]);
+    await laptop.context.close(); await phone.context.close();
+  }
+});
+
+test('a presentation that comes to show another file takes its listeners with it', async ({ browser }) => {
+  const name = 'swap' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
+  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  expect((await command(['useradd', '-m', name])).ok()).toBe(true);
+  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  const laptop = await device(browser, name, password), guest = await device(browser);
+  const stem = 'swap' + Date.now().toString(36);
+  try {
+    await run(laptop.page, `present -n ${stem} ${base}/deck.slides.md`);
+    await expect(shown(laptop.page).locator('h1')).toHaveText('One');
+    await run(guest.page, `open /dev/present/${stem}`);
+    await expect(shown(guest.page).locator('h1')).toHaveText('One');
+    // The same name, another deck: the listener goes with it, and follows it.
+    await laptop.page.getByRole('button', { name: 'Close preview' }).click();
+    await run(laptop.page, `present -n ${stem} ${base}/other.slides.md`);
+    await expect(shown(laptop.page).locator('h1')).toHaveText('Bee');
+    await expect(guest.page.locator('#viewer-title')).toHaveText(`${base}/other.slides.md`);
+    await expect(shown(guest.page).locator('h1')).toHaveText('Bee');
+    await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+    await laptop.page.keyboard.press('ArrowRight');
+    await expect(shown(guest.page).locator('h1')).toHaveText('Bee two');
+  } finally {
+    await root.delete('/api/present?name=' + stem);
+    await command(['userdel', '-r', name]);
+    await laptop.context.close(); await guest.context.close();
   }
 });

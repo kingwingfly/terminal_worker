@@ -87,9 +87,15 @@ function listen() {
   const socket = events = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/events`);
   let ping;
   socket.onopen = () => {
+    const reconnected = eventsRetry > 0;
     if (eventsRetry) changed(); eventsRetry = 0; ping = setInterval(() => socket.send('ping'), 30000);
-    // A new line follows what the page follows, and asks what it waited to ask.
+    // A new line follows what the page follows (and hears where it is), and asks what it waited
+    // to ask.
     if (following || hearing) socket.send(JSON.stringify({ follow: followed() }));
+    // A deck shown here asks where its account is now, as turns made elsewhere while the line
+    // was down were not heard; unless it turned itself meanwhile, which goes out below.
+    const turned = outbox.some(message => message.present?.path === shown?.path);
+    if (reconnected && shown && !following && !turned) outbox.push({ where: shown.path });
     for (const message of outbox.splice(0)) socket.send(JSON.stringify(message));
   };
   socket.onmessage = event => {
@@ -99,6 +105,14 @@ function listen() {
     // This page's session ended elsewhere, not by its own sign in or out: it is a guest's now.
     if (message.session === 'ended') { if (!changingSession) void identityChanged('ended'); return; }
     if (message.present) { presented(message.present); return; }
+    // A device followed shows something else now: followed again, if it still may be.
+    if (message.device?.replaced) {
+      const { name } = message.device;
+      const again = error => window.dispatchEvent(new CustomEvent('terminal:device', { detail: { name, error: error.message } }));
+      if (following?.device === name) attend(name).catch(again);
+      if (hearing?.device === name) hear(name).catch(again);
+      return;
+    }
     // The presentation followed ended, or may not be followed.
     if (message.device) {
       if (following?.device === message.device.name) following.ended = true;
@@ -339,7 +353,7 @@ async function recordSound(path, name, progress) {
       // Live once the file is there, which its device links to; a recording all the same if not.
       begun: () => { speaking = speak(path, name, microphone).then(sent => { live = sent; liveNote = ` · live as ${sent.device}`; }, error => { liveNote = ` · not live: ${error.message}`; }); } });
     await speaking;
-    return { ...saved, device: live?.device ?? null, note: liveNote };
+    return { ...saved, device: live?.device ?? null, note: liveNote + (saved.stopped ? ` · ${saved.stopped}` : '') };
   } finally {
     recording = null;
     microphone?.getTracks().forEach(track => track.stop());

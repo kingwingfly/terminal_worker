@@ -87,10 +87,12 @@ thread_local! {
     static CHANGED: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
     /// Whether a transaction ended sessions, which the pages holding them hear of.
     static ENDED: Cell<bool> = const { Cell::new(false) };
-    /// The devices the running transaction removed, ...
-    static REMOVING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    /// ... and those committed transactions removed, which the pages following them hear of.
-    static REMOVED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// The devices the running transaction removed, or replaced (true) with one of the same name
+    /// that shows something else, ...
+    static REMOVING: RefCell<Vec<(String, bool)>> = const { RefCell::new(Vec::new()) };
+    /// ... and those committed transactions removed or replaced, which the pages following them
+    /// hear of.
+    static REMOVED: RefCell<Vec<(String, bool)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The directories whose listings committed transactions changed since this was last asked.
@@ -103,8 +105,8 @@ pub fn take_ended() -> bool {
     ENDED.replace(false)
 }
 
-/// The devices committed transactions removed since this was last asked.
-pub fn take_removed() -> Vec<String> {
+/// The devices committed transactions removed, or replaced (true), since this was last asked.
+pub fn take_removed() -> Vec<(String, bool)> {
     REMOVED.take()
 }
 
@@ -867,7 +869,12 @@ impl Db {
     /// Remove the device `name`, whose followers hear so once this commits.
     pub fn delete_device(&mut self, name: &str) {
         self.run("DELETE FROM devices WHERE name = ?", vec![text(name)]);
-        REMOVING.with(|removing| removing.borrow_mut().push(name.to_string()));
+        REMOVING.with(|removing| removing.borrow_mut().push((name.to_string(), false)));
+    }
+    /// Note that the device `name` now shows something else, which its followers hear once this
+    /// commits, to follow it again, if they still may.
+    pub fn replaced_device(&mut self, name: &str) {
+        REMOVING.with(|removing| removing.borrow_mut().push((name.to_string(), true)));
     }
     pub fn set_expiry(&mut self, kind: &str, id: &str, due: u64) {
         self.run(

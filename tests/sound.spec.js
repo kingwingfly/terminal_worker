@@ -19,6 +19,11 @@ async function run(page, text) {
 }
 async function device(browser, username, password) {
   const context = await browser.newContext({ permissions: ['microphone'], extraHTTPHeaders: { 'CF-Connecting-IP': address(username || 'guest') } });
+  // The microphones a page takes, to end them as if unplugged.
+  await context.addInitScript(() => {
+    const take = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    navigator.mediaDevices.getUserMedia = async constraints => { const stream = await take(constraints); (window.microphones ??= []).push(stream); return stream; };
+  });
   if (username) expect((await context.request.post('/api/login', { headers: { Origin: origin }, data: { username, password } })).ok()).toBe(true);
   const page = await context.newPage(); await page.goto(origin + '/');
   await expect(page.locator('.lock')).toContainText(username || 'guest');
@@ -75,6 +80,25 @@ test('stream records the microphone into a file that grows as it is heard, and i
     // It is a new file: another recording does not replace it.
     await run(page, 'stream talk.weba');
     await expect(transcript(page)).toContainText('File already exists');
+  } finally {
+    await root.delete(file(recording));
+    await speaker.context.close();
+  }
+});
+
+test('a recording whose microphone stops on its own is saved, with what it heard', async ({ browser }) => {
+  const speaker = await device(browser, name, password);
+  const page = speaker.page, recording = home + '/unplugged.weba';
+  try {
+    await run(page, 'cd ~');
+    await run(page, 'stream unplugged.weba');
+    await expect(transcript(page)).toContainText(/● 00:0[3-9]/, { timeout: 15_000 });
+    // Unplugged, or taken back by the browser: every track of the microphone ends.
+    await page.evaluate(() => window.microphones.forEach(stream => stream.getTracks().forEach(track => track.stop())));
+    await expect(transcript(page)).toContainText(new RegExp(`✓ ${recording} · \\d\\d:\\d\\d · [\\d.]+ KB.* · the microphone stopped`), { timeout: 30_000 });
+    const whole = await (await root.get('/api/stat?path=' + encodeURIComponent(recording))).json();
+    expect(whole.recording).toBeFalsy(); expect(whole.size).toBeGreaterThan(0);
+    await expect(busy(page)).toHaveText('↵');
   } finally {
     await root.delete(file(recording));
     await speaker.context.close();

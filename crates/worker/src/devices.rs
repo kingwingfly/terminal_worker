@@ -116,6 +116,14 @@ fn make(
     media: Option<String>,
 ) -> Result<(), String> {
     free(db, who, device)?;
+    // Taken over to show another file, as another account, or another sound: its followers
+    // follow it again, as what they followed is not what it is.
+    if db
+        .device(device)
+        .is_some_and(|old| old.path != path || old.owner != who.id || old.media != media)
+    {
+        db.replaced_device(device);
+    }
     if db.node(device).is_some() {
         db.delete_node(device);
     }

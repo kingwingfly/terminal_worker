@@ -707,8 +707,9 @@ impl Audience {
 }
 
 thread_local! {
-    /// The speaker view this page opened last, which S shows again rather than open another.
-    static SPEAKER: std::cell::RefCell<Option<web_sys::Window>> = const { std::cell::RefCell::new(None) };
+    /// The speaker view this page opened last, and the deck it was opened for, which S shows
+    /// again rather than open another.
+    static SPEAKER: std::cell::RefCell<Option<(web_sys::Window, String)>> = const { std::cell::RefCell::new(None) };
 }
 /// Whether this window is the speaker view of the deck at `path`, as S opened it: app.js opens
 /// the deck its address names.
@@ -722,23 +723,30 @@ fn speaker_window(path: &str) -> bool {
         .is_some_and(|deck| deck == path)
 }
 /// Open the speaker view of the deck at `path` in a window of its own, to keep on this screen
-/// while the slides show on another; or show the one open already. Whether there is one.
+/// while the slides show on another; or show the one open already, taken to this deck if it
+/// showed another. Whether there is one.
 fn open_speaker(path: &str) -> bool {
+    let url = format!("/?speaker={}", js_sys::encode_uri_component(path));
     let open = SPEAKER.with_borrow(|speaker| {
         speaker
             .clone()
-            .filter(|speaker| !speaker.closed().unwrap_or(true))
+            .filter(|(speaker, _)| !speaker.closed().unwrap_or(true))
     });
-    if let Some(speaker) = open {
+    if let Some((speaker, deck)) = open {
+        if deck != path {
+            if speaker.location().set_href(&url).is_err() {
+                return false;
+            }
+            SPEAKER.set(Some((speaker.clone(), path.to_string())));
+        }
         return speaker.focus().is_ok();
     }
-    let url = format!("/?speaker={}", js_sys::encode_uri_component(path));
     let opened = window()
         .open_with_url_and_target_and_features(&url, "_blank", "popup,width=1280,height=800")
         .ok()
         .flatten();
     let shown = opened.is_some();
-    SPEAKER.set(opened);
+    SPEAKER.set(opened.map(|speaker| (speaker, path.to_string())));
     shown
 }
 

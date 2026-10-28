@@ -49,7 +49,11 @@ export async function record(destination, microphone, { progress = () => {}, beg
     });
   };
   const recorder = new MediaRecorder(microphone, { mimeType: RECORDED, audioBitsPerSecond: 64000 });
-  const stopped = new Promise(resolve => { recorder.onstop = resolve; });
+  // It stops when told to, and on its own: the microphone ended (unplugged, or taken back), or
+  // the recorder failed. Either way, what was recorded is saved.
+  let ended = false;
+  const stopped = new Promise(resolve => { recorder.onstop = () => { ended = true; resolve(); }; });
+  recorder.onerror = () => { ended = true; };
   // Read in the order recorded, as each read waits.
   let reading = Promise.resolve();
   recorder.ondataavailable = event => {
@@ -70,16 +74,18 @@ export async function record(destination, microphone, { progress = () => {}, beg
   }, HEARTBEAT);
   try {
     recorder.start(1000);
-    // Until stopped, or a chunk or the hold fails.
-    await new Promise(resolve => { const check = setInterval(() => { if (failure || signal.aborted) { clearInterval(check); resolve(); } }, 250); });
+    // Until stopped, here or by the recorder itself, or a chunk or the hold fails.
+    await new Promise(resolve => { const check = setInterval(() => { if (failure || signal.aborted || ended || recorder.state === 'inactive') { clearInterval(check); resolve(); } }, 250); });
+    const itself = !signal.aborted && !failure;
     if (recorder.state !== 'inactive') recorder.stop();
-    await stopped; await reading;
+    // A recorder that failed may say so without stopping as it should; it is not waited for long.
+    await Promise.race([stopped, new Promise(resolve => setTimeout(resolve, 2000))]); await reading;
     // What is left is the last chunk, short.
     if (pending.length) { send(pending); pending = new Uint8Array(0); }
     await queue;
     if (failure) throw failure;
     const done = await json(await fetch(`/api/uploads/complete?${held}&sha256=${whole.hex()}`, { method: 'POST' }));
-    return { ...done, seconds: (performance.now() - started) / 1000 };
+    return { ...done, seconds: (performance.now() - started) / 1000, ...(itself ? { stopped: 'the microphone stopped' } : {}) };
   } finally {
     clearInterval(ticking); clearInterval(heartbeat);
     if (recorder.state !== 'inactive') recorder.stop();
