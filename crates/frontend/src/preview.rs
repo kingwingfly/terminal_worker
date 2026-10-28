@@ -381,6 +381,18 @@ fn escape(text: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Whether a rendered slide is just one image, without a heading or caption: a whole page of a
+/// presentation, which fills the viewer.
+pub fn image_slide(html: &str) -> bool {
+    let html = html.trim();
+    let image = html
+        .strip_prefix("<p>")
+        .and_then(|p| p.strip_suffix("</p>"))
+        .map(str::trim)
+        .unwrap_or(html);
+    image.starts_with("<img ") && image.find('>') == Some(image.len() - 1)
+}
+
 /// The slides of the reveal.js Markdown `source`, the file at `path`, as HTML, in columns: a
 /// `---` line starts the next column, and a `--` line the next slide in it, except in code
 /// blocks. Speaker notes, from a `Note:` line on, do not show.
@@ -787,6 +799,19 @@ mod test {
             Some("/home/ana/Ünïcode notes (1).md")
         );
         assert_eq!(file_path("https://example.com/"), None);
+    }
+
+    #[test]
+    fn image_slides_are_one_image_alone() {
+        let deck = slides(
+            "![Wide](wide.svg)\n\nNote:\nNotes.\n\n---\n\nA caption ![x](a.png)\n\n---\n\n# Title\n\n![x](a.png)\n",
+            "/deck.slides.md",
+        );
+        let alone: Vec<bool> = deck.iter().map(|column| image_slide(&column[0])).collect();
+        assert_eq!(alone, [true, false, false]);
+        assert!(!image_slide(
+            "<p><a href=\"/x\"><img src=\"a.png\"></a></p>"
+        ));
     }
 
     #[test]
