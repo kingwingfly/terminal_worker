@@ -184,6 +184,10 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 let Some(id) = node.file else {
                     return Reply::error("This is a directory", 400);
                 };
+                // /usr's binaries are the build's, in the Worker's assets.
+                if let Some(asset) = crate::usr::asset(&id) {
+                    return Reply::ok(json!({ "asset": asset, "size": node.size }));
+                }
                 let Some(file) = db.file(&id) else {
                     return Reply::error("File content does not exist", 404);
                 };

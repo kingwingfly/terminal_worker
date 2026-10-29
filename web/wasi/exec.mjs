@@ -1,7 +1,7 @@
-// exec(2), as the page does it: a program of /bin, built for wasm32-wasip1, runs as a process of
+// exec(2), as the page does it: a program of /usr/bin, built for wasm32-wasip1, runs as a process of
 // its own (web/wasi/process.js, a Worker), with its arguments, environment, standard input and
 // the terminal. The binary is compiled once, and each process instantiates it anew.
-const BINARY = '/bin/coreutils.wasm';
+const BINARY = '/usr/bin/coreutils.wasm';
 let compiled = null;
 const compile = () => compiled ??= WebAssembly.compileStreaming(fetch(BINARY)).catch(err => { compiled = null; throw err; });
 
@@ -26,7 +26,7 @@ function columns() {
 export async function exec(argv, { cwd = '/', home = '/', user = 'guest', stdin = null, sudo = false, umask = 0o022, tty = false, cancelled = () => false } = {}) {
   const module = await compile();
   const env = {
-    PWD: cwd, HOME: home, USER: user, LOGNAME: user, PATH: '/bin', SHELL: '/bin/sh', LANG: 'C.UTF-8',
+    PWD: cwd, HOME: home, USER: user, LOGNAME: user, PATH: '/usr/bin', SHELL: '/usr/bin/sh', LANG: 'C.UTF-8',
     TERM: tty ? 'xterm-256color' : 'dumb', COLUMNS: String(columns()),
     TZ: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
   };

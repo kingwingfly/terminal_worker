@@ -464,9 +464,23 @@ fn run(
     if proc {
         return crate::procfs::call(db, sid, &process.cred, call);
     }
+    // The image (/usr, /bin) is read-only: what would change it fails, as on a read-only mount.
+    if changes(&call) {
+        for (path, follow) in paths(&mut call) {
+            if let Ok(name) = kernel::namei(db, &process.cred, path, follow)
+                && crate::usr::is(&name.path)
+            {
+                return Err(Errno::EROFS.into());
+            }
+        }
+    }
     match call {
         Call::Statfs { path } => {
             kernel::stat(db, &process.cred, &path, true)?;
+            let real = kernel::namei(db, &process.cred, &path, true)?.path;
+            if crate::usr::is(&real) {
+                return Ok(json!(crate::usr::statfs()));
+            }
             Ok(json!(statfs(db)))
         }
         Call::InotifyAddWatch { path, mask } => {
@@ -523,6 +537,28 @@ fn run(
             crate::fds::call(db, sid, &process, call)
         }
         call => kernel::call(db, &process, call),
+    }
+}
+
+/// Whether `call` would change what it names.
+fn changes(call: &Call) -> bool {
+    match call {
+        Call::Open { flags, .. } => {
+            flags & abi::O_ACCMODE != abi::O_RDONLY || flags & abi::O_CREAT != 0
+        }
+        Call::Mkdir { .. }
+        | Call::Mknod { .. }
+        | Call::Rmdir { .. }
+        | Call::Unlink { .. }
+        | Call::Rename { .. }
+        | Call::Link { .. }
+        | Call::Symlink { .. }
+        | Call::Chmod { .. }
+        | Call::Chown { .. }
+        | Call::Utimens { .. }
+        | Call::Setxattr { .. }
+        | Call::Removexattr { .. } => true,
+        _ => false,
     }
 }
 

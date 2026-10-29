@@ -1071,6 +1071,8 @@ pub async fn df(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
         };
         let (name, mounted) = if path == "/proc" || path.starts_with("/proc/") {
             ("proc", "/proc")
+        } else if path == "/usr" || path.starts_with("/usr/") || path.starts_with("/bin") {
+            ("usr", "/usr")
         } else {
             ("r2", "/")
         };

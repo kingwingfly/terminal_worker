@@ -117,6 +117,19 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
     if grant["device"].is_object() {
         return Response::from_json(&grant);
     }
+    // A binary of /usr is the build's: the assets serve it, ranges and all.
+    if let Some(asset) = grant["asset"].as_str() {
+        let headers = Headers::new();
+        for name in ["Range", "If-None-Match", "If-Range"] {
+            if let Some(value) = req.headers().get(name)? {
+                headers.set(name, &value)?;
+            }
+        }
+        let mut init = RequestInit::new();
+        init.with_method(req.method()).with_headers(headers);
+        let request = Request::new_with_init(&format!("https://assets{asset}"), &init)?;
+        return env.assets("ASSETS")?.fetch_request(request).await;
+    }
     let grant: Grant = serde_json::from_value(grant)?;
     let headers = Headers::new();
     headers.set("Content-Type", &grant.mime)?;

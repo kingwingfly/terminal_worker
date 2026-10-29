@@ -867,9 +867,9 @@ impl Shell {
             found: io.found,
         }
     }
-    /// Run the program of /bin `args[0]` (`/bin/NAME`, or a name the shell has no command of its
-    /// own for), as a process of its own: what it writes goes on, its errors to the transcript.
-    /// Ctrl+C kills it.
+    /// Run coreutils' utility `args[0]` (a name the terminal has no program of its own for, or
+    /// `coreutils NAME`), as a process of its own: what it writes goes on, its errors to the
+    /// transcript. Ctrl+C kills it.
     pub async fn bin(
         self,
         mut args: Vec<String>,
@@ -1007,9 +1007,18 @@ impl Shell {
         piped: bool,
     ) -> LocalBoxFuture<'static, Result<Output, String>> {
         async move {
-            let Some(name) = args.first().cloned() else {
+            let Some(mut name) = args.first().cloned() else {
                 return Ok(Output::default());
             };
+            let mut args = args;
+            // A path to /usr/bin runs what its name does, as PATH would have found it.
+            if let Some(named) = cli_bin::named(&name) {
+                if cli::definition(named).is_none() && cli_bin::program(named).is_none() {
+                    return Err(format!("{name}: No such file or directory"));
+                }
+                name = named.to_string();
+                args[0] = name.clone();
+            }
             // Help is the tab's, made from the command's definition: nothing is asked of the
             // server. Under sudo, it is the command sudo runs that is asked about.
             if cli::wants_help(&args) {
@@ -1029,13 +1038,11 @@ impl Shell {
             {
                 return self.program(args, stdin, piped, false).await;
             }
-            // A path to /bin's program, or a name the shell has nothing of its own for, runs
-            // /bin's, as a shell runs what its PATH finds.
-            if name.starts_with("/bin/") && cli_bin::program(&name).is_some()
-                || cli_bin::program(&name).is_some()
-                    && commands::find(&name).is_none()
-                    && cli::definition(&name).is_none()
-                    && !userland::PROGRAMS.contains(&name.as_str())
+            // A name the terminal has nothing of its own for runs coreutils', as PATH finds it.
+            if cli_bin::program(&name).is_some()
+                && commands::find(&name).is_none()
+                && cli::definition(&name).is_none()
+                && !userland::PROGRAMS.contains(&name.as_str())
             {
                 return self.bin(args, stdin, piped, false).await;
             }

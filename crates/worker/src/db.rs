@@ -1384,6 +1384,9 @@ impl kernel::Fs for Db {
         crate::auth::clock()
     }
     fn times(&self, ino: u64) -> kernel::Times {
+        if let Some(times) = crate::usr::times(ino) {
+            return times;
+        }
         #[derive(Deserialize)]
         struct Times {
             atime: u64,
@@ -1441,18 +1444,35 @@ impl kernel::Fs for Db {
 
 impl Store for Db {
     fn node(&self, path: &str) -> Option<Node> {
+        // /usr and /bin are the image's (usr.rs), over any of the store's.
+        if crate::usr::is(path) {
+            return crate::usr::node(path);
+        }
         self.rows::<NodeRow>(&format!("{NODE} WHERE n.path = ?"), vec![text(path)])
             .pop()
             .map(|r| r.pair().1)
     }
     fn children(&self, path: &str) -> Vec<(String, Node)> {
-        self.rows::<NodeRow>(
-            &format!("{NODE} WHERE n.parent = ? ORDER BY n.path"),
-            vec![text(path)],
-        )
-        .into_iter()
-        .map(NodeRow::pair)
-        .collect()
+        let image = crate::usr::children(path);
+        if path != "/"
+            && let Some(image) = image
+        {
+            return image;
+        }
+        let mut children: Vec<(String, Node)> = self
+            .rows::<NodeRow>(
+                &format!("{NODE} WHERE n.parent = ? ORDER BY n.path"),
+                vec![text(path)],
+            )
+            .into_iter()
+            .map(NodeRow::pair)
+            .filter(|(child, _)| !crate::usr::is(child))
+            .collect();
+        if let Some(image) = image {
+            children.extend(image);
+            children.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        children
     }
     fn subtree(&self, path: &str) -> Vec<(String, Node)> {
         let rows = if path == "/" {

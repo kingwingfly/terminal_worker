@@ -11,6 +11,7 @@ mod runner;
 mod store;
 mod streams;
 mod sys;
+mod usr;
 use files::error_response;
 pub use runner::JobRunner;
 pub use store::TerminalAuthority;

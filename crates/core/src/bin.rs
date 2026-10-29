@@ -1,10 +1,12 @@
-//! /bin: the programs the page runs as processes of their own, built for wasm32-wasip1 (uutils'
-//! coreutils, crates/coreutils, one binary as busybox is), in its WASI engine (web/wasi/). The
-//! shell's own commands of the same names come first, as a shell's builtins do; `/bin/NAME` runs
-//! /bin's, and `coreutils NAME` too.
+//! The programs of /usr/bin that the page runs as processes of their own, built for
+//! wasm32-wasip1 (uutils' coreutils, crates/coreutils, one binary as busybox is), in its WASI
+//! engine (web/wasi/). /usr/bin holds what a name runs (the kernel's usr.rs): the terminal's
+//! own programs, and links to `coreutils` of the utilities it has none of its own for, which a
+//! name runs at once; `coreutils NAME` runs uutils' NAME whatever the terminal has. `/usr/bin/NAME`
+//! and `/bin/NAME` (/bin is a link to usr/bin) run what NAME does.
 
-/// The utilities /bin's binary has, as crates/coreutils builds them: uutils', and `syscall`,
-/// which makes the kernel's own calls through the engine's `terminal.sys`.
+/// The utilities coreutils has, as crates/coreutils builds them: uutils', and `syscall`, which
+/// makes the kernel's own calls through the engine's `terminal.sys`.
 pub const PROGRAMS: &[&str] = &[
     "arch",
     "base32",
@@ -93,10 +95,16 @@ const WRITING: &[&str] = &[
     "split", "csplit", "tee", "dd", "mktemp",
 ];
 
-/// The utility of /bin that `name` runs, as typed: `/bin/NAME`, or a utility's name.
+/// The utility of coreutils named `name`.
 pub fn program(name: &str) -> Option<&'static str> {
-    let name = name.strip_prefix("/bin/").unwrap_or(name);
     PROGRAMS.iter().copied().find(|program| *program == name)
+}
+
+/// The name a path to /usr/bin runs, as typed: `/usr/bin/NAME` or `/bin/NAME`.
+pub fn named(path: &str) -> Option<&str> {
+    path.strip_prefix("/usr/bin/")
+        .or_else(|| path.strip_prefix("/bin/"))
+        .filter(|name| !name.is_empty() && !name.contains('/'))
 }
 
 /// Whether the utility `name` may change files.
@@ -120,7 +128,10 @@ mod tests {
             .filter(|name| !name.is_empty())
             .collect();
         assert_eq!(built, super::PROGRAMS);
-        assert_eq!(super::program("/bin/ls"), Some("ls"));
+        assert_eq!(super::program("cut"), Some("cut"));
         assert_eq!(super::program("zip"), None);
+        assert_eq!(super::named("/usr/bin/ls"), Some("ls"));
+        assert_eq!(super::named("/bin/cut"), Some("cut"));
+        assert_eq!(super::named("/usr/bin/a/b"), None);
     }
 }

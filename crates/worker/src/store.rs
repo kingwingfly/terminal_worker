@@ -582,8 +582,29 @@ impl TerminalAuthority {
             crate::sys::ensure(db);
             ((), true)
         })?;
+        // /usr is the build's: its binaries' sizes, as its manifest says.
+        let sizes = self.manifest().await;
+        let size = |content: &str| {
+            crate::usr::asset(content)
+                .and_then(|asset| sizes[asset].as_u64())
+                .unwrap_or(0)
+        };
+        crate::usr::mount(size(crate::usr::COREUTILS), size(crate::usr::TERMINAL));
         self.ready.set(true);
         Ok(())
+    }
+    /// What the build says of /usr's binaries (scripts/build.mjs, `/usr/manifest.json`): each
+    /// one's size, by its asset's path; nothing if it says nothing.
+    async fn manifest(&self) -> serde_json::Value {
+        let fetched = async {
+            let request = Request::new(
+                &format!("https://assets{}", crate::usr::MANIFEST),
+                Method::Get,
+            )?;
+            let mut response = self.env.assets("ASSETS")?.fetch_request(request).await?;
+            response.json::<serde_json::Value>().await
+        };
+        fetched.await.unwrap_or_default()
     }
     /// Create root, the system groups and the top directories, the first time only.
     async fn initialize(&self) -> Result<()> {

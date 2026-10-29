@@ -6,7 +6,7 @@ For maintainers and incoming agents, start with [AGENT.md](AGENT.md).
 
 ## Local development
 
-Prerequisites: Node.js, Rust with the `wasm32-unknown-unknown` and `wasm32-wasip1` targets (the second for /bin's programs, uutils' coreutils), `worker-build 0.8.5`, `wasm-bindgen-cli 0.2.129`, and clang with its WebAssembly target plus `llvm-ar`, which compile the tree-sitter grammars of the code previews. The wasm-bindgen CLI must match the Rust dependency version in `Cargo.lock`. Archive jobs (`zip`, `unzip`, `tar`) run in a container, which needs Docker or Podman; see [Archives](#archives).
+Prerequisites: Node.js, Rust with the `wasm32-unknown-unknown` and `wasm32-wasip1` targets (the second for uutils' coreutils, in /usr/bin), `worker-build 0.8.5`, `wasm-bindgen-cli 0.2.129`, and clang with its WebAssembly target plus `llvm-ar`, which compile the tree-sitter grammars of the code previews. The wasm-bindgen CLI must match the Rust dependency version in `Cargo.lock`. Archive jobs (`zip`, `unzip`, `tar`) run in a container, which needs Docker or Podman; see [Archives](#archives).
 
 ```bash
 rustup target add wasm32-unknown-unknown wasm32-wasip1
@@ -117,7 +117,7 @@ Every command supports `-h` and `--help`, generated, as is its page in `man COMM
 | Password | `passwd [--force] [USER]` |
 | Identity | `whoami`, `id [USER]`, `groups [USER]`, root-only `users` |
 | Interface | `help`, `man [COMMAND]`, `clear`, `vim FILE` |
-| /bin (uutils) | `cut`, `tr`, `seq`, `printf`, `date`, `tee`, `truncate`, `split`, `od`, `base64`, `sha256sum`… and `/bin/NAME`, `coreutils NAME`, `syscall CALLS` |
+| /usr/bin (uutils) | `cut`, `tr`, `seq`, `printf`, `date`, `tee`, `truncate`, `split`, `od`, `base64`, `sha256sum`…, and `/usr/bin/NAME`, `coreutils NAME`, `syscall CALLS` |
 
 Signed out, `useradd NAME` makes an account of one's own: the dialog asks for its password (12 characters unless `--short-password`), and the browser is signed in. The account has a private primary group and is in group `guest`; its home is `/guest/NAME`, mode 700, which `-m` makes (and `-M`, the default, does not), as useradd does. Other options need sudo. `/guest` is `root:guest` 1777, shared and sticky like `/tmp`. Registration is rate-limited per address, and guests may make at most 1,000 accounts. `guest` itself cannot have a password, be changed, or be deleted.
 
@@ -327,11 +327,16 @@ The page is user space and the API is the system calls (owner's design, 2026-10-
 
 A session is a browser: a signed-in one's, or, signed out, the browser's own (the `terminal_guest` cookie). Descriptors are a session's, shared by its tabs as threads share a process's; a presenter lets a guest speak by passing one to that guest's session. The places where an account last showed a deck (`present` on the events socket) are the one extension with no Linux counterpart.
 
-### /bin: programs as processes of their own
+### /usr: the build's, read-only
 
-/bin's programs are uutils' coreutils, built for `wasm32-wasip1` (`crates/coreutils`, one binary as busybox is, at `/bin/coreutils.wasm`), and run in the page's WASI engine (`web/wasi/`). The browser's WebAssembly engine is only a CPU; the engine is what a process imports. Each process is a Worker of its own that instantiates the binary, compiled once, with WASI preview 1 implemented over the system calls, synchronously (the Worker waits on each request, as a process blocks in a call), plus one import of its own, `terminal.sys`, which carries a batch of the kernel's calls as it is, for what WASI has no words for (modes, owners, ACLs, devices, accounts): the `syscall` program makes them. The engine keeps the descriptors (a file read ahead, one written in order, an existing one changed in place by rewriting it whole), the terminal and pipes as its standard streams, the working directory (`PWD`, which the binary enters as it starts) and the time; Ctrl+C terminates the Worker, and output over 10 MB stops it.
+`/usr` is the system's own, as an image-based system mounts its `/usr` read-only: what the build put there (the Worker's assets), not R2's, and `/bin` is a link to `usr/bin`, as on merged-`/usr` distributions (Arch, Fedora, Debian). Changing anything in it fails with EROFS. `/usr/bin` holds what a name runs:
 
-The shell's own commands come first, as a shell's builtins do: `ls`, `cp`, `cat` and the rest stay this terminal's, which know modes, owners and ACLs, while `/bin/NAME` runs /bin's, and a name the shell has no command for (`cut`, `tr`, `sha256sum`, `seq`, `date`, `tee`, `truncate`…) runs /bin's at once. `help` lists them; `NAME --help` tells how to use one.
+- The terminal's own programs (`ls`, `chmod`, `cp`, `passwd`…), built into the page's binary (`/pkg/frontend_bg.wasm`), each a file of it, root's, 755. Those that act beyond the caller's own rights by a policy of their own are setuid root, `-rwsr-xr-x`, as `passwd`, `su` and `sudo` are on Linux, and `useradd` and `userdel`, with which a guest makes an account of its own and an account deletes itself. The bit says, rather than grants: the page cannot be trusted with a setuid program, so the kernel's calls hold each one's policy. Root's tools (`usermod`, `groupadd`…) are 755 and need root, as on Linux. The shell's builtins (`cd`, `exit`, `logout`, `jobs`, `help`) are no files.
+- uutils' coreutils, built for `wasm32-wasip1` (`crates/coreutils`, one binary as busybox is), and a link to it of each of its utilities the terminal has no program of its own for (`cut`, `tr`, `seq`, `printf`, `date`, `tee`, `truncate`, `sha256sum`…).
+
+uutils' run as processes of their own in the page's WASI engine (`web/wasi/`). The browser's WebAssembly engine is only a CPU; the engine is what a process imports. Each process is a Worker of its own that instantiates the binary, compiled once, with WASI preview 1 implemented over the system calls, synchronously (the Worker waits on each request, as a process blocks in a call), plus one import of its own, `terminal.sys`, which carries a batch of the kernel's calls as it is, for what WASI has no words for (modes, owners, ACLs, devices, accounts): the `syscall` program makes them. The engine keeps the descriptors (a file read ahead, one written in order, an existing one changed in place by rewriting it whole), the terminal and pipes as its standard streams, the working directory (`PWD`, which the binary enters as it starts) and the time; Ctrl+C terminates the Worker, and output over 10 MB stops it. The terminal's own programs run in the page itself, which draws what they give (`ls`'s listing, its icons, colours and uploads' progress) rather than text.
+
+A name runs the terminal's program, or uutils' where it has none; `/usr/bin/NAME` and `/bin/NAME` run what NAME does, and `coreutils NAME` uutils' NAME whatever the terminal has. `help` lists uutils'; `NAME --help` tells how to use one.
 
 ## Storage and project boundaries
 
@@ -340,12 +345,12 @@ The shell's own commands come first, as a shell's builtins do: `ls`, `cp`, `cat`
 | `crates/abi` / `terminal-worker-abi` | The system calls: what each takes and gives back, and errno with glibc's words |
 | `crates/kernel` / `terminal-worker-kernel` | The file system's system calls, every check Linux's (namei, generic_permission with ACLs, sticky directories, protected links, xattrs), over a `Store`, tested in memory |
 | `crates/userland` / `terminal-worker-userland` | The programs of user space, each over `Sys` and nothing else, with GNU's messages and dates |
-| `crates/coreutils` / `terminal-worker-coreutils` | /bin's binary: uutils' coreutils for `wasm32-wasip1`, a workspace of its own, and `syscall` over `terminal.sys` |
+| `crates/coreutils` / `terminal-worker-coreutils` | /usr/bin's uutils binary: uutils' coreutils for `wasm32-wasip1`, a workspace of its own, and `syscall` over `terminal.sys` |
 | `web/wasi/` | The WASI engine: `exec.mjs` runs a program as a process, `process.js` is the process (a Worker) |
 | `crates/core` / `terminal-worker-core` | Every command's definition, parser, help and manual page (`cli/`, with clap); paths, pipelines, text filters, fd matching, completion, ACLs, HTTP Range |
 | `crates/frontend` / `terminal-worker-ui` | Leptos CSR terminal: tabs (`lib.rs`), the shell and its pipelines (`shell.rs`), the commands that run in the page (`shell/commands.rs`), upload hashing (`uploads.rs`), file previews (`preview.rs`, `viewer.rs`), man's pages for app.js (`manual.rs`) |
 | `crates/preview` / `terminal-worker-preview` | Preview web workers: PDF pages (hayro), Mermaid diagrams (merman), highlighted code (arborium, four language groups) |
-| `crates/worker` / `terminal-worker` | The kernel's host: the Worker streams file bytes (`files.rs`); the `TerminalAuthority` Durable Object serves the system calls (`sys.rs`), descriptors (`fds.rs`), /proc (`procfs.rs`), devices (`dev/`), processes (`jobs.rs`) and accounts (`commands/accounts.rs`, api.rs), in SQLite tables (`db.rs`) |
+| `crates/worker` / `terminal-worker` | The kernel's host: the Worker streams file bytes (`files.rs`); the `TerminalAuthority` Durable Object serves the system calls (`sys.rs`), descriptors (`fds.rs`), /proc (`procfs.rs`), /usr (`usr.rs`), devices (`dev/`), processes (`jobs.rs`) and accounts (`commands/accounts.rs`, api.rs), in SQLite tables (`db.rs`) |
 | `web/app.js` | Browser bridge, authentication dialogs, the preview dialog's shell and games, focus handling |
 | `web/upload.mjs` | Chunked, resumable uploads |
 | `web/record.mjs`, `web/sound.mjs` | Recording the microphone into a growing file; live sound through Realtime |

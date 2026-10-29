@@ -54,9 +54,13 @@ test('uutils runs as programs of /bin: arguments, the working directory, pipes a
   await expect(transcript(page)).toContainText("cut: missing.txt: No such file or directory");
   await run(page, 'basename /a/b/c.txt .txt');
   await expect(page.locator('.transcript pre').last()).toHaveText('c');
-  // /bin/ls is uutils' ls, not the shell's.
+  // A path to /usr/bin, or through /bin, runs what the name does.
   await run(page, '/bin/ls');
   await expect(transcript(page)).toContainText('names.txt');
+  await run(page, '/usr/bin/cut -d: -f2 names.txt');
+  await expect(page.locator('.transcript pre').last()).toHaveText('3\n1\n2');
+  await run(page, '/usr/bin/nothing');
+  await expect(transcript(page)).toContainText('/usr/bin/nothing: No such file or directory');
   // A program of /bin reaches the kernel's own calls too, which WASI has no words for, through
   // the engine's terminal.sys: the batch goes as it is.
   await run(page, `syscall '["getcreds",{"lstat":{"path":"names.txt"}},{"stat":{"path":"${base}/names.txt"}}]'`);
@@ -68,7 +72,7 @@ test('uutils runs as programs of /bin: arguments, the working directory, pipes a
   await expect(transcript(page)).toContainText('coreutils (uutils): arch base32');
   // help lists them, and man says where their help is.
   await run(page, 'help');
-  await expect(page.locator('.transcript pre').last()).toContainText("/bin (uutils' coreutils, run as processes of their own)");
+  await expect(page.locator('.transcript pre').last()).toContainText("/usr/bin, from uutils' coreutils (processes of their own)");
   await expect(page.locator('.transcript pre').last()).toContainText('sha256sum');
   await run(page, 'man cut');
   await expect(transcript(page)).toContainText("cut is /bin's (uutils): cut --help says how to use it");
@@ -96,6 +100,32 @@ test('a program of /bin writes files through the kernel, as its account', async 
   await run(page, 'cd ' + base);
   await run(page, '/bin/rm counted.txt');
   await expect(transcript(page)).toContainText("rm: cannot remove 'counted.txt': Permission denied");
+});
+
+test('/usr is the build\'s, read-only: /usr/bin holds what names run, setuid what acts as root', async ({ page, request }) => {
+  await terminal(page);
+  await run(page, 'readlink /bin');
+  await expect(page.locator('.transcript pre').last()).toHaveText('usr/bin');
+  await run(page, 'ls -l /usr/bin | cat');
+  const listed = await page.locator('.transcript pre').last().innerText();
+  expect(listed).toMatch(/^-rwsr-xr-x +1 root root .* passwd$/m);
+  expect(listed).toMatch(/^-rwsr-xr-x +1 root root .* sudo$/m);
+  expect(listed).toMatch(/^-rwxr-xr-x +1 root root .* ls$/m);
+  expect(listed).toMatch(/^lrwxrwxrwx +1 root root .* cut -> coreutils$/m);
+  expect(listed).toMatch(/^-rwxr-xr-x +1 root root +\d{6,} .* coreutils$/m);
+  // The shell's builtins are no files; root may change nothing of it.
+  await run(page, "ls /usr/bin | grep -c '^cd$'");
+  await expect(page.locator('.transcript pre').last()).toHaveText('0');
+  await run(page, 'rm /usr/bin/cut');
+  await expect(transcript(page)).toContainText("rm: cannot remove '/usr/bin/cut': Read-only file system");
+  await run(page, 'mkdir /usr/local');
+  await expect(transcript(page)).toContainText("mkdir: cannot create directory '/usr/local': Read-only file system");
+  // Its binaries read as the build has them.
+  const coreutils = await request.get(file('/usr/bin/cut'), { headers });
+  expect(coreutils.status()).toBe(200);
+  expect([...(await coreutils.body()).subarray(0, 4)]).toEqual([0, 0x61, 0x73, 0x6d]);
+  await run(page, 'df /usr');
+  await expect(page.locator('.transcript pre').last()).toContainText(/^usr .* 100% \/usr$/m);
 });
 
 test('Ctrl+C kills a program of /bin, and output past the limit stops it', async ({ page }) => {

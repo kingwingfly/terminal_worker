@@ -571,14 +571,14 @@ pub fn commands() -> String {
         }
         out.push(String::new());
     }
-    // /bin's programs, those the shell has no command of its own for.
+    // /usr/bin's programs the shell has no command of its own for: uutils'.
     let names = names();
     let bin: Vec<&str> = crate::bin::PROGRAMS
         .iter()
         .copied()
         .filter(|program| !names.iter().any(|name| name == program))
         .collect();
-    out.push("/bin (uutils' coreutils, run as processes of their own)".to_string());
+    out.push("/usr/bin, from uutils' coreutils (processes of their own)".to_string());
     let mut line = String::new();
     for program in bin {
         if !line.is_empty() && line.len() + 1 + program.len() > 76 {
