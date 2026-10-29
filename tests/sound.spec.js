@@ -55,7 +55,7 @@ test('stream records the microphone into a file that grows as it is heard, and i
     // The file is there at once, a recording, and grows, a chunk at a time.
     const stat = async () => (await root.get('/api/stat?path=' + encodeURIComponent(recording))).json();
     await expect.poll(async () => (await stat()).recording, { timeout: 15_000 }).toBe(true);
-    await expect.poll(async () => (await stat()).size, { timeout: 30_000, intervals: [1000] }).toBeGreaterThan(0);
+    await expect.poll(async () => (await stat()).size, { timeout: 60_000, intervals: [1000] }).toBeGreaterThan(0);
     const grown = (await stat()).size;
     // jobs, in another tab, says it is recording, and how much it has.
     const other = await speaker.context.newPage(); await other.goto(origin + '/');
@@ -149,7 +149,7 @@ test('jobs cancel stops a recording from another tab, keeping what arrived', asy
   try {
     await run(page, 'cd ~');
     await run(page, 'stream cancelled.weba');
-    await expect.poll(async () => (await stat()).size, { timeout: 30_000, intervals: [1000] }).toBeGreaterThan(0);
+    await expect.poll(async () => (await stat()).size, { timeout: 60_000, intervals: [1000] }).toBeGreaterThan(0);
     const other = await speaker.context.newPage(); await other.goto(origin + '/');
     await run(other, 'jobs');
     await expect(transcript(other)).toContainText(`recording  ${recording}`);
@@ -277,5 +277,28 @@ test('stream -n NAME is live only: /dev/snd/NAME is a file of its own, whose per
   } finally {
     await root.delete('/api/sound?name=' + open); await root.delete('/api/sound?name=' + closed);
     await speaker.context.close(); await guest.context.close();
+  }
+});
+
+test('a chunk R2 did not take once is sent again, and the recording goes on', async ({ browser }) => {
+  const speaker = await device(browser, name, password);
+  const page = speaker.page, recording = home + '/retried.weba';
+  let refused = 0;
+  await page.route('**/api/uploads/chunk?**', route => {
+    if (refused++ === 0) return route.fulfill({ status: 400, json: { error: 'Chunk upload failed, or the chunk does not match its SHA-256; send it again' } });
+    return route.continue();
+  });
+  try {
+    await run(page, 'cd ~');
+    await run(page, 'stream retried.weba');
+    await expect(transcript(page)).toContainText(/● 00:0[2-9]/, { timeout: 15_000 });
+    await page.locator('#command').press('Control+c');
+    await expect(transcript(page)).toContainText(`✓ ${recording}`, { timeout: 30_000 });
+    expect(refused).toBeGreaterThan(1);
+    const whole = await (await root.get('/api/stat?path=' + encodeURIComponent(recording))).json();
+    expect(whole.recording).toBeFalsy(); expect(whole.size).toBeGreaterThan(0);
+  } finally {
+    await root.delete(file(recording));
+    await speaker.context.close();
   }
 });

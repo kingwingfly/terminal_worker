@@ -1,6 +1,6 @@
 import { inspectFaststart } from './faststart.mjs';
 import { uploadFile, Cancelled } from './upload.mjs';
-import { record } from './record.mjs';
+import { record, clock } from './record.mjs';
 import { speak, listen as hearLive } from './sound.mjs';
 
 let configuration;
@@ -314,7 +314,7 @@ async function accountCommand(args, cwd) {
         submit: fields => post('unregister', { password: fields.password, remove }) });
       if (!result) throw new Error('Account deletion canceled');
       await identityChanged();
-      return { output: `Deleted user ${result.deleted}; signed out as guest`, home: '/' };
+      return { output: `Deleted user ${result.deleted}${result.kept ? `; ${result.kept}` : ''}; signed out as guest`, home: '/' };
     }
   }
   if (['su', 'login'].includes(args[0])) {
@@ -396,8 +396,7 @@ async function recordSound(path, name, acl, progress) {
       live = await speak(null, name, microphone, acl);
       const started = performance.now(), track = microphone.getAudioTracks()[0];
       const seconds = () => (performance.now() - started) / 1000;
-      const clock = () => `${String(Math.floor(seconds() / 60)).padStart(2, '0')}:${String(Math.floor(seconds() % 60)).padStart(2, '0')}`;
-      const say = () => progress(`● live as ${live.device} · ${clock()}`);
+      const say = () => progress(`● live as ${live.device} · ${clock(seconds())}`);
       const ticking = setInterval(say, 1000); say();
       try { await new Promise(resolve => { controller.signal.addEventListener('abort', resolve, { once: true }); track.addEventListener('ended', resolve, { once: true }); }); }
       finally { clearInterval(ticking); }

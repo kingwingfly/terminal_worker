@@ -14,13 +14,18 @@ use worker::*;
 /// How long an upload may go without a new chunk before it is cancelled, in seconds.
 pub const UPLOAD_TTL: u64 = 24 * 60 * 60;
 /// The chunks of a recording (`stream`): small, as each is sent once it is whole, and lost if
-/// its page goes first; about eight seconds of speech at 64 kbit/s.
-pub const RECORDING_CHUNK: u64 = 64 * 1024;
+/// its page goes first (about half a minute of speech at 64 kbit/s); not too small, as reading a
+/// file takes an R2 request a chunk, of the Worker's subrequests (1000 a request).
+pub const RECORDING_CHUNK: u64 = 256 * 1024;
+/// The most a recording may be: as many chunks as one read can take, with room for what else it
+/// asks (240 MiB, about eight hours at 64 kbit/s).
+pub const RECORDING_MAX: u64 = RECORDING_CHUNK * 960;
 /// How long a recording's page may go unheard (chunks, its hold) before the recording is
 /// completed with what arrived, in seconds.
 pub const RECORDING_IDLE: u64 = 10 * 60;
-/// What a recording that reached the largest a file may be is told: it takes no more.
-const RECORDING_FULL: &str = "The recording reached the largest a file may be (1 GB)";
+/// What a recording that reached the most it may be is told: it takes no more.
+const RECORDING_FULL: &str =
+    "The recording reached the most a recording may be (240 MB, about eight hours)";
 
 pub struct Reply {
     pub status: u16,
@@ -583,7 +588,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                             400,
                         );
                     }
-                    if file.size + length.unwrap_or_default() > MAX_FILE {
+                    if file.size + length.unwrap_or_default() > RECORDING_MAX {
                         return Reply::error(RECORDING_FULL, 413);
                     }
                     let (path, _) = match destination(db, &who, &file) {
@@ -1245,7 +1250,7 @@ fn commit_upload(
             held(db, id, hold).and_then(|()| destination(db, who, &file)),
         ) {
             (None, _) => Some(Reply::error("A recording's chunk must say its length", 400)),
-            (Some(length), _) if file.size + length > MAX_FILE => {
+            (Some(length), _) if file.size + length > RECORDING_MAX => {
                 Some(Reply::error(RECORDING_FULL, 413))
             }
             (_, Err(reply)) => Some(reply),
@@ -1342,11 +1347,8 @@ fn finish_upload(
         );
     }
     db.finish_file(id);
-    // A recording that ended is live no more.
     if file.recording() {
-        for device in db.presenting(file.uploader, &path) {
-            devices::end(db, &device.name);
-        }
+        end_live(db, &file, &path);
     }
     Reply::ok(json!({"path":path,"size":file.size,"etag":file.etag()}))
         .status(if file.base.is_none() { 201 } else { 200 })
@@ -1397,17 +1399,22 @@ fn destination(
 /// A recording whose page went away: it is complete with what arrived, in order; one with
 /// nothing is abandoned. Its live sound ends.
 pub fn finish_recording(db: &mut Db, file: &File) {
-    let path = db.showing(&file.id).pop();
-    if let Some(path) = &path {
-        for device in db.presenting(file.uploader, path) {
-            devices::end(db, &device.name);
-        }
+    if let Some(path) = db.showing(&file.id).pop() {
+        end_live(db, file, &path);
     }
     // A recording takes only its next chunk, so what arrived is all there, in order.
     if file.size == 0 {
         return cancel(db, file);
     }
     db.finish_file(&file.id);
+}
+
+/// End the live sound of the recording `file`, which shows at `path`: a recording that ended is
+/// live no more.
+fn end_live(db: &mut Db, file: &File, path: &str) {
+    for device in db.presenting(file.uploader, path) {
+        devices::end(db, &device.name);
+    }
 }
 
 /// Abandon an upload: a new file disappears, an overwritten one keeps its old content.
@@ -1687,8 +1694,6 @@ async fn passwd(
 /// The most accounts guests may make, all told.
 const REGISTERED_MAX: usize = 1000;
 
-/// useradd NAME, signed out: an account of one's own, in its own group and in guest's, with a
-/// home in /guest that only it may enter, and the password given; signed in as it at once.
 /// An account of group guest's deleting itself (userdel NAME, signed in as NAME), as its
 /// password confirms, and with `remove` its home: its sessions end, this one too.
 async fn unregister(
@@ -1747,14 +1752,18 @@ async fn unregister(
         if auth::identity(db, key.as_deref()).id != who.id {
             return Reply::error("Signed out meanwhile; please try again", 409);
         }
-        if let Err(message) = commands::accounts::delete_account(db, &name, wanted.remove) {
-            return denied(&message, &who);
-        }
-        Reply::ok(json!({ "username": "guest", "deleted": name, "home": "/" }))
+        let kept = match commands::accounts::delete_account(db, &name, wanted.remove) {
+            Ok(kept) => kept,
+            Err(message) => return denied(&message, &who),
+        };
+        Reply::ok(json!({ "username": "guest", "deleted": name, "home": "/", "kept": kept }))
             .cookie(auth::cookie(https, "", 0))
     })
 }
 
+/// useradd NAME, signed out: an account of one's own, in its own group and in guest's, its home
+/// /guest/NAME (made, only it may enter, with -m), and the password given; signed in as it at
+/// once.
 async fn register(
     req: &mut Request,
     env: &Env,

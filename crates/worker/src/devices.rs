@@ -18,6 +18,9 @@ use terminal_worker_core::{CHUNK_SIZE, kind, permissions::*};
 pub const PRESENT_TTL: u64 = 12 * 60 * 60;
 /// How long a live sound lasts unheard from its page (sound.mjs keeps it every half minute).
 pub const SOUND_IDLE: u64 = 2 * 60;
+/// How many live sounds an account may send at once: each is a Realtime session, and a name in
+/// /dev/snd no other account may take.
+pub const SOUNDS_MAX: usize = 3;
 
 /// Make /dev and its directories, root's, where they are not: they are there from the start
 /// (store.rs), and made again if removed.
@@ -87,6 +90,16 @@ pub fn sound_name(
     };
     let device = device_path(SOUND, &name)?;
     free(db, who, &device)?;
+    let sending = db
+        .sounds_of(who.id)
+        .into_iter()
+        .filter(|other| *other != device)
+        .count();
+    if sending >= SOUNDS_MAX {
+        return Err(format!(
+            "An account sends at most {SOUNDS_MAX} live sounds at once; stop one first"
+        ));
+    }
     Ok(device)
 }
 

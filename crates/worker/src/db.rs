@@ -844,6 +844,16 @@ impl Db {
             vec![int(owner), text(path)],
         )
     }
+    /// The names of `owner`'s live sounds.
+    pub fn sounds_of(&self, owner: u32) -> Vec<String> {
+        self.rows::<Device>(
+            "SELECT name, owner, path, media FROM devices WHERE owner = ? AND media IS NOT NULL",
+            vec![int(owner)],
+        )
+        .into_iter()
+        .map(|device| device.name)
+        .collect()
+    }
     /// The names of `owner`'s devices.
     pub fn devices_of(&self, owner: u32) -> Vec<String> {
         self.rows::<Device>(
@@ -1110,6 +1120,15 @@ impl Store for Db {
         self.rows::<UserRow>(&format!("{USER} WHERE id = ?"), vec![int(id)])
             .pop()
             .map(UserRow::pair)
+    }
+    fn home_of(&self, path: &str) -> Option<u32> {
+        #[derive(Deserialize)]
+        struct Id {
+            id: u32,
+        }
+        self.rows::<Id>("SELECT id FROM users WHERE home = ?", vec![text(path)])
+            .pop()
+            .map(|user| user.id)
     }
     fn users(&self) -> Vec<(String, User)> {
         self.rows::<UserRow>(&format!("{USER} ORDER BY name"), vec![])

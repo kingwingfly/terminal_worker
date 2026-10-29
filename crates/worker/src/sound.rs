@@ -133,6 +133,13 @@ pub async fn speak(
     if let Err(why) = app(env) {
         return Ok(Reply::error(&why, 503));
     }
+    // Each makes a Realtime session, as a listener's does.
+    if auth::limited(req, env, "speak").await? {
+        return Ok(Reply::error(
+            "Too many attempts; please try again later",
+            429,
+        ));
+    }
     // Asked first, so that Realtime is not asked for one who may not.
     let asked = (key.clone(), path.clone());
     let device = api::run(state, move |db| {

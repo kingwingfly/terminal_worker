@@ -48,9 +48,10 @@ export async function speak(path, name, microphone, acl = null) {
     published = await post('/api/sound?' + query, { sdp: pc.localDescription.sdp, mid: transceiver.mid });
     await pc.setRemoteDescription({ type: 'answer', sdp: published.sdp });
     await connected(pc);
-    // Still sending: every half minute; a device gone or taken over is kept no more.
+    // Still sending: every half minute. A device gone, or taken over (404), or a session that
+    // ended (401, 403), is kept no more; one the authority could not answer for now is, next time.
     holding = setInterval(() => {
-      fetch('/api/sound/hold?' + device(), { method: 'POST' }).then(json).catch(error => { if (error.status) clearInterval(holding); });
+      fetch('/api/sound/hold?' + device(), { method: 'POST' }).then(json).catch(error => { if ([401, 403, 404].includes(error.status)) clearInterval(holding); });
     }, HOLD);
     return { device: published.device, end };
   } catch (error) {

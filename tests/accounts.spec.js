@@ -59,6 +59,11 @@ test('signed out, useradd makes an account of one\'s own: a home with -m, other 
     await expect(last(one.page)).toContainText(`Created user ${plain} and signed in; no home (/guest/${plain} is not made)`);
     expect((await stat('/guest/' + plain)).status()).toBe(404);
     expect(await output(one.page, 'groups')).toBe(`${plain} guest`);
+    // Its home, not made yet, is its own to make: no one else takes its path in /guest.
+    await run(two.page, `mkdir /guest/${plain}`);
+    await expect(last(two.page)).toContainText(`/guest/${plain} is another account's home`);
+    await output(one.page, `mkdir /guest/${plain}`);
+    expect((await (await stat('/guest/' + plain)).json()).owner).toBe(plain);
     // With -m, its home, and --short-password lets the password be short.
     await run(two.page, `useradd -m --short-password ${homed}`);
     await expect(two.page.locator('#auth-description')).toContainText(`Your home will be /guest/${homed}, which only you may enter`);
@@ -95,6 +100,15 @@ test('an account in group guest deletes itself with its password; others need ro
     await expect(last(one.page)).toContainText(`Deleted user ${self}; signed out as guest`);
     await expect(one.page.locator('.lock')).toContainText('guest');
     expect((await stat('/guest/' + self)).status()).toBe(404);
+    // Its group went with it, as userdel's does: the name may be taken again.
+    await run(one.page, `useradd ${self}`); await answer(one.page, password);
+    await expect(last(one.page)).toContainText(`Created user ${self} and signed in`);
+    // -r keeps a home that is not the account's own: root's directory, here.
+    expect((await root.post('/api/mkdir?path=' + encodeURIComponent('/guest/' + self))).ok()).toBe(true);
+    await run(one.page, `userdel -r ${self}`); await answer(one.page, password, false);
+    await expect(last(one.page)).toContainText(`Deleted user ${self}; /guest/${self} is not ${self}'s, not removed; signed out as guest`);
+    expect((await stat('/guest/' + self)).status()).toBe(200);
+    await root.delete('/api/file?path=' + encodeURIComponent('/guest/' + self) + '&recursive=true');
     const again = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('again') } });
     expect((await again.post('/api/login', { data: { username: self, password } })).ok()).toBe(false);
     await again.dispose();

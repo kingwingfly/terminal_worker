@@ -12,7 +12,8 @@ export const RECORDED = 'audio/webm;codecs=opus';
 
 // `bytes`, in the unit they make at least one of.
 const size = bytes => bytes < 1e3 ? `${bytes} B` : bytes < 1e6 ? `${(bytes / 1e3).toFixed(1)} KB` : `${(bytes / 1e6).toFixed(1)} MB`;
-const clock = seconds => `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+/** `seconds` as minutes and seconds, as a recording's line and a live sound's show them. */
+export const clock = seconds => `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
 
 /** Record `microphone`, a MediaStream, into a new file at `destination`, made with the ACL
  * entries `acl` (stream -m), until `signal` stops it, reporting progress; `begun` hears once the
@@ -39,10 +40,13 @@ export async function record(destination, microphone, { acl = null, progress = (
           // Its hash is of what arrived, in order.
           await json(response); sent += bytes.length; whole.update(bytes); return;
         } catch (error) {
-          // Refused, it is over. Unreachable, it goes again, for as long as the network is down,
-          // while what is recorded meanwhile waits its turn; once stopped, a few times more.
+          // Refused, it is over; a 400 says R2 did not take it (files.rs), which goes again a few
+          // times, as an upload's chunk does. Unreachable, it goes again for as long as the
+          // network is down, while what is recorded meanwhile waits its turn; once stopped, a few
+          // times more.
           if (error.status === 413) { full = true; return; }
-          if ((error.status >= 400 && error.status < 500) || (signal.aborted && attempt + 1 >= RETRIES)) { failure = error; return; }
+          const refused = error.status >= 400 && error.status < 500 && (error.status !== 400 || attempt + 1 >= RETRIES);
+          if (refused || (signal.aborted && attempt + 1 >= RETRIES)) { failure = error; return; }
           await new Promise(resolve => setTimeout(resolve, Math.min(10000, 1000 * 2 ** attempt)));
         }
       }
