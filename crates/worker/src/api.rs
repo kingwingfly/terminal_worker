@@ -159,6 +159,8 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             );
             Reply::ok(view)
         }),
+        // System calls (sys.rs): what user space, the page, asks of the kernel.
+        (Method::Post, "/api/sys") => crate::sys::handle(req, state, key).await,
         (Method::Post, "/api/login") => login(req, env, state, key, https).await,
         (Method::Post, "/api/logout") => run(state, move |db| {
             if let Some(key) = &key {

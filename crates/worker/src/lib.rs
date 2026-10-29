@@ -9,6 +9,7 @@ mod runner;
 mod sound;
 mod store;
 mod streams;
+mod sys;
 use files::error_response;
 pub use runner::JobRunner;
 pub use store::TerminalAuthority;

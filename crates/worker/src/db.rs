@@ -45,8 +45,8 @@ const SCHEMA: [&str; 23] = [
     "CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent)",
     "CREATE INDEX IF NOT EXISTS nodes_ino ON nodes(ino)",
     // An inode: a directory, a file showing content, or a symbolic link to `link`; its ACLs as
-    // JSON (crate::acl).
-    "CREATE TABLE IF NOT EXISTS inodes(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, grp INTEGER NOT NULL, mode INTEGER NOT NULL, directory INTEGER NOT NULL, file TEXT, size INTEGER NOT NULL, link TEXT, acl TEXT, default_acl TEXT)",
+    // JSON (crate::acl); when its content (a directory's entries) last changed, and it at all.
+    "CREATE TABLE IF NOT EXISTS inodes(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, grp INTEGER NOT NULL, mode INTEGER NOT NULL, directory INTEGER NOT NULL, file TEXT, size INTEGER NOT NULL, link TEXT, acl TEXT, default_acl TEXT, mtime INTEGER NOT NULL DEFAULT 0, ctime INTEGER NOT NULL DEFAULT 0)",
     "CREATE INDEX IF NOT EXISTS inodes_file ON inodes(file)",
     // Extended attributes, their values in hexadecimal.
     "CREATE TABLE IF NOT EXISTS xattrs(ino INTEGER NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(ino, name))",
@@ -171,6 +171,15 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     }
     for statement in SCHEMA {
         sql.exec(statement, None)?;
+    }
+    // Inodes made before they had times get them, as of 1970.
+    if sql.exec("SELECT mtime FROM inodes LIMIT 0", None).is_err() {
+        for column in ["mtime", "ctime"] {
+            sql.exec(
+                &format!("ALTER TABLE inodes ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
+                None,
+            )?;
+        }
     }
     // Tables made just now are this version's, said at once: initialization may fail (a
     // missing ADMIN_PASSWORD), and the next start must not take them for an older version's.
@@ -1080,6 +1089,59 @@ pub enum JobColumn {
 }
 const USER: &str = "SELECT id, name, gid, groups, home, locked, salt, hash FROM users";
 
+impl Db {
+    /// The entries of the directory holding `path` changed: its times are now.
+    fn entries_changed(&mut self, path: &str, now: u64) {
+        if path == "/" {
+            return;
+        }
+        self.run(
+            "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE id = (SELECT ino FROM nodes WHERE path = ?2)",
+            vec![int(now), text(terminal_worker_core::parent(path))],
+        );
+    }
+}
+
+/// What the kernel's file system keeps beyond names: the time, inodes' times, empty content,
+/// and what has arrived of content still being written.
+impl kernel::Fs for Db {
+    fn now(&self) -> u64 {
+        crate::auth::now()
+    }
+    fn times(&self, ino: u64) -> (u64, u64) {
+        #[derive(Deserialize)]
+        struct Times {
+            mtime: u64,
+            ctime: u64,
+        }
+        self.rows::<Times>(
+            "SELECT mtime, ctime FROM inodes WHERE id = ?",
+            vec![int(ino)],
+        )
+        .pop()
+        .map_or((0, 0), |times| (times.mtime, times.ctime))
+    }
+    fn touch(&mut self, ino: u64) {
+        let now = crate::auth::now();
+        self.run(
+            "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE id = ?2",
+            vec![int(now), int(ino)],
+        );
+        for name in self.names(ino) {
+            changes(&name);
+        }
+    }
+    fn empty(&mut self, owner: u32, path: &str) -> String {
+        let file = self.create_file(0, 1, None, owner, path, None, crate::auth::now());
+        self.finish_file(&file);
+        file
+    }
+    fn writing(&self, file: &str) -> Option<(u64, bool)> {
+        let file = self.file(file).filter(|file| !file.complete())?;
+        Some((self.received(&file), file.recording()))
+    }
+}
+
 impl Store for Db {
     fn node(&self, path: &str) -> Option<Node> {
         self.rows::<NodeRow>(&format!("{NODE} WHERE n.path = ?"), vec![text(path)])
@@ -1119,8 +1181,10 @@ impl Store for Db {
         #[derive(Deserialize)]
         struct Shown {
             file: Option<String>,
+            mtime: u64,
         }
         changes(path);
+        let now = crate::auth::now();
         let json = |value: Option<String>| -> SqlStorageValue { value.into() };
         let values = vec![
             int(node.owner),
@@ -1138,21 +1202,29 @@ impl Store for Db {
             ),
         ];
         let ino = if node.ino == 0 {
+            let mut values = values;
+            values.extend([int(now), int(now)]);
             self.rows::<Id>(
-                "INSERT INTO inodes(owner, grp, mode, directory, file, size, link, acl, default_acl) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                "INSERT INTO inodes(owner, grp, mode, directory, file, size, link, acl, default_acl, mtime, ctime) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
                 values,
             )
             .pop()
             .map_or(0, |i| i.id)
         } else {
-            let before = self
-                .rows::<Shown>("SELECT file FROM inodes WHERE id = ?", vec![int(node.ino)])
-                .pop()
-                .and_then(|s| s.file);
+            let shown = self
+                .rows::<Shown>(
+                    "SELECT file, mtime FROM inodes WHERE id = ?",
+                    vec![int(node.ino)],
+                )
+                .pop();
+            let (before, mtime) = shown.map_or((None, 0), |s| (s.file, s.mtime));
+            // Its content changed (an upload completed over it): its mtime too; anything, its
+            // ctime.
+            let mtime = if before != node.file { now } else { mtime };
             let mut values = values;
-            values.push(int(node.ino));
+            values.extend([int(mtime), int(now), int(node.ino)]);
             self.run(
-                "UPDATE inodes SET owner = ?, grp = ?, mode = ?, directory = ?, file = ?, size = ?, link = ?, acl = ?, default_acl = ? WHERE id = ?",
+                "UPDATE inodes SET owner = ?, grp = ?, mode = ?, directory = ?, file = ?, size = ?, link = ?, acl = ?, default_acl = ?, mtime = ?, ctime = ? WHERE id = ?",
                 values,
             );
             // Every name of it shows the change.
@@ -1172,6 +1244,9 @@ impl Store for Db {
             "INSERT INTO nodes(path, parent, ino) VALUES(?, ?, ?) ON CONFLICT(path) DO UPDATE SET ino = excluded.ino",
             vec![text(path), text(parent_of(path)), int(ino)],
         );
+        if old != Some(ino) {
+            self.entries_changed(path, now);
+        }
         if let Some(old) = old
             && old != ino
         {
@@ -1185,6 +1260,7 @@ impl Store for Db {
             .pop()
             .map(|r| r.ino);
         self.run("DELETE FROM nodes WHERE path = ?", vec![text(path)]);
+        self.entries_changed(path, crate::auth::now());
         if let Some(old) = old {
             self.forget(old);
         }

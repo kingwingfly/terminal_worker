@@ -3821,9 +3821,19 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "terminal-worker-abi",
  "terminal-worker-core",
+ "terminal-worker-kernel",
  "wasm-bindgen",
  "worker",
+]
+
+[[package]]
+name = "terminal-worker-abi"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3847,6 +3857,16 @@ dependencies = [
  "terminal-worker-core",
  "tiny_http",
  "zip",
+]
+
+[[package]]
+name = "terminal-worker-kernel"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "terminal-worker-abi",
+ "terminal-worker-core",
 ]
 
 [[package]]
