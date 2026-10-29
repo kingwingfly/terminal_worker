@@ -6,6 +6,8 @@
 import { json } from './http.mjs';
 
 const ICE = [{ urls: 'stun:stun.cloudflare.com:3478' }];
+// How often a speaker's page says it still sends its sound, in ms.
+const HOLD = 30000;
 
 const post = (url, body, method = 'POST') => fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(json);
 
@@ -21,26 +23,35 @@ function connected(pc) {
   });
 }
 
-/** Send `microphone` live, as /dev/snd/NAME of the recording at `path`; settles with the device
- * and what ends it. */
-export async function speak(path, name, microphone) {
+/** Send `microphone` live, as /dev/snd/NAME: of the recording at `path`, or, with no path, kept
+ * nowhere, a file of its own made with the ACL entries `acl` (stream -m). Settles with the device
+ * and what ends it. While it goes, the page says so (/api/sound/hold), or it ends
+ * (devices::SOUND_IDLE). */
+export async function speak(path, name, microphone, acl = null) {
   const pc = new RTCPeerConnection({ iceServers: ICE, bundlePolicy: 'max-bundle' });
-  let published = null;
+  let published = null, holding = null;
+  const device = () => 'name=' + encodeURIComponent(published.device) + '&version=' + encodeURIComponent(published.version ?? '');
   // Ends the device this page made, while it is still that one: another page of the account may
   // have taken its name over since (devices::stop, by version).
   const end = async () => {
-    pc.close();
+    clearInterval(holding); pc.close();
     if (!published) return;
-    const query = 'name=' + encodeURIComponent(published.device) + '&version=' + encodeURIComponent(published.version ?? '');
-    await fetch('/api/sound?' + query, { method: 'DELETE' }).catch(() => {});
+    await fetch('/api/sound?' + device(), { method: 'DELETE' }).catch(() => {});
   };
   try {
     const transceiver = pc.addTransceiver(microphone.getAudioTracks()[0], { direction: 'sendonly' });
     await pc.setLocalDescription(await pc.createOffer());
-    const query = 'path=' + encodeURIComponent(path) + (name ? '&name=' + encodeURIComponent(name) : '');
+    const query = new URLSearchParams();
+    if (path) query.set('path', path);
+    if (name) query.set('name', name);
+    if (acl) query.set('acl', acl);
     published = await post('/api/sound?' + query, { sdp: pc.localDescription.sdp, mid: transceiver.mid });
     await pc.setRemoteDescription({ type: 'answer', sdp: published.sdp });
     await connected(pc);
+    // Still sending: every half minute; a device gone or taken over is kept no more.
+    holding = setInterval(() => {
+      fetch('/api/sound/hold?' + device(), { method: 'POST' }).then(json).catch(error => { if (error.status) clearInterval(holding); });
+    }, HOLD);
     return { device: published.device, end };
   } catch (error) {
     // A sound that never connected is no device for listeners to find.

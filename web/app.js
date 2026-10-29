@@ -27,7 +27,7 @@ async function api(url, options) {
 async function session(path = directory) { return (await api('/api/session?path=' + encodeURIComponent(path))).json(); }
 // Endpoints that change this browser's session. The session one replaces ends as it answers,
 // which this page hears of before its own identityChanged: until then, that is not news.
-const SESSION_CHANGES = new Set(['login', 'logout', 'passwd', 'register']);
+const SESSION_CHANGES = new Set(['login', 'logout', 'passwd', 'register', 'unregister']);
 let changingSession = 0;
 async function post(endpoint, data) {
   const changes = SESSION_CHANGES.has(endpoint);
@@ -279,17 +279,43 @@ async function accountCommand(args, cwd) {
     if (!result) throw new Error('Password change canceled');
     await identityChanged(); return { output: `Password updated for ${username}` };
   }
-  // Signed out, useradd NAME makes an account of one's own, with the password given here.
+  // Signed out, useradd NAME makes an account of one's own, with the password given here: its
+  // home is /guest/NAME, which -m makes, and it is in group guest; other options need sudo. The
+  // shell gives the options as useradd's definition spells them (shell.rs).
   if (args[0] === 'useradd' && !sudo && !(await session()).authenticated) {
-    const force = args.includes('--force');
-    const rest = args.slice(1).filter(arg => arg !== '--force');
-    if (rest.length !== 1 || rest[0].startsWith('-')) throw new Error('Usage: useradd [--force] NAME (signed out: an account of your own, home /guest/NAME); options need sudo');
-    const username = rest[0];
-    const result = await credentials({ title: `Create account ${username}`, description: (force ? '--force enabled: short passwords are allowed, but cannot be empty. ' : 'Use at least 12 characters, or run useradd --force NAME to allow a short password. ') + `Your home will be /guest/${username}, which only you may enter; you will be signed in.`, newPassword: true, action: 'Create account',
-      submit: fields => post('register', { username, password: fields.password, force }) });
+    let createHome = false, shortPassword = false, username = null, operands = false;
+    for (const arg of args.slice(1)) {
+      if (!operands && arg === '--') operands = true;
+      else if (!operands && arg === '-m') createHome = true;
+      else if (!operands && arg === '-M') createHome = false;
+      else if (!operands && arg === '--short-password') shortPassword = true;
+      else if (!operands && arg.startsWith('-')) throw new Error(`useradd: ${arg} needs sudo; signed out, useradd [-m|-M] [--short-password] NAME makes an account of your own, home /guest/NAME, in group guest`);
+      else if (username === null) username = arg;
+      else throw new Error('Usage: useradd [-m|-M] [--short-password] NAME');
+    }
+    if (!username) throw new Error('Usage: useradd [-m|-M] [--short-password] NAME');
+    const home = `/guest/${username}`;
+    const result = await credentials({ title: `Create account ${username}`, description: (shortPassword ? '--short-password: short passwords are allowed, but cannot be empty. ' : 'Use at least 12 characters, or run useradd --short-password NAME to allow a short password. ') + (createHome ? `Your home will be ${home}, which only you may enter; ` : `Your home, ${home}, will not be made (useradd -m makes it); `) + 'you will be signed in.', newPassword: true, action: 'Create account',
+      submit: fields => post('register', { username, password: fields.password, short_password: shortPassword, create_home: createHome }) });
     if (!result) throw new Error('Account creation canceled');
     await identityChanged();
-    return { output: `Created user ${username} and signed in; home ${result.home}`, home: result.home };
+    return result.created_home
+      ? { output: `Created user ${username} and signed in; home ${result.home}`, home: result.home }
+      : { output: `Created user ${username} and signed in; no home (${result.home} is not made)` };
+  }
+  // An account of group guest's deletes itself (userdel [-r] NAME, signed in as NAME), as its
+  // password confirms; others, and root, go to the server, which takes root.
+  if (args[0] === 'userdel' && !sudo) {
+    const remove = args.slice(1).some(arg => arg === '-r' || arg === '--remove');
+    const named = args.slice(1).filter(arg => !arg.startsWith('-'));
+    const current = await session();
+    if (current.authenticated && current.uid !== 0 && current.groups?.includes('guest') && named.length === 1 && named[0] === current.username) {
+      const result = await credentials({ title: `Delete account ${current.username}`, description: `This deletes your account, ends its sessions and signs you out; ${remove ? `-r removes its home, ${current.home}, and everything in it` : 'its home and files stay'}. It cannot be undone.`, action: 'Delete account',
+        submit: fields => post('unregister', { password: fields.password, remove }) });
+      if (!result) throw new Error('Account deletion canceled');
+      await identityChanged();
+      return { output: `Deleted user ${result.deleted}; signed out as guest`, home: '/' };
+    }
   }
   if (['su', 'login'].includes(args[0])) {
     if (sudo) throw new Error('Use su root to switch accounts');
@@ -358,14 +384,26 @@ function cancelUploads() { if (!uploading) return false; uploading.abort(); retu
 // when it may (sound.mjs); `progress` hears how it goes. Ctrl+C in its tab stops it
 // (stopRecording), which saves what was recorded. Settles with what was saved.
 let recording = null;
-async function recordSound(path, name, progress) {
+async function recordSound(path, name, acl, progress) {
   if (recording) throw new Error('This page is recording already; stop it with Ctrl+C in its tab');
   const controller = recording = new AbortController();
   let microphone, live = null, liveNote = '', speaking = Promise.resolve();
   try {
     try { microphone = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
     catch (error) { throw new Error('No microphone: ' + error.message); }
-    const saved = await record(path, microphone, { signal: controller.signal, progress: text => progress(text + liveNote),
+    // Live only, kept nowhere: until Ctrl+C, or the microphone ends.
+    if (!path) {
+      live = await speak(null, name, microphone, acl);
+      const started = performance.now(), track = microphone.getAudioTracks()[0];
+      const seconds = () => (performance.now() - started) / 1000;
+      const clock = () => `${String(Math.floor(seconds() / 60)).padStart(2, '0')}:${String(Math.floor(seconds() % 60)).padStart(2, '0')}`;
+      const say = () => progress(`● live as ${live.device} · ${clock()}`);
+      const ticking = setInterval(say, 1000); say();
+      try { await new Promise(resolve => { controller.signal.addEventListener('abort', resolve, { once: true }); track.addEventListener('ended', resolve, { once: true }); }); }
+      finally { clearInterval(ticking); }
+      return { seconds: seconds(), device: live.device, note: track.readyState === 'ended' && !controller.signal.aborted ? ' · the microphone stopped' : '' };
+    }
+    const saved = await record(path, microphone, { acl, signal: controller.signal, progress: text => progress(text + liveNote),
       // Live once the file is there, which its device links to; a recording all the same if not.
       begun: () => { speaking = speak(path, name, microphone).then(sent => { live = sent; liveNote = ` · live as ${sent.device}`; }, error => { liveNote = ` · not live: ${error.message}`; }); } });
     await speaking;

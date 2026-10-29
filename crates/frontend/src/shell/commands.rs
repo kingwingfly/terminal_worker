@@ -454,23 +454,32 @@ impl TerminalCommand for Stream {
     ) -> LocalBoxFuture<'static, Result<Output, String>> {
         async move {
             let stream = cli::parse::<files::Stream>(rest(&args))?;
-            let path = shell.path(&stream.file)?;
-            let lower = path.to_lowercase();
-            if !lower.ends_with(".weba") && !lower.ends_with(".webm") {
-                return Err(format!(
-                    "stream: {}: browsers record Opus in WebM; name the recording NAME.weba",
-                    stream.file
-                ));
-            }
-            // A line that follows the recording; Ctrl+C in this tab stops it, as it cancels an
+            // Recorded into FILE, or live only.
+            let path = match &stream.file {
+                Some(file) => {
+                    let path = shell.path(file)?;
+                    let lower = path.to_lowercase();
+                    if !lower.ends_with(".weba") && !lower.ends_with(".webm") {
+                        return Err(format!(
+                            "stream: {file}: browsers record Opus in WebM; name the recording NAME.weba"
+                        ));
+                    }
+                    Some(path)
+                }
+                None => None,
+            };
+            // Entries for who may hear, given as one list, as setfacl -m takes them.
+            let acl = (!stream.modify.is_empty()).then(|| stream.modify.join(","));
+            // A line that follows the sound; Ctrl+C in this tab stops it, as it cancels an
             // upload.
             let line = RwSignal::new(String::from("● starting the microphone"));
             shell.push(LogLine::Live(line));
             let progress = Closure::<dyn Fn(String)>::new(move |text: String| line.set(text));
             shell.recording.set(true);
             let result = JsFuture::from(record_sound(
-                &path,
+                path.clone(),
                 stream.name,
+                acl,
                 progress.as_ref().unchecked_ref(),
             ))
             .await;
@@ -483,12 +492,14 @@ impl TerminalCommand for Stream {
             let seconds = get("seconds").as_f64().unwrap_or_default() as u64;
             let size = get("size").as_f64().unwrap_or_default() as u64;
             let note = get("note").as_string().unwrap_or_default();
-            line.set(format!(
-                "✓ {path} · {:02}:{:02} · {}{note}",
-                seconds / 60,
-                seconds % 60,
-                crate::viewer::size(size)
-            ));
+            let clock = format!("{:02}:{:02}", seconds / 60, seconds % 60);
+            line.set(match &path {
+                Some(path) => format!("✓ {path} · {clock} · {}{note}", crate::viewer::size(size)),
+                None => format!(
+                    "✓ {} · {clock}{note}",
+                    get("device").as_string().unwrap_or_default()
+                ),
+            });
             shell.refresh().await?;
             Ok(Output::default())
         }

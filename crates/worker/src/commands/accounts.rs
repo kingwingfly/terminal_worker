@@ -1,6 +1,7 @@
 //! Accounts: whoami, id, groups, users, useradd, usermod, userdel, groupadd, groupmod and
 //! groupdel. Those that change accounts are root's; a signed-out useradd NAME goes to
-//! /api/register instead, through the terminal's dialog.
+//! /api/register instead, and an account of group guest's userdel of itself to
+//! /api/unregister, through the terminal's dialog.
 
 use terminal_worker_core::cli::{accounts as args, parse};
 use terminal_worker_core::parent;
@@ -235,26 +236,30 @@ impl ServerCommand for Userdel {
     fn run(&self, ctx: &mut Context) -> Result<String, String> {
         let userdel = parse::<args::Userdel>(ctx.args)?;
         root(ctx)?;
-        let db = &mut *ctx.db;
-        let name = userdel.user.as_str();
-        let user = db.user(name).ok_or("User does not exist")?;
-        if user.id == 0 || user.id == GUEST {
-            return Err(format!("Cannot delete {name}"));
-        }
-        if userdel.remove && db.node(&user.home).is_some() {
-            protect_home(db, &user.home, user.id)?;
-            db.remove(&Identity::root(), &user.home, true)?;
-        }
-        db.delete_user(name);
-        db.delete_sessions(user.id);
-        // Its presentations end with it, and their followers hear so; where it showed decks is
-        // forgotten, as a new account may take its uid.
-        for device in db.devices_of(user.id) {
-            crate::devices::end(db, &device);
-        }
-        db.delete_places(user.id);
-        Ok(format!("Deleted user {name}"))
+        delete_account(ctx.db, &userdel.user, userdel.remove)?;
+        Ok(format!("Deleted user {}", userdel.user))
     }
+}
+
+/// Delete the account `name`, and with `remove` its home: its sessions end, its devices end
+/// (their followers hear so), and where it showed decks is forgotten, as a new account may take
+/// its uid. Its files keep its uid. root and guest are never deleted.
+pub fn delete_account(db: &mut crate::db::Db, name: &str, remove: bool) -> Result<(), String> {
+    let user = db.user(name).ok_or("User does not exist")?;
+    if user.id == 0 || user.id == GUEST {
+        return Err(format!("Cannot delete {name}"));
+    }
+    if remove && db.node(&user.home).is_some() {
+        protect_home(db, &user.home, user.id)?;
+        db.remove(&Identity::root(), &user.home, true)?;
+    }
+    db.delete_user(name);
+    db.delete_sessions(user.id);
+    for device in db.devices_of(user.id) {
+        crate::devices::end(db, &device);
+    }
+    db.delete_places(user.id);
+    Ok(())
 }
 
 pub struct Groupadd;

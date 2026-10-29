@@ -169,10 +169,10 @@ impl Manual for Passwd {
 /// make an account
 ///
 /// Signed out, useradd NAME makes an account of your own: a dialog asks for its password, and
-/// you are signed in. Its home is /guest/NAME, mode 700, which only you may enter; /guest itself
-/// is shared and sticky (1777), so anyone may put files there and only their owners remove them.
-/// The account has a group of its own and is in group guest. Guests may make up to 1000
-/// accounts, a few a minute from one address.
+/// you are signed in. Its home is /guest/NAME, which -m makes, mode 700, so that only you may
+/// enter it; /guest itself is shared and sticky (1777), so anyone may put files there and only
+/// their owners remove them. The account has a group of its own and is in group guest. Other
+/// options need sudo. Guests may make up to 1000 accounts, a few a minute from one address.
 ///
 /// Root makes any account: -m makes its home (/home/NAME, or -d HOME), mode 700; without -g, a
 /// group of the same name is its primary group; -G adds others. Set its password with passwd
@@ -183,15 +183,18 @@ impl Manual for Passwd {
 #[derive(Parser, Debug)]
 #[command(
     name = "useradd",
-    override_usage = "useradd [--force] NAME                                (signed out)\n       useradd [-m] [-d HOME] [-g GROUP] [-G G1,G2] NAME   (root)"
+    override_usage = "useradd [-m|-M] [--short-password] NAME              (signed out)\n       useradd [-m|-M] [-d HOME] [-g GROUP] [-G G1,G2] NAME   (root)"
 )]
 pub struct Useradd {
-    /// signed out: allow a short password
-    #[arg(long = "force")]
-    pub force: bool,
+    /// signed out: allow a password shorter than 12 characters (never an empty one)
+    #[arg(long = "short-password")]
+    pub short_password: bool,
     /// make the home
-    #[arg(short = 'm', long = "create-home")]
+    #[arg(short = 'm', long = "create-home", overrides_with = "no_create_home")]
     pub create_home: bool,
+    /// make no home (the default)
+    #[arg(short = 'M', long = "no-create-home", overrides_with = "create_home")]
+    pub no_create_home: bool,
     /// its home
     #[arg(value_hint = ValueHint::DirPath, short = 'd', long = "home-dir", value_name = "HOME")]
     pub home: Option<String>,
@@ -207,7 +210,10 @@ pub struct Useradd {
 impl Manual for Useradd {
     const SECTION: Section = Section::Accounts;
     const EXAMPLES: &'static [(&'static str, &'static str)] = &[
-        ("useradd ada", "signed out: an account of your own"),
+        (
+            "useradd -m ada",
+            "signed out: an account of your own, with a home",
+        ),
         ("sudo useradd -m -G research alice", "root: another account"),
     ];
     const SEE: &'static [&'static str] = &["passwd", "usermod", "userdel"];
@@ -259,10 +265,14 @@ impl Manual for Usermod {
     const SEE: &'static [&'static str] = &["useradd", "userdel"];
 }
 
-/// delete an account (root)
+/// delete an account
 ///
 /// Deletes the account and ends its sessions; -r also removes its home. Its files keep its uid,
 /// and root may give them to another. root and guest cannot be deleted.
+///
+/// Root deletes any account. An account in group guest, as useradd makes them for those signed
+/// out, deletes itself: userdel NAME, signed in as NAME; a dialog asks for its password, and you
+/// are signed out.
 #[derive(Parser, Debug)]
 #[command(name = "userdel")]
 pub struct Userdel {
@@ -274,7 +284,7 @@ pub struct Userdel {
 }
 impl Manual for Userdel {
     const SECTION: Section = Section::Accounts;
-    const NEEDS: &'static str = "root.";
+    const NEEDS: &'static str = "root; or being the account, in group guest.";
     const SEE: &'static [&'static str] = &["useradd"];
 }
 

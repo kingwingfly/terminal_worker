@@ -165,6 +165,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         (Method::Post, "/api/sudo") => sudo(req, env, state, key).await,
         (Method::Post, "/api/passwd") => passwd(req, env, state, key, https).await,
         (Method::Post, "/api/register") => register(req, env, state, key, https).await,
+        (Method::Post, "/api/unregister") => unregister(req, env, state, key, https).await,
         (Method::Post, "/api/command") => {
             if !body_size(req, 1 << 20) {
                 return Ok(Reply::error(
@@ -261,7 +262,18 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         // device at `path` (/dev/snd/NAME); answer what Realtime offered, to hear it.
         (Method::Post, "/api/sound") => {
             let name = Some(param("name")).filter(|name| !name.is_empty());
-            sound::speak(req, env, state, key, path, name).await
+            let entries = Some(param("acl")).filter(|entries| !entries.is_empty());
+            // Of a recording, or kept nowhere.
+            let recording = (!param("path").is_empty()).then_some(path);
+            sound::speak(req, env, state, key, recording, name, entries).await
+        }
+        // The page sending a live sound still does: it lasts (devices::SOUND_IDLE).
+        (Method::Post, "/api/sound/hold") => {
+            let (name, version) = (param("name"), param("version"));
+            run(state, move |db| {
+                let who = auth::identity(db, key.as_deref());
+                Reply::ok(acl!(devices::keep(db, &who, &name, &version), &who))
+            })
         }
         (Method::Delete, "/api/sound") => {
             let name = param("name");
@@ -358,6 +370,9 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 /// A recording (`stream`): a new file of no size yet, which grows.
                 #[serde(default)]
                 record: bool,
+                /// A recording's ACL entries, as setfacl -m takes them (stream -m).
+                #[serde(default)]
+                acl: Option<String>,
             }
             if !body_size(req, 4096) {
                 return Ok(Reply::error("Invalid upload request", 400));
@@ -415,6 +430,12 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 {
                     db.record_file(&id);
                     db.set_expiry("upload", &id, auth::now() + RECORDING_IDLE);
+                    // Who may hear it, as it is made (stream -m), or it is not made.
+                    if let (Some(entries), Some(made)) = (&start.acl, db.showing(&id).pop())
+                        && let Err(message) = devices::grant(db, &who, &made, entries)
+                    {
+                        return denied(&message, &who);
+                    }
                 }
                 reply
             })
@@ -439,13 +460,10 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 // another resumes the upload, holding it.
                 match held(db, &id, Some(&hold)) {
                     Ok(()) => {
-                        // A recording, and its live sound, last while their page is heard.
+                        // A recording lasts while its page is heard; its live sound, as that page
+                        // keeps it (/api/sound/hold).
                         if file.recording() {
-                            let until = auth::now() + RECORDING_IDLE;
-                            db.set_expiry("upload", &id, until);
-                            for device in db.presenting(who.id, &file.target) {
-                                db.set_expiry("device", &device.name, until);
-                            }
+                            db.set_expiry("upload", &id, auth::now() + RECORDING_IDLE);
                         }
                         Reply::ok(json!({"held": true}))
                     }
@@ -1671,6 +1689,72 @@ const REGISTERED_MAX: usize = 1000;
 
 /// useradd NAME, signed out: an account of one's own, in its own group and in guest's, with a
 /// home in /guest that only it may enter, and the password given; signed in as it at once.
+/// An account of group guest's deleting itself (userdel NAME, signed in as NAME), as its
+/// password confirms, and with `remove` its home: its sessions end, this one too.
+async fn unregister(
+    req: &mut Request,
+    env: &Env,
+    state: &State,
+    key: Option<String>,
+    https: bool,
+) -> Result<Reply> {
+    let who = read(state, {
+        let key = key.clone();
+        move |db| auth::identity(db, key.as_deref())
+    })?;
+    if who.id == GUEST {
+        return Ok(Reply::error("Sign in first", 401));
+    }
+    if who.id == 0 || !who.groups.contains(&GUEST) {
+        return Ok(Reply::error(
+            "Permission denied: an account deletes itself only if it is in group guest; root deletes others with sudo userdel",
+            403,
+        ));
+    }
+    if auth::limited(req, env, "unregister").await? {
+        return Ok(Reply::error(
+            "Too many attempts; please try again later",
+            429,
+        ));
+    }
+    if !body_size(req, 2048) {
+        return Ok(Reply::error("Invalid account request", 400));
+    }
+    #[derive(Deserialize)]
+    struct Unregister {
+        password: String,
+        #[serde(default)]
+        remove: bool,
+    }
+    let Ok(wanted) = req.json::<Unregister>().await else {
+        return Ok(Reply::error("Invalid account request", 400));
+    };
+    let (name, user) = read(state, {
+        let id = who.id;
+        move |db| {
+            let name = db.username(id);
+            let user = db.user(&name);
+            (name, user)
+        }
+    })?;
+    let Some(user) = user.filter(|user| user.id == who.id) else {
+        return Ok(Reply::error("User does not exist", 404));
+    };
+    if !auth::verify(&wanted.password, &user, env).await? {
+        return Ok(Reply::error("Incorrect password", 401));
+    }
+    run(state, move |db| {
+        if auth::identity(db, key.as_deref()).id != who.id {
+            return Reply::error("Signed out meanwhile; please try again", 409);
+        }
+        if let Err(message) = commands::accounts::delete_account(db, &name, wanted.remove) {
+            return denied(&message, &who);
+        }
+        Reply::ok(json!({ "username": "guest", "deleted": name, "home": "/" }))
+            .cookie(auth::cookie(https, "", 0))
+    })
+}
+
 async fn register(
     req: &mut Request,
     env: &Env,
@@ -1701,8 +1785,12 @@ async fn register(
     struct Register {
         username: String,
         password: String,
+        /// One shorter than 12 characters is meant (useradd --short-password).
         #[serde(default)]
-        force: bool,
+        short_password: bool,
+        /// Its home, /guest/NAME, is made too (useradd -m).
+        #[serde(default)]
+        create_home: bool,
     }
     let Ok(wanted) = req.json::<Register>().await else {
         return Ok(Reply::error("Invalid account request", 400));
@@ -1720,12 +1808,13 @@ async fn register(
             400,
         ));
     }
-    if !wanted.force && !auth::password_valid(&wanted.password) {
+    if !wanted.short_password && !auth::password_valid(&wanted.password) {
         return Ok(Reply::error(
-            "Use at least 12 characters; useradd --force allows a short password",
+            "Use at least 12 characters; useradd --short-password allows a short password",
             400,
         ));
     }
+    let create_home = wanted.create_home;
     // Refused before the slow hash, and again in the transaction that makes it.
     let taken = |db: &Db, name: &str| {
         if db.user(name).is_some() || db.group(name).is_some() {
@@ -1782,9 +1871,13 @@ async fn register(
                 hash,
             },
         );
-        db.set_node(&home, &Node::directory(uid, gid, 0o700));
+        // Its home is /guest/NAME, made as useradd -m makes one, or not at all.
+        if create_home {
+            db.set_node(&home, &Node::directory(uid, gid, 0o700));
+        }
         let (mut body, token) = auth::issue(db, key.as_deref(), uid);
         body["home"] = json!(home);
+        body["created_home"] = json!(create_home);
         Reply::ok(body)
             .status(201)
             .cookie(auth::cookie(https, &token, auth::TTL))

@@ -2,7 +2,7 @@
 //! a module a section: files, permissions, accounts and archives. Their arguments, and their
 //! help, are their definitions in [`terminal_worker_core::cli`].
 
-mod accounts;
+pub(crate) mod accounts;
 mod archives;
 mod files;
 mod permissions;

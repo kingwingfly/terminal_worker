@@ -14,12 +14,13 @@ export const RECORDED = 'audio/webm;codecs=opus';
 const size = bytes => bytes < 1e3 ? `${bytes} B` : bytes < 1e6 ? `${(bytes / 1e3).toFixed(1)} KB` : `${(bytes / 1e6).toFixed(1)} MB`;
 const clock = seconds => `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
 
-/** Record `microphone`, a MediaStream, into a new file at `destination` until `signal` stops it,
- * reporting progress; `begun` hears once the file is there. Settles with what was saved. */
-export async function record(destination, microphone, { progress = () => {}, begun: there = () => {}, signal }) {
+/** Record `microphone`, a MediaStream, into a new file at `destination`, made with the ACL
+ * entries `acl` (stream -m), until `signal` stops it, reporting progress; `begun` hears once the
+ * file is there. Settles with what was saved. */
+export async function record(destination, microphone, { acl = null, progress = () => {}, begun: there = () => {}, signal }) {
   if (!window.MediaRecorder?.isTypeSupported(RECORDED)) throw new Error('This browser cannot record Opus in WebM');
   const rust = window.terminalUploads, whole = rust.hasher();
-  const begun = await json(await fetch('/api/uploads?path=' + encodeURIComponent(destination), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ record: true }) }));
+  const begun = await json(await fetch('/api/uploads?path=' + encodeURIComponent(destination), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ record: true, acl }) }));
   const held = `id=${encodeURIComponent(begun.id)}&hold=${encodeURIComponent(begun.hold)}`;
   const chunkSize = begun.chunk_size;
   there(begun);

@@ -194,8 +194,9 @@ fn spelled(args: &[String]) -> Result<Vec<String>, String> {
         // Signed out, app.js makes the account; signed in, the server, which reads it again.
         "useradd" => {
             let useradd = cli::parse::<accounts::Useradd>(rest)?;
-            option(useradd.force, "--force", None);
+            option(useradd.short_password, "--short-password", None);
             option(useradd.create_home, "-m", None);
+            option(useradd.no_create_home, "-M", None);
             option(false, "-d", useradd.home);
             option(false, "-g", useradd.group);
             option(false, "-G", useradd.groups);

@@ -107,15 +107,17 @@ Every command supports `-h` and `--help`, generated, as is its page in `man COMM
 | Find | `fd [-H] [-t f\|d\|x] [-e EXT] [-d N] [-g\|-F] [-i\|-s] [-p] [-a] [-0] [PATTERN] [PATH...] [-x\|-X COMMAND...]` |
 | Text | `echo`, `cat`, `head`, `tail`, `grep`, `wc`, `sort`, `uniq`, `xargs`, joined by `\|` |
 | Permissions | `chmod [-R] MODE PATH...`, `chown [-R] USER[:GROUP] PATH...`, `chown :GROUP PATH...` |
-| Accounts | `useradd [-m] [-d HOME] [-g GROUP] [-G G1,G2] USER` |
+| Accounts | `useradd [-m\|-M] [-d HOME] [-g GROUP] [-G G1,G2] USER`; signed out, `useradd [-m\|-M] [--short-password] NAME` |
 | Update account | `usermod [-a] [-G G1,G2] [-g GROUP] [-d HOME [-m]] [-l NEW] [-L\|-U] USER` |
-| Remove account | `userdel [-r] USER` |
+| Remove account | `userdel [-r] USER`; an account in group guest, itself |
 | Groups | `groupadd GROUP`, `groupmod -n NEW OLD`, `groupdel GROUP` |
 | Password | `passwd [--force] [USER]` |
 | Identity | `whoami`, `id [USER]`, `groups [USER]`, root-only `users` |
 | Interface | `help`, `man [COMMAND]`, `clear`, `vim FILE` |
 
-Signed out, `useradd NAME` makes an account of one's own: the dialog asks for its password (12 characters unless `--force`), and the browser is signed in. The account has a private primary group and is in group `guest`; its home is `/guest/NAME`, mode 700. `/guest` is `root:guest` 1777, shared and sticky like `/tmp`. Registration is rate-limited per address, and guests may make at most 1,000 accounts. `guest` itself cannot have a password, be changed, or be deleted.
+Signed out, `useradd NAME` makes an account of one's own: the dialog asks for its password (12 characters unless `--short-password`), and the browser is signed in. The account has a private primary group and is in group `guest`; its home is `/guest/NAME`, mode 700, which `-m` makes (and `-M`, the default, does not), as useradd does. Other options need sudo. `/guest` is `root:guest` 1777, shared and sticky like `/tmp`. Registration is rate-limited per address, and guests may make at most 1,000 accounts. `guest` itself cannot have a password, be changed, or be deleted.
+
+An account in group `guest` deletes itself: signed in as NAME, `userdel NAME` (with `-r`, its home too) asks for its password in the dialog, ends its sessions and returns the browser to guest. Root deletes any account; other accounts need it.
 
 As root, `useradd -m` creates the home; `-d` selects its absolute path. Without `-g`, a same-name primary group is created. New accounts need `passwd USER` before login. Names start with a lowercase letter and contain up to 32 lowercase letters, digits, underscores, or hyphens.
 
@@ -265,9 +267,9 @@ So for a talk whose files are `u:guest:r` (`setfacl -R -m u:guest:rX DIR`, so th
 
 #### Live sound: stream and /dev/snd
 
-`stream talk.weba` records the microphone into a new file, Opus in WebM, which every browser records (Chrome, Firefox, Safari 18.4+; none on Linux records AAC). The file is there at once, marked as recording, and grows a chunk (64 KiB, about eight seconds) at a time; it may be read meanwhile. Ctrl+C in its tab stops it, and the file is complete. A chunk that cannot be sent is sent again for as long as the network is down, while the recording goes on. `jobs` lists a recording, and `jobs cancel ID` stops it from another tab or device, keeping what arrived; a recording ends at 1 GB, as any file does. A page that goes away mid-recording leaves what arrived: ten minutes later the authority completes the file with it.
+`stream -n talk`, signed in, sends the microphone live as `/dev/snd/talk`, kept nowhere (below). `stream talk.weba` also records it, into a new file, Opus in WebM, which every browser records (Chrome, Firefox, Safari 18.4+; none on Linux records AAC). The file is there at once, marked as recording, and grows a chunk (64 KiB, about eight seconds) at a time; it may be read meanwhile. Ctrl+C in its tab stops it, and the file is complete. A chunk that cannot be sent is sent again for as long as the network is down, while the recording goes on. `jobs` lists a recording, and `jobs cancel ID` stops it from another tab or device, keeping what arrived; a recording ends at 1 GB, as any file does. A page that goes away mid-recording leaves what arrived: ten minutes later the authority completes the file with it.
 
-Signed in, the sound is also live, as `/dev/snd/talk`, through Cloudflare Realtime (WebRTC): whoever may read the recording hears it with `open /dev/snd/talk`, in a small player that goes on playing whatever the viewer shows, with Mute and ×; a browser that wants a tap to play shows Listen. Whoever follows `/dev/present/talk`, a presentation of the same name by the same account, hears it with the slides. Listeners in the same room as the speaker should use earphones, or the microphone hears them.
+Signed in, the sound is also live, as `/dev/snd/talk`, through Cloudflare Realtime (WebRTC): whoever may read the recording (or, live only, `/dev/snd/talk` itself, a file of the speaker's, made with the umask) hears it with `open /dev/snd/talk`, in a small player that goes on playing whatever the viewer shows, with Mute and ×; a browser that wants a tap to play shows Listen. Whoever follows `/dev/present/talk`, a presentation of the same name by the same account, hears it with the slides. Listeners in the same room as the speaker should use earphones, or the microphone hears them. `-m ENTRIES` gives what decides who may hear, the recording or `/dev/snd/NAME`, ACL entries as `setfacl -m` takes them, as it is made: `stream -n talk -m o::-,g:lab:r` is heard by group lab only. A live sound whose page goes away ends two minutes later.
 
 Live sound needs the site's Cloudflare Realtime app: create an SFU app in the dashboard (Realtime), then give the Worker its App ID and secret, in `.dev.vars` locally (`REALTIME_APP_ID=…`, `REALTIME_APP_TOKEN=…`) and as secrets when deployed (`npx wrangler secret put REALTIME_APP_ID`, `npx wrangler secret put REALTIME_APP_TOKEN`). Pages never see the secret: the authority asks Realtime for them, once it has decided that they may. Without the app, `stream` records only, and says so.
 

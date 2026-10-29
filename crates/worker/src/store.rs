@@ -422,6 +422,11 @@ impl TerminalAuthority {
         if transact(&self.state, |db| (db.is_empty(), false))? {
             self.initialize().await?;
         }
+        // /dev is there from the start, for storage made before it was too.
+        transact(&self.state, |db| {
+            devices::ensure(db);
+            ((), true)
+        })?;
         self.ready.set(true);
         Ok(())
     }

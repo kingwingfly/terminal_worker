@@ -32,8 +32,9 @@ extern "C" {
     fn cancel_uploads() -> bool;
     #[wasm_bindgen(js_namespace = terminal, js_name = recordSound)]
     fn record_sound(
-        path: &str,
+        path: Option<String>,
         name: Option<String>,
+        acl: Option<String>,
         progress: &js_sys::Function,
     ) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = stopRecording)]

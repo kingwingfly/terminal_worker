@@ -220,3 +220,62 @@ test('a page that stops its live sound leaves alone the one that took its name o
     await laptop.context.close(); await phone.context.close();
   }
 });
+
+test('stream -m gives the recording its ACL as it is made; entries it cannot take make nothing', async ({ browser }) => {
+  const speaker = await device(browser, name, password);
+  const page = speaker.page, recording = home + '/shared.weba';
+  try {
+    await run(page, 'cd ~');
+    await run(page, 'stream -m bogus:x:r refused.weba');
+    await expect(transcript(page)).toContainText('stream -m');
+    expect((await root.get('/api/stat?path=' + encodeURIComponent(home + '/refused.weba'))).status()).toBe(404);
+    await run(page, 'stream -m g:guest:r,o::- shared.weba');
+    await expect(transcript(page)).toContainText(/● \d\d:\d\d/);
+    const acl = await (await root.post('/api/command', { data: { args: ['getfacl', '-c', recording], cwd: '/' } })).json();
+    expect(acl.output).toContain('group:guest:r--');
+    expect(acl.output).toContain('other::---');
+    await page.locator('#command').press('Control+c');
+    await expect(transcript(page)).toContainText(`✓ ${recording}`, { timeout: 30_000 });
+  } finally {
+    await root.delete(file(recording));
+    await speaker.context.close();
+  }
+});
+
+test('stream -n NAME is live only: /dev/snd/NAME is a file of its own, whose permissions say who hears', async ({ browser }) => {
+  const live = await root.post('/api/sound/listen?path=' + encodeURIComponent('/dev/snd/nothing'));
+  test.skip(live.status() === 503, 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)');
+  const speaker = await device(browser, name, password), guest = await device(browser);
+  const open = 'open' + Date.now().toString(36), closed = 'closed' + Date.now().toString(36);
+  const listed = async () => ((await (await root.get('/api/ls?path=' + encodeURIComponent('/dev/snd'))).json()).entries || []).map(entry => entry.name);
+  const other = await speaker.context.newPage(); await other.goto(origin + '/');
+  try {
+    // Nothing named, nothing to stream.
+    await run(speaker.page, 'stream');
+    await expect(transcript(speaker.page)).toContainText('stream: missing --name NAME');
+    await run(speaker.page, `stream -n ${open}`);
+    await expect(transcript(speaker.page)).toContainText(new RegExp(`● live as /dev/snd/${open} · \\d\\d:\\d\\d`), { timeout: 20_000 });
+    // The speaker's, made as a file is: others may read it, and so hear it.
+    const node = await (await root.get('/api/stat?path=' + encodeURIComponent('/dev/snd/' + open))).json();
+    expect([node.directory, node.owner, node.mode, node.size]).toEqual([false, name, 0o644, 0]);
+    await run(guest.page, `open /dev/snd/${open}`);
+    const player = guest.page.getByRole('region', { name: 'Live sound' });
+    await expect(player).toHaveAttribute('data-state', /live|paused/, { timeout: 20_000 });
+    await player.getByRole('button', { name: 'Stop listening' }).click();
+    // -m o::- lets no one else hear it.
+    await run(other, `stream -n ${closed} -m o::-`);
+    await expect(transcript(other)).toContainText(`● live as /dev/snd/${closed}`, { timeout: 20_000 });
+    await run(guest.page, `open /dev/snd/${closed}`);
+    await expect(transcript(guest.page)).toContainText('Permission denied');
+    // Stopped, it is gone; nothing was kept.
+    for (const [page, device] of [[speaker.page, open], [other, closed]]) {
+      await page.locator('#command').press('Control+c');
+      await expect(transcript(page)).toContainText(new RegExp(`✓ /dev/snd/${device} · \\d\\d:\\d\\d`), { timeout: 30_000 });
+    }
+    await expect.poll(listed, { timeout: 10_000 }).not.toContain(open);
+    expect(await listed()).not.toContain(closed);
+  } finally {
+    await root.delete('/api/sound?name=' + open); await root.delete('/api/sound?name=' + closed);
+    await speaker.context.close(); await guest.context.close();
+  }
+});

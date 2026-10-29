@@ -135,37 +135,52 @@ impl Manual for Present {
     const SEE: &'static [&'static str] = &["open"];
 }
 
-/// record the microphone into a file, which others hear live
+/// send the microphone live, and record it into a file
 ///
-/// Records sound from the microphone into FILE, a new file: Opus in WebM (.weba or .webm), which
-/// every browser records. FILE grows as you speak, and may be read meanwhile; Ctrl+C stops the
-/// recording, and FILE is complete. A recording whose page goes away keeps what arrived.
-///
-/// Signed in, the sound is also live, as /dev/snd/NAME: whoever may read FILE hears it with
+/// Signed in, the sound is live as /dev/snd/NAME: whoever may hear it does with
 /// open /dev/snd/NAME, guests too, and whoever follows a presentation of the same name,
-/// /dev/present/NAME, hears it with the slides. Live sound needs the site's Cloudflare Realtime
-/// app; without it, stream only records.
+/// /dev/present/NAME, hears it with the slides. Ctrl+C stops it. Live sound needs the site's
+/// Cloudflare Realtime app.
+///
+/// With FILE, the sound is also recorded into it, a new file: Opus in WebM (.weba or .webm),
+/// which every browser records. FILE grows as you speak, and may be read meanwhile; when stopped,
+/// it is complete, and a recording whose page goes away keeps what arrived. Those who may read
+/// FILE may hear the sound. Without the Realtime app, stream only records.
+///
+/// Without FILE, nothing is kept: /dev/snd/NAME is a file of its own, yours, and those who may
+/// read it may hear the sound.
+///
+/// -m gives entries as setfacl -m takes them to what decides who may hear, FILE or
+/// /dev/snd/NAME, as it is made: -m o::- lets no one else hear, -m u:ada:r,o::- only ada.
 #[derive(Parser, Debug)]
 #[command(name = "stream")]
 pub struct Stream {
-    /// the live sound's name, /dev/snd/NAME; by default, FILE's name without its extension
-    #[arg(short = 'n', long = "name", value_name = "NAME")]
+    /// the live sound's name, /dev/snd/NAME; with FILE, by default, FILE's name without its
+    /// extension
+    #[arg(
+        short = 'n',
+        long = "name",
+        value_name = "NAME",
+        required_unless_present = "file"
+    )]
     pub name: Option<String>,
+    /// ACL entries, as setfacl -m takes them, for FILE, or /dev/snd/NAME without it
+    #[arg(short = 'm', long = "modify", value_name = "ENTRIES")]
+    pub modify: Vec<String>,
     #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE")]
-    pub file: String,
+    pub file: Option<String>,
 }
 impl Manual for Stream {
     const SECTION: Section = Section::Files;
-    const NEEDS: &'static str = "w and x on FILE's directory, and a microphone. Live sound needs an account of your own; hearing it, r on FILE.";
+    const NEEDS: &'static str = "a microphone; live, an account of your own; with FILE, w and x on its directory. Hearing it, r on FILE, or on /dev/snd/NAME without FILE.";
     const EXAMPLES: &'static [(&'static str, &'static str)] = &[
         (
             "stream talk.weba",
             "records into talk.weba, live as /dev/snd/talk",
         ),
-        (
-            "open /dev/snd/talk",
-            "hears it, from anywhere talk.weba may be read",
-        ),
+        ("stream -n talk", "live as /dev/snd/talk, kept nowhere"),
+        ("stream -n talk -m o::-,g:lab:r", "only group lab hears it"),
+        ("open /dev/snd/talk", "hears it"),
     ];
     const SEE: &'static [&'static str] = &["present", "open"];
 }

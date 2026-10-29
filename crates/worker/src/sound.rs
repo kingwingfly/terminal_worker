@@ -112,15 +112,17 @@ async fn described(req: &mut Request) -> Option<Described> {
     req.json::<Described>().await.ok()
 }
 
-/// Send the speaker's microphone live, as the recording at `path` is made, as /dev/snd/`name`:
-/// the page offers its track; Realtime answers.
+/// Send the speaker's microphone live as /dev/snd/`name`: as the recording at `path` is made,
+/// or kept nowhere, given the ACL `entries` (stream -m). The page offers its track; Realtime
+/// answers.
 pub async fn speak(
     req: &mut Request,
     env: &Env,
     state: &State,
     key: Option<String>,
-    path: String,
+    path: Option<String>,
     name: Option<String>,
+    entries: Option<String>,
 ) -> Result<Reply> {
     let Some(offer) = described(req).await else {
         return Ok(Reply::error("Invalid sound request", 400));
@@ -136,7 +138,7 @@ pub async fn speak(
     let device = api::run(state, move |db| {
         let (key, path) = asked;
         let who = auth::identity(db, key.as_deref());
-        match devices::sound_name(db, &who, &path, name.as_deref()) {
+        match devices::sound_name(db, &who, path.as_deref(), name.as_deref()) {
             Ok(device) => Reply::ok(json!({ "device": device })),
             Err(message) => api::denied(&message, &who),
         }
@@ -175,7 +177,15 @@ pub async fn speak(
     let media = json!({ "session": session, "track": TRACK }).to_string();
     api::run(state, move |db| {
         let who = auth::identity(db, key.as_deref());
-        match devices::start_sound(db, &who, &path, &device, &media) {
+        let made = devices::start_sound(
+            db,
+            &who,
+            path.as_deref(),
+            &device,
+            &media,
+            entries.as_deref(),
+        );
+        match made {
             Ok(made) => {
                 Reply::ok(json!({ "device": device, "sdp": sdp, "version": made["version"] }))
             }
