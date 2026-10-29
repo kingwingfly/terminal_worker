@@ -1,5 +1,6 @@
 import { test, expect, devices } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { mkdirp, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const { defaultBrowserType, ...pixel } = devices['Pixel 7'];
@@ -11,10 +12,10 @@ test.beforeEach(async ({ context }) => {
   await context.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'phone-' + base });
   const headers = { Origin: origin };
   expect((await context.request.post('/api/login', { headers, data: { password } })).ok()).toBe(true);
-  expect((await context.request.post('/api/mkdir?path=' + encodeURIComponent(base), { headers })).ok()).toBe(true);
+  await mkdirp(context.request, base);
 });
 test.afterEach(async ({ context }) => {
-  await context.request.delete('/api/file?path=' + encodeURIComponent(base) + '&recursive=true', { headers: { Origin: origin } });
+  await rmrf(context.request, base);
 });
 
 test('a phone shows the terminal as an app that keeps its command line above the keyboard', async ({ page }) => {

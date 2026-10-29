@@ -5,7 +5,7 @@ use serde::de::{DeserializeOwned, IgnoredAny};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
-use terminal_worker_core::permissions::{Id, Node, Session, Store, User};
+use terminal_worker_core::permissions::{Id, Identity, Node, Session, Store, User};
 use wasm_bindgen::prelude::*;
 use worker::{Error, Result, SqlStorage, SqlStorageValue, State};
 
@@ -785,13 +785,6 @@ impl Db {
             self.release(Some(file));
         }
     }
-    /// The unfinished uploads that nodes in directory `dir` show.
-    pub fn uploading_in(&self, dir: &str) -> Vec<File> {
-        self.rows(
-            "SELECT DISTINCT f.id, f.size, f.chunk_size, f.state, f.sha256, f.uploader, f.target, f.base FROM files f JOIN inodes i ON i.file = f.id JOIN nodes n ON n.ino = i.id WHERE n.parent = ? AND f.state IN ('uploading', 'recording')",
-            vec![text(dir)],
-        )
-    }
     /// The uploads `uploader` has not finished.
     pub fn uploads_of(&self, uploader: u32) -> Vec<File> {
         self.rows(
@@ -909,19 +902,6 @@ impl Db {
             "SELECT name, owner, path, media FROM devices WHERE json_extract(media, '$.for') = ? ORDER BY started, name",
             vec![text(presentation)],
         )
-    }
-    /// The devices below the directory `directory`.
-    pub fn devices_under(&self, directory: &str) -> Vec<String> {
-        self.rows::<Device>(
-            "SELECT name, owner, path, media FROM devices WHERE substr(name, 1, ?) = ?",
-            vec![
-                int(directory.len() as u32 + 1),
-                text(&format!("{directory}/")),
-            ],
-        )
-        .into_iter()
-        .map(|device| device.name)
-        .collect()
     }
     /// The names of `owner`'s devices.
     pub fn devices_of(&self, owner: u32) -> Vec<String> {
@@ -1139,6 +1119,21 @@ impl kernel::Fs for Db {
     fn writing(&self, file: &str) -> Option<(u64, bool)> {
         let file = self.file(file).filter(|file| !file.complete())?;
         Some((self.received(&file), file.recording()))
+    }
+    fn unlink_device(
+        &mut self,
+        cred: &Identity,
+        path: &str,
+    ) -> Option<std::result::Result<(), abi::Error>> {
+        let stopped = crate::devices::remove(self, cred, path)?;
+        Some(stopped.map(|_| ()).map_err(|why| {
+            let errno = if crate::commands::is_permission_error(&why) {
+                abi::Errno::EACCES
+            } else {
+                abi::Errno::EPERM
+            };
+            abi::Error::because(errno, why)
+        }))
     }
 }
 

@@ -2,6 +2,7 @@ mod manual;
 mod preview;
 mod search;
 mod shell;
+mod sys;
 mod uploads;
 mod viewer;
 mod workers;
@@ -10,9 +11,9 @@ use std::cell::RefCell;
 
 use leptos::prelude::*;
 use shell::{Account, LogLine, Shell};
-use terminal_worker_core::{Entry, Listing};
+use terminal_worker_core::Entry;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+use wasm_bindgen_futures::spawn_local;
 
 #[wasm_bindgen]
 extern "C" {
@@ -20,10 +21,12 @@ extern "C" {
     fn config() -> JsValue;
     #[wasm_bindgen(js_namespace = terminal, js_name = open)]
     pub(crate) fn open_file(path: &str, kind: &str) -> js_sys::Promise;
-    #[wasm_bindgen(js_namespace = terminal)]
-    fn unlock(path: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = accountCommand)]
     fn account_command(args: JsValue, cwd: &str) -> js_sys::Promise;
+    /// sudo's authentication: whether the account may act as root now, its password asked for
+    /// if it has not lately.
+    #[wasm_bindgen(js_namespace = terminal)]
+    fn sudo() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = chooseFiles)]
     fn choose_files() -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = uploadFiles)]
@@ -66,24 +69,26 @@ async fn request(url: &str, method: &str) -> Result<serde_json::Value, String> {
 fn endpoint(api: &str, path: &str) -> String {
     format!("/api/{api}?path={}", js_sys::encode_uri_component(path))
 }
-async fn listing(path: &str) -> Result<Vec<Entry>, String> {
-    let value = request(&endpoint("ls", path), "GET").await?;
-    serde_json::from_value::<Listing>(value)
-        .map(|l| l.entries)
-        .map_err(|e| e.to_string())
+/// What stat(2) says of `path`, a link at its end followed.
+async fn stat(path: &str) -> Result<abi::Stat, abi::Error> {
+    userland::sys::stat(&sys::HttpSys::default(), path).await
 }
-async fn authorize(path: &str) -> Result<(), String> {
-    let value = JsFuture::from(unlock(path)).await.map_err(|error| {
-        js_sys::Reflect::get(&error, &JsValue::from_str("message"))
-            .ok()
-            .and_then(|value| value.as_string())
-            .unwrap_or_else(|| "Authorization failed".into())
-    })?;
-    if value.as_bool() == Some(true) {
-        Ok(())
-    } else {
-        Err("Write canceled".into())
+/// Whether `path` is a directory the account may enter (search), as cd and chdir(2) need.
+async fn enterable(path: &str) -> Result<(), abi::Error> {
+    if !stat(path).await?.is_dir() {
+        return Err(abi::Errno::ENOTDIR.into());
     }
+    let access = abi::Call::Access {
+        path: path.into(),
+        mode: abi::X_OK,
+    };
+    userland::sys::done(&sys::HttpSys::default(), access).await
+}
+/// The entries of the directory `path`, as ls lists them: through system calls, as user space.
+async fn listing(path: &str) -> Result<Vec<Entry>, String> {
+    userland::entries(&sys::HttpSys::default(), path, path)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 fn file_icon(kind: &str, directory: bool) -> impl IntoView + use<> {

@@ -492,6 +492,81 @@ impl Manual for Readlink {
     const SEE: &'static [&'static str] = &["ln", "ls"];
 }
 
+/// print the absolute path a path leads to
+///
+/// Prints each FILE as the absolute path it leads to, every link followed, `.` and `..` gone.
+/// All of it but the last part must exist, unless -e (all) or -m (none) says otherwise.
+#[derive(Parser, Debug)]
+#[command(name = "realpath")]
+pub struct Realpath {
+    /// all of it must exist
+    #[arg(
+        short = 'e',
+        long = "canonicalize-existing",
+        overrides_with = "missing"
+    )]
+    pub existing: bool,
+    /// nothing need exist
+    #[arg(
+        short = 'm',
+        long = "canonicalize-missing",
+        overrides_with = "existing"
+    )]
+    pub missing: bool,
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "FILE")]
+    pub files: Vec<String>,
+}
+impl Manual for Realpath {
+    const SECTION: Section = Section::Files;
+    const NEEDS: &'static str = "x on the directories on the way.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] =
+        &[("realpath current/../notes.md", "where it is, really")];
+    const SEE: &'static [&'static str] = &["readlink", "ln"];
+}
+
+/// show what a file is
+///
+/// Shows what each FILE is: its type, size, inode and links, its mode, owner and group, and when
+/// its content and it last changed (UTC). A link is shown as itself, unless -L.
+#[derive(Parser, Debug)]
+#[command(name = "stat")]
+pub struct Stat {
+    /// what a link leads to, not the link
+    #[arg(short = 'L', long = "dereference")]
+    pub dereference: bool,
+    #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "FILE")]
+    pub files: Vec<String>,
+}
+impl Manual for Stat {
+    const SECTION: Section = Section::Files;
+    const NEEDS: &'static str = "x on the directories on the way.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[("stat notes.md", "what it is")];
+    const SEE: &'static [&'static str] = &["ls", "chmod"];
+}
+
+/// remove empty directories
+///
+/// Removes each DIR, which must be empty; with -p, then each directory above it, as written,
+/// while one goes. rm -r removes a directory with what is in it.
+#[derive(Parser, Debug)]
+#[command(name = "rmdir")]
+pub struct Rmdir {
+    /// then the directories above each, as written
+    #[arg(short = 'p', long = "parents")]
+    pub parents: bool,
+    #[arg(value_hint = ValueHint::DirPath, required = true, value_name = "DIR")]
+    pub dirs: Vec<String>,
+}
+impl Manual for Rmdir {
+    const SECTION: Section = Section::Files;
+    const NEEDS: &'static str = "w and x on the directory holding each DIR.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("rmdir old", "an empty directory"),
+        ("rmdir -p a/b/c", "c, then b, then a"),
+    ];
+    const SEE: &'static [&'static str] = &["rm", "mkdir"];
+}
+
 /// find files by name
 ///
 /// Finds what is below the working directory, or each PATH, whose name matches PATTERN, a

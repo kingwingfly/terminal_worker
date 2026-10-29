@@ -15,8 +15,10 @@ async function upload(path, body) {
   console.log(`${response.status === 409 ? 'Keeping existing' : 'Wrote'} ${path}`);
 }
 for (const name of await readdir('seed')) await upload('/' + name, await readFile('seed/' + name));
-const directory = await fetch(origin + '/api/mkdir?path=' + encodeURIComponent('/media'), { method: 'POST', headers });
-if (!directory.ok) throw new Error(await directory.text());
+// mkdir(2), as a system call; one that is there already is fine.
+const made = await fetch(origin + '/api/sys', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ calls: [{ mkdir: { path: '/media', mode: 0o755 } }] }) });
+const [result] = made.ok ? (await made.json()).results : [{ err: { errno: await made.text() } }];
+if (result.err && result.err.errno !== 'EEXIST') throw new Error(`mkdir /media: ${result.err.detail || result.err.errno}`);
 // A generated, quiet two-second sine wave; no external media or network dependencies.
 const sampleRate = 22050, count = sampleRate * 2, wav = Buffer.alloc(44 + count * 2);
 wav.write('RIFF', 0); wav.writeUInt32LE(wav.length - 8, 4); wav.write('WAVEfmt ', 8); wav.writeUInt32LE(16, 16);

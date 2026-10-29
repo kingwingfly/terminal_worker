@@ -1,5 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { entry, errno, listing, mkdirp, names, program, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -36,30 +37,30 @@ async function device(browser, username, password) {
 }
 
 let root, name, password, base;
-const listed = async directory => ((await (await root.get('/api/ls?path=' + encodeURIComponent(directory))).json()).entries || []).map(entry => entry.name);
+const listed = directory => names(root, directory);
 const realtime = async () => (await root.post('/api/sound/listen?path=' + encodeURIComponent('/dev/snd/nothing'))).status() !== 503;
 const NO_REALTIME = 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)';
 test.beforeAll(async () => {
   root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
   expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
   name = 'live' + Date.now().toString(36); password = 'live-password-' + Date.now();
-  expect((await root.post('/api/command', { data: { args: ['useradd', '-m', name], cwd: '/' } })).ok()).toBe(true);
+  expect((await program(root, ['useradd', '-m', name])).ok()).toBe(true);
   expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
   // The speaker's directory, which everyone may read, guests too.
   base = '/live-' + Date.now().toString(36);
-  expect((await root.post('/api/mkdir?path=' + encodeURIComponent(base))).ok()).toBe(true);
-  expect((await root.post('/api/command', { data: { args: ['chown', name, base], cwd: '/' } })).ok()).toBe(true);
+  await mkdirp(root, base);
+  expect((await program(root, ['chown', name, base])).ok()).toBe(true);
 });
 test.afterAll(async () => {
-  await root.delete(file(base) + '&recursive=true');
-  await root.post('/api/command', { data: { args: ['userdel', '-r', name], cwd: '/' } });
+  await rmrf(root, base);
+  await program(root, ['userdel', '-r', name]);
   await root.dispose();
 });
 // A deck of the speaker's, of its own name.
 async function deck() {
   const stem = 'talk' + Date.now().toString(36) + ++sequence, path = `${base}/${stem}.slides.md`;
   expect((await root.put(file(path), { data: '# One\n\n---\n\n# Two\n' })).status()).toBe(201);
-  expect((await root.post('/api/command', { data: { args: ['chown', name, path], cwd: '/' } })).ok()).toBe(true);
+  expect((await program(root, ['chown', name, path])).ok()).toBe(true);
   return { stem, path };
 }
 
@@ -78,12 +79,11 @@ test('Present in the bar makes /dev/present/NAME; rm of it stops it, as its acco
     // Another account, here everyone signed out, may not remove it.
     await run(guest.page, `rm /dev/present/${stem}`);
     await expect(transcript(guest.page)).toContainText('Permission denied: it is another account\'s');
-    expect((await guest.context.request.delete(origin + file(`/dev/present/${stem}`), { headers: { Origin: origin } })).status()).toBe(401);
+    expect(await errno(guest.context.request, { unlink: { path: `/dev/present/${stem}` } })).toBe('EACCES');
     await run(guest.page, `open /dev/present/${stem}`);
     await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
     // Its account removes it, from another device: it ends, and its listeners and its bar hear so.
     await run(phone.page, `rm /dev/present/${stem}`);
-    await expect(transcript(phone.page)).toContainText(`Removed /dev/present/${stem}`);
     await expect(guest.page.locator('.presentation-badge')).toHaveText('The presentation ended');
     await expect(present).toHaveAttribute('aria-pressed', 'false');
     expect(await listed('/dev/present')).not.toContain(stem);
@@ -121,7 +121,7 @@ test('Go live in the bar, Live + record, records beside the deck; stopped, the f
     await stop.click();
     await expect(laptop.page.locator('.live-note')).toContainText(`Saved ${base}/${recording}`, { timeout: 30_000 });
     await expect(laptop.page.getByRole('button', { name: 'Go live' })).toBeVisible();
-    const kept = await (await root.get('/api/stat?path=' + encodeURIComponent(`${base}/${recording}`))).json();
+    const kept = await entry(root, `${base}/${recording}`);
     expect(kept.recording).toBeFalsy(); expect(kept.size).toBeGreaterThan(0);
     await expect.poll(() => listed('/dev/snd'), { timeout: 10_000 }).not.toContain(name);
   } finally {
@@ -152,8 +152,7 @@ test('stream is live as the account\'s name; its presentation\'s listeners conne
     await guest.page.getByRole('button', { name: 'Close preview' }).click();
     await run(guest.page, `open /dev/present/${stem}`);
     await expect(player(guest.page)).toHaveAttribute('data-state', /live|paused/, { timeout: 20_000 });
-    const removed = await (await root.post('/api/command', { data: { args: ['rm', `/dev/snd/${name}`], cwd: '/' } })).json();
-    expect(removed.output).toBe(`Removed /dev/snd/${name}`);
+    expect(await errno(root, { unlink: { path: `/dev/snd/${name}` } })).toBe(null);
     await expect(transcript(phone.page)).toContainText(new RegExp(`✓ /dev/snd/${name} · \\d\\d:\\d\\d`), { timeout: 30_000 });
     await expect(player(guest.page)).toBeHidden({ timeout: 10_000 });
   } finally {
@@ -204,7 +203,7 @@ test('a listener asks to speak; allowed, everyone following hears them, until th
     await laptop.page.getByRole('menuitem', { name: 'Allow' }).click();
     await expect(ask).toHaveAttribute('title', /^Speaking/, { timeout: 20_000 });
     await expect.poll(() => listed('/dev/snd'), { timeout: 10_000 }).toContain(`${stem}-guest`);
-    const voice = (await (await root.get('/api/ls?path=' + encodeURIComponent('/dev/snd'))).json()).entries.find(entry => entry.name === `${stem}-guest`);
+    const voice = (await listing(root, '/dev/snd')).find(entry => entry.name === `${stem}-guest`);
     expect([voice.owner, voice.link]).toEqual([name, path]);
     await expect(other.page.locator('#listening-name')).toHaveText('guest speaking', { timeout: 20_000 });
     await expect(player(other.page)).toHaveAttribute('data-state', /live|paused/);

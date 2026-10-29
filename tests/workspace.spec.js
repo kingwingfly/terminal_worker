@@ -1,11 +1,12 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { mkdirp, program, rmrf } from './sys.js';
 const origin=process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password=(await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const headers={Origin:origin,'CF-Connecting-IP':'workspace-regression'};
 const file=path=>'/api/file?path='+encodeURIComponent(path);
 const run=async(page,text)=>{await expect(page.locator('.busy')).toHaveText('↵');const input=page.getByRole('combobox',{name:'Terminal command'});await input.fill(text);await input.press('Enter');};
-const cmd=async(request,args)=>request.post('/api/command',{headers,data:{args,cwd:'/'}});
+const cmd=async(request,args)=>program(request,args);
 function pdfBytes(){
  const objects=['<< /Type /Catalog /Pages 2 0 R >>','<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>','<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents 4 0 R >>','<< /Length 33 >>\nstream\n0.2 0.6 0.3 rg 20 20 200 100 re f\nendstream','<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents 6 0 R >>','<< /Length 33 >>\nstream\n0.7 0.6 0.2 rg 20 20 100 200 re f\nendstream'];
  let text='%PDF-1.4\n',offsets=[0];for(let i=0;i<objects.length;i++){offsets.push(Buffer.byteLength(text));text+=`${i+1} 0 obj\n${objects[i]}\nendobj\n`;}
@@ -44,7 +45,7 @@ test('manual, large terminal, collapsible layouts, prompt/listing colors, icons 
 });
 
 test('vim edits highlighted Rust, saves conditionally, preserves conflicting drafts, and respects read-only permissions',async({page,request})=>{
- const base='/editor-'+Date.now();await request.post('/api/login',{headers,data:{password}});await request.post('/api/mkdir?path='+base,{headers});
+ const base='/editor-'+Date.now();await request.post('/api/login',{headers,data:{password}});await mkdirp(request, base);
  // Browser and fixture request intentionally have separate sessions.
  try{
   await page.goto('/');await run(page,'su root');await page.getByLabel('Password',{exact:true}).fill(password);await page.locator('#auth button[type=submit]').click();await expect(page.locator('.lock')).toContainText('root');
@@ -60,11 +61,11 @@ test('vim edits highlighted Rust, saves conditionally, preserves conflicting dra
   await run(page,'logout');await expect(page.locator('.lock')).toContainText('guest');
   await run(page,'vim '+base+'/main.rs');await expect(page.locator('#editor-status')).toContainText('Read-only');await expect(page.locator('#editor-save')).toBeDisabled();await expect(page.locator('.cm-content')).toHaveAttribute('contenteditable','false');
   await page.getByRole('button',{name:'Close editor'}).click();
- }finally{await request.delete(file(base)+'&recursive=true',{headers});}
+ }finally{await rmrf(request, base);}
 });
 
 test('PDF pages and PNG/JPEG/WebP previews load through protected file APIs',async({page,request})=>{
- const base='/preview-'+Date.now();await request.post('/api/login',{headers,data:{password}});await request.post('/api/mkdir?path='+base,{headers});
+ const base='/preview-'+Date.now();await request.post('/api/login',{headers,data:{password}});await mkdirp(request, base);
  try{
   expect((await request.put(file(base+'/sample.pdf'),{headers,data:pdfBytes()})).status()).toBe(201);
   await page.goto('/');
@@ -78,5 +79,5 @@ test('PDF pages and PNG/JPEG/WebP previews load through protected file APIs',asy
   await expect.poll(()=>page.locator('.pdf-page').evaluateAll(pages=>pages.filter(p=>p.width>0).length)).toBe(2);
   await page.getByRole('button',{name:'Next page'}).click();await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('2 / 2');await page.getByRole('button',{name:'Close preview'}).click();await expect(page.locator('#viewer')).toBeHidden();
   await run(page,'open '+base+'/sample.pdf');await expect(page.locator('.pdf-toolbar [role=status]')).toHaveText('2 / 2');await page.getByRole('button',{name:'Close preview'}).click();
- }finally{await request.delete(file(base)+'&recursive=true',{headers});}
+ }finally{await rmrf(request, base);}
 });

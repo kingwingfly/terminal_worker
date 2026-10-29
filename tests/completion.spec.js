@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { mkdirp, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787', headers = { Origin: origin };
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const names = ['alpha.txt', 'alphabet.txt', 'z-alpha.txt', 'a_l_p_h_a.txt', 'GammaSpectrum.txt', 'γάμμα-spectrum.md', 'name "quote".txt'];
@@ -7,14 +8,14 @@ let base;
 test.beforeEach(async ({ request, page }) => {
   base = '/completion-' + Date.now();
   expect((await request.post('/api/login', { headers, data: { password } })).ok()).toBe(true);
-  for (const path of [base + '/a-dir', base + '/b-dir']) expect((await request.post('/api/mkdir?path=' + encodeURIComponent(path), { headers })).ok()).toBe(true);
+  for (const path of [base + '/a-dir', base + '/b-dir']) await mkdirp(request, path);
   for (const name of [...names, 'a-dir/inside.txt']) expect((await request.put('/api/file?path=' + encodeURIComponent(base + '/' + name), { headers, data: 'fixture' })).status()).toBe(201);
   await page.goto('/');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill('cd ' + base); await input.press('Enter');
   await expect(page.locator('.directory-bar')).toContainText(base);
 });
-test.afterEach(async ({ request }) => { await request.delete('/api/file?recursive=true&path=' + encodeURIComponent(base), { headers }); });
+test.afterEach(async ({ request }) => { await rmrf(request, base); });
 
 test('lists the fuzzy matches first, to narrow them by typing, cycles them both ways, browses files on an empty line, and preserves stdout', async ({ page }) => {
   const input = page.getByRole('combobox', { name: 'Terminal command' }), options = page.getByRole('option');
@@ -73,12 +74,12 @@ test('matches case-insensitive subsequences and quoted Unicode paths, then desce
 test('queues fast Tab presses and discards late listings after editing', async ({ page }) => {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   let requests = 0;
-  await page.route('**/api/ls?*', async route => { requests++; await new Promise(resolve => setTimeout(resolve, 500)); await route.continue(); });
+  await page.route('**/api/sys', async route => { if (route.request().postData()?.includes('getdents')) { requests++; await new Promise(resolve => setTimeout(resolve, 500)); } await route.continue(); });
   // The first lists them; each one after picks the next.
   await input.fill('open alp'); await input.press('Tab'); await input.press('Tab'); await input.press('Tab');
   await expect(input).toHaveValue('open "alphabet.txt"'); expect(requests).toBe(1);
   await input.fill('open a-dir/in');
-  const response = page.waitForResponse(r => r.url().includes('/api/ls?'));
+  const response = page.waitForResponse(r => r.url().includes('/api/sys') && r.request().postData()?.includes('getdents'));
   await input.press('Tab'); await input.fill('pwd'); await response;
   // A rendering frame lets the discarded response finish all its callbacks.
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));

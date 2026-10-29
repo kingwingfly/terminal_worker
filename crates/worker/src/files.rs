@@ -107,7 +107,14 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
     if grant.status_code() >= 400 {
         return Ok(grant);
     }
-    let grant: Grant = grant.json().await?;
+    let grant: serde_json::Value = grant.json().await?;
+    // A file the kernel writes as it is read (/etc/passwd): all of it, as it is now.
+    if let Some(text) = grant["generated"].as_str() {
+        let headers = Headers::new();
+        headers.set("Content-Type", "text/plain; charset=utf-8")?;
+        return Ok(Response::ok(text)?.with_headers(headers));
+    }
+    let grant: Grant = serde_json::from_value(grant)?;
     let headers = Headers::new();
     headers.set("Content-Type", &grant.mime)?;
     headers.set("Accept-Ranges", "bytes")?;

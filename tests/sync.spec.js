@@ -1,5 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { mkdirp, program, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -14,7 +15,7 @@ async function device() {
 test('a page shows what other devices change as it happens, and hears nothing of what it may not list', async ({ page, context, browser }) => {
   const other = await device(), base = '/sync-' + Date.now().toString(36);
   try {
-    expect((await other.post('/api/mkdir?path=' + encodeURIComponent(base))).ok()).toBe(true);
+    await mkdirp(other, base);
     await context.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'sync-page-' + Date.now() });
     expect((await context.request.post('/api/login', { headers: { Origin: origin }, data: { password } })).ok()).toBe(true);
     await page.goto('/');
@@ -26,9 +27,9 @@ test('a page shows what other devices change as it happens, and hears nothing of
     const names = page.locator('.files .filename');
     expect((await other.put(file(base + '/hello.txt'), { data: 'hi' })).status()).toBe(201);
     await expect(names).toHaveText(['hello.txt']);
-    expect((await other.post('/api/mkdir?path=' + encodeURIComponent(base + '/docs'))).ok()).toBe(true);
+    await mkdirp(other, base + '/docs');
     await expect(names).toHaveText(['docs/', 'hello.txt']);
-    expect((await other.post('/api/command', { data: { args: ['mv', base + '/hello.txt', base + '/docs/'], cwd: '/' } })).ok()).toBe(true);
+    expect((await program(other, ['mv', base + '/hello.txt', base + '/docs/'])).ok()).toBe(true);
     await expect(names).toHaveText(['docs/']);
     // A guest's page hears of a directory it may list, and nothing of /root.
     const guest = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': 'sync-guest-' + Date.now() } });
@@ -46,7 +47,7 @@ test('a page shows what other devices change as it happens, and hears nothing of
     expect((await other.get('/api/events', { headers: { Origin: 'https://elsewhere.example' } })).status()).toBe(403);
     expect((await other.get('/api/events')).status()).toBe(426);
   } finally {
-    await other.delete(file(base) + '&recursive=true'); await other.delete(file('/root/sync-secret.txt'));
+    await rmrf(other, base); await rmrf(other, '/root/sync-secret.txt');
     await other.dispose();
   }
 });
@@ -54,7 +55,7 @@ test('a page shows what other devices change as it happens, and hears nothing of
 test('removing a file another device is uploading stops that upload, as rm does to a file being written', async ({ page, context }) => {
   const other = await device(), base = '/sync-upload-' + Date.now().toString(36);
   try {
-    expect((await other.post('/api/mkdir?path=' + encodeURIComponent(base))).ok()).toBe(true);
+    await mkdirp(other, base);
     await context.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'sync-uploader-' + Date.now() });
     expect((await context.request.post('/api/login', { headers: { Origin: origin }, data: { password } })).ok()).toBe(true);
     await page.goto('/');
@@ -69,12 +70,12 @@ test('removing a file another device is uploading stops that upload, as rm does 
     await input.fill('upload'); await input.press('Enter');
     await (await chooser).setFiles({ name: 'big.log', mimeType: 'application/octet-stream', buffer: Buffer.alloc(3 * 8 * 1024 * 1024 + 100, 7) });
     await expect(page.locator('.files .filename')).toContainText(['big.log'], { timeout: 20_000 });
-    expect((await other.delete(file(base + '/big.log'))).ok()).toBe(true);
+    expect(await rmrf(other, base + '/big.log')).toBe(null);
     await expect(page.locator('.transcript')).toContainText('✕ big.log: stopped: the file was removed, or its upload cancelled, elsewhere', { timeout: 30_000 });
     await expect(page.locator('.files .filename')).toHaveCount(0);
   } finally {
     await page.unroute('**/api/uploads/chunk?**');
-    await other.delete(file(base) + '&recursive=true');
+    await rmrf(other, base);
     await other.dispose();
   }
 });

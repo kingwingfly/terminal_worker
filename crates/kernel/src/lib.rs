@@ -30,6 +30,28 @@ pub trait Fs: Store {
     /// What has arrived of the content `file`, if it is still being written, and whether it is
     /// a recording.
     fn writing(&self, file: &str) -> Option<(u64, bool)>;
+    /// What unlinking the device at `path` does, as its driver has it (rm of a presentation
+    /// stops it); None for a name like any other.
+    fn unlink_device(&mut self, _cred: &Identity, _path: &str) -> Option<Result<()>> {
+        None
+    }
+}
+
+/// The store in memory, for tests and tools: no clock, no times, every file whole.
+impl Fs for MemStore {
+    fn now(&self) -> u64 {
+        0
+    }
+    fn times(&self, _ino: u64) -> (u64, u64) {
+        (0, 0)
+    }
+    fn touch(&mut self, _ino: u64) {}
+    fn empty(&mut self, _owner: u32, path: &str) -> String {
+        format!("empty:{path}")
+    }
+    fn writing(&self, _file: &str) -> Option<(u64, bool)> {
+        None
+    }
 }
 
 /// What a call runs as: an account (root under sudo), and the process's umask.
@@ -61,9 +83,7 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
             to,
             noreplace,
         } => rename(fs, cred, &from, &to, noreplace).map(|()| Value::Null),
-        Call::Link { from, to, follow } => {
-            link(fs, cred, &from, &to, follow).map(|()| Value::Null)
-        }
+        Call::Link { from, to, follow } => link(fs, cred, &from, &to, follow).map(|()| Value::Null),
         Call::Symlink { target, path } => symlink(fs, cred, &target, &path).map(|()| Value::Null),
         Call::Chmod { path, mode } => chmod(fs, cred, &path, mode).map(|()| Value::Null),
         Call::Chown {
@@ -198,26 +218,49 @@ fn last(path: &str) -> &str {
         .unwrap_or_default()
 }
 
+/// Whether the last part of `path` is `.` or `..`, once the directory it is in is found to be
+/// there, as Linux resolves that directory before it looks at the last part.
+fn dots(fs: &impl Fs, cred: &Identity, path: &str) -> Result<bool> {
+    if !matches!(last(path), "." | "..") {
+        return Ok(false);
+    }
+    let above = match path.trim_end_matches('/').rsplit_once('/') {
+        Some(("", _)) | None => "/",
+        Some((above, _)) => above,
+    };
+    match namei(fs, cred, above, true)?.node {
+        Some(node) if node.directory => Ok(true),
+        Some(_) => Err(Errno::ENOTDIR.into()),
+        None => Err(Errno::ENOENT.into()),
+    }
+}
+
 /// Where a new name `path` goes: the directory, which `cred` may write and search, and the
 /// name, which must be free. A home not made yet is its account's to make, or root's: no one
 /// else takes its name, as anyone could in /guest, which everyone may write in.
 fn creating(fs: &impl Fs, cred: &Identity, path: &str) -> Result<(String, Node)> {
-    if matches!(last(path), "" | "." | "..") {
+    if last(path).is_empty() || dots(fs, cred, path)? {
         return Err(Errno::EEXIST.into());
     }
     let name = namei(fs, cred, path, false)?;
     if name.node.is_some() {
         return Err(Errno::EEXIST.into());
     }
-    let dir = fs.node(parent(&name.path)).ok_or(Errno::ENOENT)?;
+    let dir = writable_dir(fs, cred, &name.path)?;
+    Ok((name.path, dir))
+}
+/// The directory a new name `real` goes in, which `cred` may write and search, unless the name
+/// is a home not made yet, and not `cred`'s.
+fn writable_dir(fs: &impl Fs, cred: &Identity, real: &str) -> Result<Node> {
+    let dir = fs.node(parent(real)).ok_or(Errno::ENOENT)?;
     require(cred, &dir, WRITE | EXEC)?;
-    if cred.id != 0 && fs.home_of(&name.path).is_some_and(|owner| owner != cred.id) {
+    if cred.id != 0 && fs.home_of(real).is_some_and(|owner| owner != cred.id) {
         return Err(Error::because(
             Errno::EACCES,
-            format!("{} is another account's home", name.path),
+            format!("{real} is another account's home"),
         ));
     }
-    Ok((name.path, dir))
+    Ok(dir)
 }
 
 pub fn mkdir(fs: &mut impl Fs, process: &Process, path: &str, mode: u16) -> Result<()> {
@@ -250,33 +293,42 @@ fn unlinkable(fs: &impl Fs, cred: &Identity, path: &str, node: &Node) -> Result<
 }
 
 pub fn rmdir(fs: &mut impl Fs, cred: &Identity, path: &str) -> Result<()> {
-    match last(path) {
-        "" => return Err(Errno::EBUSY.into()),
-        "." => return Err(Errno::EINVAL.into()),
-        ".." => return Err(Errno::ENOTEMPTY.into()),
-        _ => {}
+    if last(path).is_empty() {
+        return Err(Errno::EBUSY.into());
     }
+    if dots(fs, cred, path)? {
+        let errno = if last(path) == "." {
+            Errno::EINVAL
+        } else {
+            Errno::ENOTEMPTY
+        };
+        return Err(errno.into());
+    }
+    // As Linux's may_delete has it: whether the name may go, before what it names.
     let (real, node) = existing(fs, cred, path, false)?;
+    unlinkable(fs, cred, &real, &node)?;
     if !node.directory {
         return Err(Errno::ENOTDIR.into());
     }
     if !fs.children(&real).is_empty() {
         return Err(Errno::ENOTEMPTY.into());
     }
-    unlinkable(fs, cred, &real, &node)?;
     fs.delete_node(&real);
     Ok(())
 }
 
 pub fn unlink(fs: &mut impl Fs, cred: &Identity, path: &str) -> Result<()> {
-    if matches!(last(path), "" | "." | "..") {
+    if last(path).is_empty() || dots(fs, cred, path)? {
         return Err(Errno::EISDIR.into());
     }
     let (real, node) = existing(fs, cred, path, false)?;
+    if let Some(done) = fs.unlink_device(cred, &real) {
+        return done;
+    }
+    unlinkable(fs, cred, &real, &node)?;
     if node.directory {
         return Err(Errno::EISDIR.into());
     }
-    unlinkable(fs, cred, &real, &node)?;
     fs.delete_node(&real);
     Ok(())
 }
@@ -292,7 +344,8 @@ pub fn rename(
     to: &str,
     noreplace: bool,
 ) -> Result<()> {
-    if matches!(last(from), "" | "." | "..") || matches!(last(to), "" | "." | "..") {
+    if last(from).is_empty() || last(to).is_empty() || dots(fs, cred, from)? || dots(fs, cred, to)?
+    {
         return Err(Errno::EBUSY.into());
     }
     let (source, node) = existing(fs, cred, from, false)?;
@@ -308,6 +361,22 @@ pub fn rename(
     }
     if node.directory && parent(&source) != parent(&target.path) {
         require(cred, &node, WRITE)?;
+    }
+    // A directory an account's home is, or is in, stays, as a mount point in use does.
+    if node.directory {
+        let below = format!("{source}/");
+        if let Some((name, _)) = fs
+            .users()
+            .into_iter()
+            .find(|(_, user)| user.home == source || user.home.starts_with(&below))
+        {
+            return Err(Error::because(
+                Errno::EBUSY,
+                format!(
+                    "{source} holds the home of {name}; move homes with usermod -d HOME -m {name}"
+                ),
+            ));
+        }
     }
     if let Some(existing) = &target.node {
         if existing.ino == node.ino {
@@ -360,7 +429,7 @@ pub fn link(fs: &mut impl Fs, cred: &Identity, from: &str, to: &str, follow: boo
     if node.file.as_deref().is_some_and(|id| fs.uploading(id)) {
         return Err(Error::because(
             Errno::EBUSY,
-            format!("{from} is still being written; link it once it is whole"),
+            format!("{from} is still uploading; link it once it completes"),
         ));
     }
     let (real, _) = creating(fs, cred, to)?;

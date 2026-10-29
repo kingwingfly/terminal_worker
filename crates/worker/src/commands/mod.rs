@@ -5,13 +5,12 @@
 pub(crate) mod accounts;
 mod archives;
 mod files;
-mod permissions;
 
 use crate::db::Db;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
-use terminal_worker_core::{Entry, kind, permissions::*, resolve};
+use std::collections::BTreeSet;
+use terminal_worker_core::{Entry, permissions::*, resolve};
 
 #[derive(Deserialize)]
 pub struct Command {
@@ -85,64 +84,6 @@ fn show_id(c: &Db, who: &Identity) -> String {
     )
 }
 
-/// What `who` sees of `n`, named `path`, shown at `shown`: the path as it was asked for, through
-/// any link on the way.
-pub fn entry(c: &Db, who: &Identity, shown: &str, path: &str, n: &Node) -> Entry {
-    let uploaded = n
-        .file
-        .as_deref()
-        .and_then(|id| c.file(id))
-        .filter(|f| !f.complete())
-        .map(|f| (c.received(&f), f.recording()));
-    let mut entry = described(
-        c,
-        who,
-        path,
-        n,
-        uploaded,
-        c.username(n.owner),
-        c.groupname(n.group),
-    );
-    entry.path = shown.into();
-    entry
-}
-/// The entries of `children`, the nodes in directory `dir`, directories first, then by name,
-/// with their paths in `shown`, the directory as it was asked for. Each owner, group and
-/// unfinished upload is looked up once, not once per entry.
-pub fn entries(
-    c: &Db,
-    who: &Identity,
-    dir: &str,
-    shown: &str,
-    children: &[(String, Node)],
-) -> Vec<Entry> {
-    let uploading: BTreeMap<String, (u64, bool)> = c
-        .uploading_in(dir)
-        .into_iter()
-        .map(|f| (f.id.clone(), (c.received(&f), f.recording())))
-        .collect();
-    let mut owners = BTreeMap::new();
-    let mut groups = BTreeMap::new();
-    let mut entries: Vec<Entry> = children
-        .iter()
-        .map(|(path, n)| {
-            let owner = owners.entry(n.owner).or_insert_with(|| c.username(n.owner));
-            let group = groups
-                .entry(n.group)
-                .or_insert_with(|| c.groupname(n.group));
-            let uploaded = n.file.as_ref().and_then(|id| uploading.get(id).copied());
-            let mut entry = described(c, who, path, n, uploaded, owner.clone(), group.clone());
-            entry.path = joined(shown, &entry.name);
-            entry
-        })
-        .collect();
-    entries.sort_by(|a, b| {
-        b.directory
-            .cmp(&a.directory)
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    entries
-}
 /// `name` in the directory `dir`.
 pub fn joined(dir: &str, name: &str) -> String {
     if dir == "/" {
@@ -151,76 +92,6 @@ pub fn joined(dir: &str, name: &str) -> String {
         format!("{dir}/{name}")
     }
 }
-fn described(
-    c: &Db,
-    who: &Identity,
-    path: &str,
-    n: &Node,
-    uploaded: Option<(u64, bool)>,
-    owner: String,
-    group: String,
-) -> Entry {
-    // A link opens as what it leads to, if `who` may get there.
-    let target = n
-        .is_link()
-        .then(|| {
-            c.physical(who, path, true)
-                .ok()
-                .and_then(|real| c.node(&real))
-        })
-        .flatten();
-    let opened = target.as_ref().unwrap_or(n);
-    let directory = opened.directory;
-    // Opening it lists a directory, which takes r and x, or reads a file.
-    let denied = !who.allows(opened, if directory { READ | EXEC } else { READ });
-    Entry {
-        denied,
-        uploaded: uploaded.map(|(received, _)| received),
-        recording: uploaded.is_some_and(|(_, recording)| recording),
-        name: path.rsplit('/').next().unwrap_or("").into(),
-        path: path.into(),
-        directory,
-        size: n.size,
-        kind: if directory { "directory" } else { kind(path) }.into(),
-        owner,
-        group,
-        mode: n.mode,
-        link: n.link.clone(),
-        links: n.links,
-        acl: n.acl.is_some(),
-    }
-}
-/// ls -l's line for `n`, named `path`: its type and mode, `+` for an ACL, names, owner, group,
-/// size and name, and where a link points.
-fn long_line(c: &Db, path: &str, n: &Node) -> String {
-    let kind = if n.is_link() {
-        'l'
-    } else if n.directory {
-        'd'
-    } else {
-        '-'
-    };
-    let name = path
-        .rsplit('/')
-        .next()
-        .filter(|n| !n.is_empty())
-        .unwrap_or("/");
-    format!(
-        "{}{} {:>2} {} {} {:>8} {name}{}",
-        type_mode_text(n.mode, kind),
-        if n.acl.is_some() { "+" } else { " " },
-        n.links,
-        c.username(n.owner),
-        c.groupname(n.group),
-        n.size,
-        match (&n.link, n.directory) {
-            (Some(target), _) => format!(" -> {target}"),
-            (None, true) if name != "/" => "/".into(),
-            _ => String::new(),
-        }
-    )
-}
-
 /// `value`, a path typed in `command`, from its working directory, `~` its home, physically: a
 /// link on the way, and at its end, followed, as most commands take a path (stat(2)).
 pub fn command_path(
@@ -276,9 +147,6 @@ pub struct Context<'a> {
     pub command: &'a Command,
     /// Its arguments, after its name.
     pub args: &'a [String],
-    /// Where the working directory is, as typed, and physically: what nothing may remove or move.
-    pub cwd: String,
-    pub here: String,
     /// What failed of what a command does several of (paths, mostly): each is reported, and
     /// what did not fail is kept.
     pub errors: Vec<String>,
@@ -302,10 +170,6 @@ impl Context<'_> {
     pub fn entry(&self, value: &str) -> Result<String, String> {
         entry_path(self.db, self.who, self.command, value)
     }
-    /// `value` as typed, from the working directory.
-    pub fn typed(&self, value: &str) -> Result<String, String> {
-        typed_path(self.db, self.who, self.command, value)
-    }
     /// Note how one of several things went: what failed is reported, and the rest kept.
     pub fn each<T>(&mut self, result: Result<T, String>) -> Option<T> {
         match result {
@@ -323,22 +187,7 @@ impl Context<'_> {
 
 /// Every command the server runs.
 pub static COMMANDS: &[&dyn ServerCommand] = &[
-    &files::Touch,
-    &files::Ls,
-    &files::Mkdir,
-    &files::Rm,
-    &files::Mv,
     &files::Cp,
-    &files::Ln,
-    &files::Readlink,
-    &files::Fd,
-    &permissions::Chmod,
-    &permissions::Chown,
-    &permissions::Chgrp,
-    &permissions::Getfacl,
-    &permissions::Setfacl,
-    &permissions::Getfattr,
-    &permissions::Setfattr,
     &accounts::Whoami,
     &accounts::Id,
     &accounts::Groups,
@@ -368,16 +217,12 @@ pub fn execute(db: &mut Db, who: &Identity, owner: u32, command: Command) -> Res
             "Unsupported server command; sudo supports file and account management commands. Use su root to browse restricted content".into(),
         );
     };
-    let cwd = resolve("/", &command.cwd)?;
-    let here = db.physical(who, &cwd, true)?;
     let mut ctx = Context {
         db,
         who,
         owner,
         command: &command,
         args,
-        cwd,
-        here,
         errors: Vec::new(),
         succeeded: false,
         listing: None,

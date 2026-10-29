@@ -3,22 +3,6 @@ use abi::{ACL_ACCESS, ACL_DEFAULT, XATTR_CREATE};
 use std::collections::BTreeSet;
 use terminal_worker_core::acl::Entries;
 
-impl Fs for MemStore {
-    fn now(&self) -> u64 {
-        0
-    }
-    fn times(&self, _ino: u64) -> (u64, u64) {
-        (0, 0)
-    }
-    fn touch(&mut self, _ino: u64) {}
-    fn empty(&mut self, _owner: u32, path: &str) -> String {
-        format!("empty:{path}")
-    }
-    fn writing(&self, _file: &str) -> Option<(u64, bool)> {
-        None
-    }
-}
-
 fn user(id: u32, groups: &[u32]) -> Identity {
     Identity {
         id,
@@ -196,9 +180,22 @@ fn rmdir_and_unlink_take_one_name_as_linux_does() {
     assert_eq!(errno(rmdir(&mut fs, &ann, "/tmp/ann")), Errno::ENOTDIR);
     assert_eq!(errno(rmdir(&mut fs, &ann, "/")), Errno::EBUSY);
     assert_eq!(errno(rmdir(&mut fs, &ann, "/tmp/full/.")), Errno::EINVAL);
+    // The directory a `..` is in is found first, as Linux does.
+    assert_eq!(
+        errno(rmdir(&mut fs, &ann, "/tmp/missing/..")),
+        Errno::ENOENT
+    );
+    assert_eq!(
+        errno(rmdir(&mut fs, &ann, "/tmp/full/..")),
+        Errno::ENOTEMPTY
+    );
     assert_eq!(errno(unlink(&mut fs, &ann, "/tmp/full")), Errno::EISDIR);
     // In a sticky directory, another's file stays, even if it may be written.
     assert_eq!(errno(unlink(&mut fs, &bob, "/tmp/ann")), Errno::EPERM);
+    // Whether the name may go is asked before what it names, as may_delete does.
+    assert_eq!(errno(rmdir(&mut fs, &bob, "/tmp")), Errno::EACCES);
+    assert_eq!(errno(rmdir(&mut fs, &bob, "/tmp/full")), Errno::EPERM);
+    assert_eq!(errno(unlink(&mut fs, &bob, "/tmp")), Errno::EACCES);
     unlink(&mut fs, &ann, "/tmp/full/f").unwrap();
     rmdir(&mut fs, &ann, "/tmp/full").unwrap();
     assert_eq!(errno(stat(&fs, &ann, "/tmp/full", true)), Errno::ENOENT);
@@ -272,7 +269,10 @@ fn hard_links_of_anothers_file_need_it_to_be_safe_to_link() {
         Errno::EPERM
     );
     link(&mut fs, &ann, "/w/open", "/w/o2", false).unwrap();
-    assert_eq!(errno(link(&mut fs, &ann, "/w", "/w/self", false)), Errno::EPERM);
+    assert_eq!(
+        errno(link(&mut fs, &ann, "/w", "/w/self", false)),
+        Errno::EPERM
+    );
     assert_eq!(
         errno(link(&mut fs, &ann, "/w/mine", "/w/mine2", false)),
         Errno::EEXIST

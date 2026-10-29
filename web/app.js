@@ -896,7 +896,7 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, present, presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
+window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, present, presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]')) return;

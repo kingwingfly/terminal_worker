@@ -14,6 +14,7 @@ import { cpp } from '@codemirror/lang-cpp';
 import { yaml } from '@codemirror/legacy-modes/mode/yaml';
 import { toml } from '@codemirror/legacy-modes/mode/toml';
 import { shell } from '@codemirror/legacy-modes/mode/shell';
+import { sys } from './http.mjs';
 const $ = id => document.getElementById(id);
 const theme = EditorView.theme({
  '&': { color: '#d0dbd3', backgroundColor: '#101614', height: '100%', fontSize: '20px' },
@@ -80,9 +81,13 @@ export async function edit(path,{api,fileUrl,unlock,changed}) {
  try{
   if(/\.(pdf|png|jpe?g|webp|gif|avif|bmp|ico|mp4|webm|mov|m4v|mp3|wav|ogg|m4a|flac)$/i.test(path))throw new Error('vim supports text, Markdown, and source files only');
   let text='';
-  let metadata;
-  try { metadata=await (await api('/api/stat?path='+encodeURIComponent(path))).json(); }
-  catch(error){if(error.status===401){if(!await unlock(path.slice(0,path.lastIndexOf('/'))||'/'))throw error;metadata=await (await api('/api/stat?path='+encodeURIComponent(path))).json();}else if(error.status!==404)throw error;}
+  // What it is, and whether it may be written, as stat(2) and access(2) say; a new file if
+  // there is none. One the account may not look at asks it to sign in.
+  const look=()=>sys([{stat:{path}},{access:{path,mode:2}}]);
+  let [found,writable]=await look();
+  if(found.err?.errno==='EACCES'){if(!await unlock(path.slice(0,path.lastIndexOf('/'))||'/'))throw new Error('Permission denied');[found,writable]=await look();}
+  if(found.err&&found.err.errno!=='ENOENT')throw new Error(found.err.detail||(found.err.errno==='EACCES'?'Permission denied':found.err.errno));
+  const metadata=found.ok&&{directory:(found.ok.mode&0o170000)===0o040000,size:found.ok.size,writable:'ok' in writable};
   if(metadata){
    if(metadata.directory)throw new Error('This is a directory');
    if(metadata.size>2_000_000)throw new Error('File exceeds 2 MB; download it to edit locally');

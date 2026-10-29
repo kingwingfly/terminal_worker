@@ -1,5 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { program, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 let sequence = 0;
@@ -23,14 +24,14 @@ let root, ann, base;
 const name = 'sysann' + Date.now().toString(36), password = 'sys-password-' + Date.now();
 test.beforeAll(async () => {
   root = await session('root', rootPassword);
-  expect((await root.context.post('/api/command', { data: { args: ['useradd', '-m', name], cwd: '/' } })).ok()).toBe(true);
+  expect((await program(root.context, ['useradd', '-m', name])).ok()).toBe(true);
   expect((await root.context.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
   ann = await session(name, password);
   base = '/sys-' + Date.now().toString(36);
 });
 test.afterAll(async () => {
-  await root.context.delete('/api/file?recursive=true&path=' + encodeURIComponent(base));
-  await root.context.post('/api/command', { data: { args: ['userdel', '-r', name], cwd: '/' } });
+  await rmrf(root.context, base);
+  await program(root.context, ['userdel', '-r', name]);
   for (const { context } of [root, ann]) await context.dispose();
 });
 

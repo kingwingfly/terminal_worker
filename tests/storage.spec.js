@@ -1,10 +1,10 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import http from 'node:http';
+import { listing, mkdirp, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
-const ls = path => '/api/ls?path=' + encodeURIComponent(path);
 async function root() {
   const client = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'storage-' + Date.now() } });
   expect((await client.post('/api/login', { data: { username: 'root', password: rootPassword } })).status()).toBe(200);
@@ -29,16 +29,14 @@ test('a slow upload blocks neither listings nor downloads of other files, and it
   const admin = await root(), other = await root();
   const base = '/storage-' + Date.now().toString(36);
   try {
-    expect((await admin.post('/api/mkdir?path=' + encodeURIComponent(base))).status()).toBe(200);
+    await mkdirp(admin, base);
     expect((await admin.put(file(base + '/ready.txt'), { data: 'already here' })).status()).toBe(201);
     const cookie = (await admin.storageState()).cookies.map(c => `${c.name}=${c.value}`).join('; ');
     const started = Date.now();
     const upload = slowPut(base + '/slow.bin', cookie, 20, 150);
     await new Promise(r => setTimeout(r, 400));
     // While the upload streams, other requests answer at once.
-    const listing = await other.get(ls(base)); const listed = Date.now();
-    expect(listing.status()).toBe(200);
-    const names = (await listing.json()).entries.map(e => e.name);
+    const names = (await listing(other, base)).map(e => e.name); const listed = Date.now();
     expect(names).toEqual(expect.arrayContaining(['ready.txt', 'slow.bin']));
     const ready = await other.get(file(base + '/ready.txt')); const read = Date.now();
     expect(await ready.text()).toBe('already here');
@@ -55,7 +53,7 @@ test('a slow upload blocks neither listings nor downloads of other files, and it
     // Text may be compressed in transit; the declared length is still the file's.
     expect((await other.head(file(base + '/slow.bin'))).headers()['content-length']).toBe(String(20 * 64 * 1024));
   } finally {
-    await admin.delete(file(base) + '&recursive=true');
+    await rmrf(admin, base);
     await admin.dispose(); await other.dispose();
   }
 });
@@ -64,14 +62,14 @@ test('an interrupted upload leaves no file behind, and an overwrite shows the ol
   const admin = await root(), other = await root();
   const base = '/storage-' + Date.now().toString(36);
   try {
-    expect((await admin.post('/api/mkdir?path=' + encodeURIComponent(base))).status()).toBe(200);
+    await mkdirp(admin, base);
     const cookie = (await admin.storageState()).cookies.map(c => `${c.name}=${c.value}`).join('; ');
     // Promise a body, send part of it, and hang up.
     await new Promise(resolve => {
       const req = http.request(new URL(file(base + '/broken.bin'), origin), { method: 'PUT', headers: { Origin: origin, Cookie: cookie, 'Content-Length': 1_000_000 } });
       req.on('error', () => resolve()); req.write(Buffer.alloc(1000)); setTimeout(() => { req.destroy(); resolve(); }, 300);
     });
-    await expect.poll(async () => (await (await other.get(ls(base))).json()).entries.map(e => e.name), { timeout: 10_000 }).toEqual([]);
+    await expect.poll(async () => (await listing(other, base)).map(e => e.name), { timeout: 10_000 }).toEqual([]);
     expect((await admin.put(file(base + '/a.txt'), { data: 'old' })).status()).toBe(201);
     // Without overwrite, an existing name is refused before any byte is stored.
     expect((await slowPut(base + '/a.txt', cookie, 1, 0)).status).toBe(409);
@@ -87,7 +85,7 @@ test('an interrupted upload leaves no file behind, and an overwrite shows the ol
     expect(await (await other.get(file(base + '/a.txt'))).text()).toBe('new!!!');
     expect((await other.head(file(base + '/a.txt'))).headers().etag).not.toBe(etag);
   } finally {
-    await admin.delete(file(base) + '&recursive=true');
+    await rmrf(admin, base);
     await admin.dispose(); await other.dispose();
   }
 });

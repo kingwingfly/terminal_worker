@@ -63,6 +63,57 @@ fn run(
     }
 }
 
+/// The files the kernel writes as they are read, as /proc's are: /etc/passwd and /etc/group,
+/// what libc's getpwnam and getgrnam read, which user space's programs do to name accounts.
+pub fn generated(db: &Db, path: &str) -> Option<String> {
+    let mut users = db.users();
+    users.sort_by_key(|(_, user)| user.id);
+    match path {
+        "/etc/passwd" => Some(
+            users
+                .iter()
+                .map(|(name, user)| {
+                    format!(
+                        "{name}:x:{}:{}::{}:/bin/sh\n",
+                        user.id, user.group, user.home
+                    )
+                })
+                .collect(),
+        ),
+        "/etc/group" => {
+            let mut groups = db.groups();
+            groups.sort_by_key(|(_, id)| *id);
+            Some(
+                groups
+                    .iter()
+                    .map(|(name, id)| {
+                        let members: Vec<&str> = users
+                            .iter()
+                            .filter(|(_, user)| user.groups.contains(id))
+                            .map(|(name, _)| name.as_str())
+                            .collect();
+                        format!("{name}:x:{id}:{}\n", members.join(","))
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Make /etc and the files the kernel writes in it, root's, where they are not.
+pub fn ensure(db: &mut Db) {
+    if db.node("/etc").is_none() {
+        db.set_node("/etc", &Node::directory(0, 0, 0o755));
+    }
+    for path in ["/etc/passwd", "/etc/group"] {
+        if db.node(path).is_none() {
+            let file = kernel::Fs::empty(db, 0, path);
+            db.set_node(path, &Node::file(0, 0, 0o644, file, 0));
+        }
+    }
+}
+
 /// Who the process is.
 fn creds(db: &Db, key: Option<&str>, cred: &Identity) -> Creds {
     let view = auth::session_view(db, key);

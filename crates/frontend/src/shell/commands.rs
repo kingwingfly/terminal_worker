@@ -9,14 +9,14 @@ use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use leptos::prelude::*;
 use terminal_worker_core::cli::{self, files, terminal, text as filters};
-use terminal_worker_core::{Entry, text};
+use terminal_worker_core::text;
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 
-use super::{LogLine, Output, Shell, asks, js_message, listing_text};
+use super::{LogLine, Output, Shell, asks, js_message};
 use crate::{
-    authorize, choose_files, endpoint, listing, open_file, record_sound, request, set_directory,
-    upload_files,
+    choose_files, endpoint, enterable, listing, open_file, record_sound, request, set_directory,
+    stat, upload_files,
 };
 
 /// A command the tab runs.
@@ -48,10 +48,7 @@ pub static COMMANDS: &[&dyn TerminalCommand] = &[
     &Fd,
     &Jobs,
     &Asking("cp"),
-    &Asking("mv"),
     &Asking("sudo"),
-    &Ls,
-    &Mkdir,
     &Cd,
     &Pwd,
     &Clear,
@@ -156,7 +153,7 @@ impl TerminalCommand for Fd {
             if find.exec.is_some() {
                 shell.fd_exec(&args).await
             } else {
-                shell.manage(&args, piped).await
+                shell.program(args, None, piped, false).await
             }
         }
         .boxed_local()
@@ -183,8 +180,8 @@ impl TerminalCommand for Jobs {
     }
 }
 
-/// cp, mv, and sudo running either: with -i, the tab asks about each file the server says
-/// exists; otherwise the server does all.
+/// cp, and sudo: with -i, the tab asks about each file the server says exists; otherwise the
+/// server does all. sudo of a program of user space runs it as root.
 struct Asking(&'static str);
 impl TerminalCommand for Asking {
     fn name(&self) -> &'static str {
@@ -194,87 +191,19 @@ impl TerminalCommand for Asking {
         &self,
         shell: Shell,
         args: Vec<String>,
-        _: Option<String>,
+        stdin: Option<String>,
         piped: bool,
     ) -> LocalBoxFuture<'static, Result<Output, String>> {
         async move {
+            let program = args.get(1).filter(|_| args[0] == "sudo");
+            if program.is_some_and(|name| userland::PROGRAMS.contains(&name.as_str())) {
+                return shell.sudo_program(args[1..].to_vec(), stdin, piped).await;
+            }
             if asks(&args) {
                 shell.interactive(&args).await
             } else {
                 shell.manage(&args, piped).await
             }
-        }
-        .boxed_local()
-    }
-}
-
-/// ls of one directory, which the tab lists itself; with options, the server.
-struct Ls;
-impl TerminalCommand for Ls {
-    fn name(&self) -> &'static str {
-        "ls"
-    }
-    fn run(
-        &self,
-        shell: Shell,
-        args: Vec<String>,
-        _: Option<String>,
-        piped: bool,
-    ) -> LocalBoxFuture<'static, Result<Output, String>> {
-        async move {
-            let ls = cli::parse::<files::Ls>(rest(&args))?;
-            if ls.long || ls.directory || ls.all {
-                return shell.manage(&args, piped).await;
-            }
-            let path = shell.path(ls.path.as_deref().unwrap_or("."))?;
-            let entries = listing(&path).await?;
-            if path == shell.cwd.get_untracked() {
-                shell.entries.set(entries.clone());
-            }
-            if piped {
-                Ok(Output::text(listing_text(&entries, false)))
-            } else if entries.is_empty() {
-                Ok(Output::text("(empty directory)"))
-            } else {
-                Ok(Output {
-                    view: Some(LogLine::Listing {
-                        entries,
-                        long: false,
-                    }),
-                    ..Default::default()
-                })
-            }
-        }
-        .boxed_local()
-    }
-}
-
-/// mkdir of one directory, with its parents, as the API does; with -p or several, the server.
-struct Mkdir;
-impl TerminalCommand for Mkdir {
-    fn name(&self) -> &'static str {
-        "mkdir"
-    }
-    fn run(
-        &self,
-        shell: Shell,
-        args: Vec<String>,
-        _: Option<String>,
-        piped: bool,
-    ) -> LocalBoxFuture<'static, Result<Output, String>> {
-        async move {
-            let mkdir = cli::parse::<files::Mkdir>(rest(&args))?;
-            let [dir] = mkdir.dirs.as_slice() else {
-                return shell.manage(&args, piped).await;
-            };
-            if mkdir.parents {
-                return shell.manage(&args, piped).await;
-            }
-            let path = shell.path(dir)?;
-            authorize(terminal_worker_core::parent(&path)).await?;
-            request(&endpoint("mkdir", &path), "POST").await?;
-            shell.refresh().await?;
-            Ok(Output::text(format!("Created {path}")))
         }
         .boxed_local()
     }
@@ -298,7 +227,10 @@ impl TerminalCommand for Cd {
                 Some(dir) => shell.path(dir)?,
                 None => shell.account.home.get_untracked(),
             };
-            request(&format!("{}&enter=true", endpoint("stat", &path)), "GET").await?;
+            let typed = cd.dir.as_deref().unwrap_or("~");
+            enterable(&path)
+                .await
+                .map_err(|error| format!("cd: {typed}: {error}"))?;
             let result = listing(&path).await;
             shell.cwd.set(path.clone());
             set_directory(&path);
@@ -374,13 +306,13 @@ impl TerminalCommand for Open {
         async move {
             let open = cli::parse::<files::Open>(rest(&args))?;
             let path = shell.path(&open.file)?;
-            let entry: Entry =
-                serde_json::from_value(request(&endpoint("stat", &path), "GET").await?)
-                    .map_err(|e| e.to_string())?;
-            if entry.directory {
+            let node = stat(&path)
+                .await
+                .map_err(|error| format!("open: {}: {error}", open.file))?;
+            if node.is_dir() {
                 return Err("This is a directory; use cd".into());
             }
-            JsFuture::from(open_file(&path, &entry.kind))
+            JsFuture::from(open_file(&path, terminal_worker_core::kind(&path)))
                 .await
                 .map_err(js_message)?;
             Ok(Output::default())

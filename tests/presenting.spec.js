@@ -1,5 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { mkdirp, names, program, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -44,10 +45,10 @@ test.beforeAll(async () => {
   root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
   expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
   base = '/presenting-' + Date.now().toString(36);
-  expect((await root.post('/api/mkdir?path=' + encodeURIComponent(base))).ok()).toBe(true);
+  await mkdirp(root, base);
   for (const [name, data] of [['deck.slides.md', deck], ['other.slides.md', '# Bee\n\n---\n\n# Bee two\n'], ['third.slides.md', '# Sea\n'], ['figure.svg', figure], ['pages.pdf', pdf()]]) expect((await root.put(file(base + '/' + name), { data })).status()).toBe(201);
 });
-test.afterAll(async () => { await root.delete(file(base) + '&recursive=true'); await root.dispose(); });
+test.afterAll(async () => { await rmrf(root, base); await root.dispose(); });
 
 test('slides go in order, by number and from an overview; images enlarge; the speaker view shows notes, the next slide and a clock', async ({ page }) => {
   await page.goto('/');
@@ -130,7 +131,7 @@ test('the overview lays its thumbnails out in rows, none over another, wide and 
     expect(Math.abs(boxes[0][3] - boxes[0][2] * 9 / 16)).toBeLessThan(2);
     await page.keyboard.press('Escape'); await expect(thumbs).toHaveCount(0);
   }
-  await root.delete(file(path));
+  await rmrf(root, path);
 });
 
 test('S opens the speaker view in a window of its own, and the two windows follow each other', async ({ page }) => {
@@ -168,7 +169,7 @@ test('S opens the speaker view in a window of its own, and the two windows follo
 
 test('the pages of one account signed in on other devices follow the slide presented, and no one else', async ({ browser }) => {
   const name = 'present' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
-  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
   expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
   const laptop = await device(browser, name, password), phone = await device(browser, name, password);
@@ -252,7 +253,7 @@ test('a PDF presented shows one page at a time, filling the view, turned as slid
 
 test('a page of the account opens a deck where the account showed it last, on any device', async ({ browser }) => {
   const name = 'where' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
-  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
   expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
   const laptop = await device(browser, name, password);
@@ -274,7 +275,7 @@ test('a page of the account opens a deck where the account showed it last, on an
 test('present makes /dev/present/NAME, which whoever may read the file follows, guests too, and only its account turns', async ({ browser }) => {
   const name = 'speaker' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
   const outsider = 'outsider' + Date.now().toString(36);
-  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  const command = args => program(root, args);
   for (const user of [name, outsider]) {
     expect((await command(['useradd', '-m', user])).ok()).toBe(true);
     expect((await root.post('/api/passwd', { data: { username: user, password } })).ok()).toBe(true);
@@ -346,24 +347,22 @@ test('present makes /dev/present/NAME, which whoever may read the file follows, 
     await expect(badge(guest.page)).toHaveText('The presentation ended');
     await run(laptop.page, `present --stop ${stem}`);
     await expect(transcript(laptop.page)).toContainText(`Stopped /dev/present/${stem}`);
-    const listed = await (await root.get('/api/ls?path=' + encodeURIComponent('/dev/present'))).json();
-    expect(listed.entries.map(entry => entry.name)).not.toContain(stem);
+    expect(await names(root, '/dev/present')).not.toContain(stem);
     // An account deleted takes its presentations with it.
     await run(laptop.page, `present ${talk}`);
     await expect(transcript(laptop.page)).toContainText(`as /dev/present/${stem}`);
     expect((await command(['userdel', '-r', name])).ok()).toBe(true);
-    const after = await (await root.get('/api/ls?path=' + encodeURIComponent('/dev/present'))).json();
-    expect(after.entries.map(entry => entry.name)).not.toContain(stem);
+    expect(await names(root, '/dev/present')).not.toContain(stem);
   } finally {
     for (const user of [name, outsider]) await command(['userdel', '-r', user]);
     for (const { context } of [laptop, phone, guest, other]) await context.close();
-    await root.delete(file(talk));
+    await rmrf(root, talk);
   }
 });
 
 test('a page whose line dropped catches up, on its return, with the turns made meanwhile', async ({ browser }) => {
   const name = 'line' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
-  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
   expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
   // The phone's line to the authority, which the test drops.
@@ -390,7 +389,7 @@ test('a page whose line dropped catches up, on its return, with the turns made m
 
 test('a presentation that comes to show another file takes its listeners with it', async ({ browser }) => {
   const name = 'swap' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
-  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
   expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
   const laptop = await device(browser, name, password), guest = await device(browser);
@@ -418,7 +417,7 @@ test('a presentation that comes to show another file takes its listeners with it
 
 test('a listener whose line was down when the presentation came to show another file goes with it on its return', async ({ browser }) => {
   const name = 'missed' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
-  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
   expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
   let line;
@@ -452,7 +451,7 @@ test('a listener whose line was down when the presentation came to show another 
 
 test('a replacement heard after the listener left the presentation does not take them back to it', async ({ browser }) => {
   const name = 'left' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
-  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
   expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
   const laptop = await device(browser, name, password), guest = await device(browser);
@@ -487,7 +486,7 @@ test('a replacement heard after the listener left the presentation does not take
 
 test('a page whose line was down when its presentation changed hands learns it on its return, and turns it if now its own', async ({ browser }) => {
   const name = 'hands' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
-  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
   expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
   let line;
@@ -528,7 +527,7 @@ test('a page whose line was down when its presentation changed hands learns it o
 
 test('a failure heard for a replacement the listener has since gone past does not end what they follow now', async ({ browser }) => {
   const name = 'stale' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
-  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
   expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
   // A deck the presenter may read and guests may not.
@@ -561,7 +560,7 @@ test('a failure heard for a replacement the listener has since gone past does no
     await expect(guest.page.locator('.presentation-badge')).toBeEnabled();
   } finally {
     await root.delete('/api/present?name=' + stem);
-    await root.delete(file(secret));
+    await rmrf(root, secret);
     await command(['userdel', '-r', name]);
     await laptop.context.close(); await guest.context.close();
   }

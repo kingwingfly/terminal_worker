@@ -9,7 +9,15 @@ test('every command has side-effect-free help, including privileged and interact
   await page.goto('/');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   const requests = [];
-  page.on('request', request => { if (request.method() !== 'GET' && request.method() !== 'HEAD') requests.push(request.url()); });
+  // Whatever changes something: a request other than a read, and system calls other than those
+  // that only look (a listing the panel makes again is no side effect).
+  const looking = new Set(['getcreds', 'stat', 'lstat', 'getdents', 'access', 'readlink', 'getxattr', 'listxattr']);
+  const changes = request => {
+    if (request.method() === 'GET' || request.method() === 'HEAD') return false;
+    if (!request.url().endsWith('/api/sys')) return true;
+    return JSON.parse(request.postData() || '{}').calls?.some(call => !looking.has(typeof call === 'string' ? call : Object.keys(call)[0])) ?? true;
+  };
+  page.on('request', request => { if (changes(request)) requests.push(request.url()); });
   for (const command of commands) {
     await expect(page.locator('.busy')).toHaveText('↵');
     await input.fill(command + ' -h'); await input.press('Enter');
@@ -28,7 +36,7 @@ test('every command has side-effect-free help, including privileged and interact
   // Explicit -- keeps -h a path instead of interpreting it as help.
   await expect(page.locator('.busy')).toHaveText('↵');
   await input.fill('rm -- -h'); await input.press('Enter');
-  await expect(page.locator('.transcript pre').last()).toContainText('Permission denied');
+  await expect(page.locator('.transcript pre').last()).toContainText("rm: cannot remove '-h': No such file or directory");
   await expect(page.locator('#auth')).not.toBeVisible();
 });
 

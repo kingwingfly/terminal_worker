@@ -1,11 +1,11 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
+import { listing, mkdirp, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const CHUNK = 8 * 1024 * 1024;
 const file = path => '/api/file?path=' + encodeURIComponent(path);
-const ls = path => '/api/ls?path=' + encodeURIComponent(path);
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 let sequence = 0;
 async function root() {
@@ -40,7 +40,7 @@ test('chunked uploads check every chunk, are readable while they arrive, resume,
   const base = '/uploads-' + Date.now().toString(36), path = base + '/data.bin';
   const bytes = content(), parts = slices(bytes);
   try {
-    expect((await admin.post('/api/mkdir?path=' + encodeURIComponent(base))).status()).toBe(200);
+    await mkdirp(admin, base);
     const begin = await admin.post('/api/uploads?path=' + encodeURIComponent(path), { data: { size: bytes.length, sha256: sha256(bytes) } });
     expect(begin.status(), await begin.text()).toBe(200);
     const { id, chunk_size, hold } = await begin.json();
@@ -58,7 +58,7 @@ test('chunked uploads check every chunk, are readable while they arrive, resume,
     const status = await (await admin.get('/api/uploads?id=' + id)).json();
     expect(status.committed).toEqual([0]);
     // The file is listed while uploading, with what has arrived so far.
-    const entry = (await (await reader.get(ls(base))).json()).entries[0];
+    const entry = (await listing(reader, base))[0];
     expect(entry.name).toBe('data.bin'); expect(entry.uploaded).toBe(CHUNK);
     const head = await reader.head(file(path));
     expect(head.headers()['x-upload-state']).toBe('uploading');
@@ -88,7 +88,7 @@ test('chunked uploads check every chunk, are readable while they arrive, resume,
     expect((await chunk(other, id, again.hold, 2, parts[2])).status()).toBe(200);
     // Progress counts every chunk that arrived, as the uploading page does, not only those
     // readable from the start.
-    expect((await (await reader.get(ls(base))).json()).entries[0].uploaded).toBe(CHUNK + parts[2].length);
+    expect((await listing(reader, base))[0].uploaded).toBe(CHUNK + parts[2].length);
     expect((await other.post(`/api/uploads/complete?id=${id}&hold=${again.hold}`)).status()).toBe(409);
     expect((await chunk(other, id, again.hold, 1, parts[1])).status()).toBe(200);
     // A chunk sent while the upload completes never changes the completed file.
@@ -106,9 +106,9 @@ test('chunked uploads check every chunk, are readable while they arrive, resume,
     // any session of its account.
     const cancelled = await (await admin.post('/api/uploads?path=' + encodeURIComponent(base + '/gone.bin'), { data: { size: 10, sha256: sha256(Buffer.alloc(10)) } })).json();
     expect((await other.delete('/api/uploads?id=' + cancelled.id)).status()).toBe(200);
-    expect((await (await reader.get(ls(base))).json()).entries.map(e => e.name)).toEqual(['data.bin']);
+    expect((await listing(reader, base)).map(e => e.name)).toEqual(['data.bin']);
   } finally {
-    await admin.delete(file(base) + '&recursive=true');
+    await rmrf(admin, base);
     await admin.dispose(); await reader.dispose(); await other.dispose();
   }
 });
@@ -151,7 +151,7 @@ test('the browser resumes an interrupted upload from the chunks already sent, an
   await expect(transcript).toContainText('↑ other.log', { timeout: 15_000 });
   await page.locator('#command').press('Control+c');
   await expect(transcript).toContainText('✕ other.log: Upload cancelled', { timeout: 15_000 });
-  await expect.poll(async () => (await (await page.request.get(ls(folder))).json()).entries.map(e => e.name)).toEqual(['data.log']);
+  await expect.poll(async () => (await listing(page.request, folder)).map(e => e.name)).toEqual(['data.log']);
   await page.unroute('**/api/uploads/chunk?**');
   // Any file uploads: media are served as such, what is neither text nor media as bytes.
   for (const [name, type] of [['tone.aac', 'audio/aac'], ['report.docx', 'application/octet-stream']]) {
@@ -167,5 +167,5 @@ test('the browser resumes an interrupted upload from the chunks already sent, an
   await expect(page.locator('.busy')).toHaveText('Working...');
   await page.locator('#command').press('Control+c');
   await expect(page.locator('.busy')).toHaveText('↵');
-  await page.request.delete(file(folder) + '&recursive=true', { headers: { Origin: origin } });
+  await rmrf(page.request, folder);
 });

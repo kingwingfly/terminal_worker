@@ -1,5 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { mkdirp, program, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -34,7 +35,7 @@ test('two devices of one account never send one upload at once, and one stopping
   const base = '/devices-' + Date.now().toString(36);
   const a = await device(browser), b = await device(browser);
   try {
-    expect((await root.post('/api/mkdir?path=' + encodeURIComponent(base))).ok()).toBe(true);
+    await mkdirp(root, base);
     for (const { page } of [a, b]) { await run(page, 'cd ' + base); await expect(page.locator('.directory-bar')).toContainText(base); }
     const bytes = Buffer.alloc(CHUNK * 2 + 1000);
     for (let i = 0; i < bytes.length; i += 4) bytes.writeUInt32LE(i, i);
@@ -54,7 +55,7 @@ test('two devices of one account never send one upload at once, and one stopping
     // A's file panel showed the same progress as its upload line, as both count what arrived.
     await expect(a.page.locator('.files .file').filter({ hasText: 'data.bin' })).toContainText('KB');
   } finally {
-    await root.delete(file(base) + '&recursive=true');
+    await rmrf(root, base);
     await a.context.close(); await b.context.close(); await root.dispose();
   }
 });
@@ -63,7 +64,7 @@ test('a page hears when its session ends elsewhere, and windows of one browser f
   const root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
   expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
   const name = 'dev' + Date.now().toString(36), password = 'device-password-' + Date.now();
-  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
   expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
   const phone = await device(browser, name, password);
@@ -94,11 +95,11 @@ test('the file panel dims what the account may not open, and says why when click
   const root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
   expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
   const base = '/panel-' + Date.now().toString(36);
-  const command = args => root.post('/api/command', { data: { args, cwd: '/' } });
+  const command = args => program(root, args);
   const context = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': address('guest') } });
   const page = await context.newPage();
   try {
-    for (const dir of ['', '/locked', '/open']) expect((await root.post('/api/mkdir?path=' + encodeURIComponent(base + dir))).ok()).toBe(true);
+    for (const dir of ['', '/locked', '/open']) await mkdirp(root, base + dir);
     expect((await root.put(file(base + '/secret.txt'), { data: 'no' })).status()).toBe(201);
     expect((await root.put(file(base + '/notes.txt'), { data: 'yes' })).status()).toBe(201);
     for (const args of [['chmod', '700', base + '/locked'], ['chmod', '600', base + '/secret.txt'], ['ln', '-s', base + '/nowhere', base + '/dangling']]) expect((await command(args)).ok()).toBe(true);
@@ -121,9 +122,9 @@ test('the file panel dims what the account may not open, and says why when click
     await page.getByRole('button', { name: 'Close preview' }).click();
     await expect(page.locator('.file-notice')).toBeEmpty();
     await entry('dangling').click();
-    await expect(page.locator('.file-notice')).toContainText('does not exist');
+    await expect(page.locator('.file-notice')).toContainText('No such file or directory');
   } finally {
-    await root.delete(file(base) + '&recursive=true');
+    await rmrf(root, base);
     await context.close(); await root.dispose();
   }
 });

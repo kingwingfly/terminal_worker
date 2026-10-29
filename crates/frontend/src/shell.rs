@@ -1,7 +1,8 @@
 //! One terminal tab: its directory, transcript, history and completion, and the commands it
-//! runs. A line is a pipeline: each stage's output is the next one's input. The server runs
-//! file and account commands; text filters, xargs and fd -x run here, as do browser
-//! interactions such as open and upload.
+//! runs. A line is a pipeline: each stage's output is the next one's input. The programs of
+//! user space (crates/userland: ls, rm, chmod...) run here, over system calls; so do text
+//! filters, xargs and fd -x, and browser interactions such as open and upload. The server
+//! still runs what has not moved yet (cp, accounts, archives).
 
 mod commands;
 
@@ -19,8 +20,18 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::{
     account_command, cancel_choosing, cancel_uploads, choose_files, completion_focus, endpoint,
-    focus_input, listing, request, set_directory, stop_recording,
+    focus_input, listing, request, set_directory, stop_recording, sudo,
 };
+
+/// What a program of user space left: its exit status, its output and errors, its listing,
+/// and what fd found.
+struct Exited {
+    status: i32,
+    out: String,
+    err: Vec<String>,
+    view: Option<userland::View>,
+    found: Vec<String>,
+}
 
 /// The most transcript lines kept, ...
 const KEPT: usize = 100;
@@ -39,10 +50,7 @@ const GLOB_PATHS: usize = 10_000;
 const GLOB_CONCURRENCY: usize = 8;
 
 /// Server commands that xargs and fd -x may run many of in one request.
-const BATCHED: &[&str] = &[
-    "touch", "rm", "mv", "cp", "chmod", "chown", "chgrp", "mkdir", "ls", "whoami", "id", "groups",
-    "ln", "readlink", "getfacl", "setfacl", "getfattr", "setfattr",
-];
+const BATCHED: &[&str] = &["cp", "whoami", "id", "groups"];
 
 #[derive(Clone)]
 pub enum LogLine {
@@ -791,17 +799,13 @@ impl Shell {
         out.failed |= self.cancelled();
         Ok(out)
     }
-    /// fd with -x or -X: the server searches, and this runs the command on what it found.
+    /// fd with -x or -X: fd searches, and this runs the command on what it found.
     async fn fd_exec(self, args: &[String]) -> Result<Output, String> {
         let search = find::parse(&args[1..])?;
         let Some((all, template)) = search.exec else {
-            return self.manage(args, true).await;
+            return self.program(args.to_vec(), None, true, false).await;
         };
-        // The server searches as the line says, leaving the command to this.
-        let value = self.call(args).await?;
-        let found = self.output(&value, true)?;
-        let results: Vec<String> =
-            serde_json::from_value(value["results"].clone()).unwrap_or_default();
+        let (found, results) = self.find(args).await;
         if results.is_empty() {
             return Ok(Output {
                 failed: found.failed,
@@ -889,6 +893,105 @@ impl Shell {
         Ok(out)
     }
 
+    /// Run the program of user space `args[0]`, under sudo if `sudo`, with `stdin`: what it
+    /// left. Its questions (mv -i) go to this tab's next line, and Ctrl+C stops it between
+    /// steps.
+    async fn exec(self, args: Vec<String>, stdin: Option<String>, sudo: bool) -> Exited {
+        let cancelled = move || self.cancelled();
+        let ask = move |question: String| {
+            Box::pin(async move { Some(self.ask(question).await) })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>>>>
+        };
+        let mut io = userland::Io {
+            args,
+            cwd: self.cwd.get_untracked(),
+            home: self.account.home.get_untracked(),
+            stdin,
+            out: String::new(),
+            err: Vec::new(),
+            view: None,
+            found: Vec::new(),
+            cancelled: &cancelled,
+            ask: &ask,
+        };
+        let sys = crate::sys::HttpSys {
+            sudo,
+            ..Default::default()
+        };
+        let status = userland::run(&sys, &mut io).await.unwrap_or(127);
+        Exited {
+            status,
+            out: io.out,
+            err: io.err,
+            view: io.view,
+            found: io.found,
+        }
+    }
+    /// Run the program of user space `args[0]` as a stage: its errors go to the transcript, and
+    /// its listing as a view of its own unless piped.
+    pub async fn program(
+        self,
+        args: Vec<String>,
+        stdin: Option<String>,
+        piped: bool,
+        sudo: bool,
+    ) -> Result<Output, String> {
+        let changes = !matches!(
+            args[0].as_str(),
+            "ls" | "stat" | "readlink" | "realpath" | "getfacl" | "getfattr" | "fd"
+        );
+        let io = self.exec(args, stdin, sudo).await;
+        let status = io.status;
+        for line in io.err {
+            self.error(line);
+        }
+        let mut out = Output {
+            stdout: io.out,
+            failed: status != 0,
+            ..Default::default()
+        };
+        if let Some(userland::View::Listing { entries, long }) = io.view {
+            if piped {
+                out.stdout = listing_text(&entries, long);
+            } else if entries.is_empty() {
+                out.stdout = "(empty directory)\n".into();
+            } else {
+                out.view = Some(LogLine::Listing { entries, long });
+            }
+        }
+        if changes {
+            self.refresh().await?;
+        }
+        Ok(out)
+    }
+    /// sudo PROGRAM ...: a program of user space, run as root once the account has authenticated
+    /// (sudo's password, asked for if it has not lately).
+    pub async fn sudo_program(
+        self,
+        args: Vec<String>,
+        stdin: Option<String>,
+        piped: bool,
+    ) -> Result<Output, String> {
+        let allowed = JsFuture::from(sudo()).await.map_err(js_message)?;
+        if allowed.as_bool() != Some(true) {
+            return Err("sudo canceled".into());
+        }
+        self.program(args, stdin, piped, true).await
+    }
+    /// What fd finds, as `args` say: whether it failed, and its results, by path.
+    async fn find(self, args: &[String]) -> (Output, Vec<String>) {
+        let io = self.exec(args.to_vec(), None, false).await;
+        let status = io.status;
+        for line in io.err {
+            self.error(line);
+        }
+        let out = Output {
+            failed: status != 0,
+            ..Default::default()
+        };
+        (out, io.found)
+    }
+
     /// Run one command, with what the previous stage wrote, if any. `piped`: whether its output
     /// goes on to another stage, rather than to the transcript.
     pub fn invoke(
@@ -911,6 +1014,9 @@ impl Shell {
                 if let Some(help) = cli::help(asked) {
                     return Ok(Output::text(help + "\n"));
                 }
+            }
+            if userland::PROGRAMS.contains(&name.as_str()) && commands::find(&name).is_none() {
+                return self.program(args, stdin, piped, false).await;
             }
             match commands::find(&name) {
                 Some(command) => command.run(self, args, stdin, piped).await,
@@ -1116,11 +1222,7 @@ impl Shell {
                     Part::Name(name) => {
                         // Literal names need search permission, not a listing. Dot components
                         // are not listing entries; check traversal before resolving them away.
-                        if navigation
-                            && request(&(endpoint("stat", &directory) + "&enter=true"), "GET")
-                                .await
-                                .is_err()
-                        {
+                        if navigation && crate::enterable(&directory).await.is_err() {
                             return Vec::new();
                         }
                         let target = joined(&typed, name);
@@ -1130,10 +1232,8 @@ impl Shell {
                         let Ok(path) = self.path(&target) else {
                             return Vec::new();
                         };
-                        match request(&endpoint("stat", &path), "GET").await {
-                            Ok(entry) if entry["directory"] == true || last && !directories => {
-                                vec![target]
-                            }
+                        match crate::stat(&path).await {
+                            Ok(node) if node.is_dir() || last && !directories => vec![target],
                             _ => Vec::new(),
                         }
                     }

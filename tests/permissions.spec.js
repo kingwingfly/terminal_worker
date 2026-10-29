@@ -1,14 +1,14 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
+import { entry, errno, mkdirp, program, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const password = 'testing-long-passphrase-8274';
 const file = path => '/api/file?path=' + encodeURIComponent(path);
-const ls = path => '/api/ls?path=' + encodeURIComponent(path);
 let sequence = 0;
 async function client() { return playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'acl-test-' + Date.now() + '-' + (++sequence) } }); }
-async function command(client, args, extra = {}) { return client.post('/api/command', { data: { args, cwd: '/', ...extra } }); }
+async function command(client, args, extra = {}) { return program(client, args, extra); }
 async function ok(response, status = 200) { expect(response.status(), await response.text()).toBe(status); return response; }
 async function login(client, username, secret = password) { return ok(await client.post('/api/login', { data: { username, password: secret } })); }
 async function setup() {
@@ -51,11 +51,11 @@ test('owner/group/other, traversal, ranges, revocation and root bypass are enfor
   expect((await command(bob,['chmod','777',path])).status()).toBe(403);
   expect((await command(alice,['chown','root:root',path])).status()).toBe(403);
   await ok(await command(alice,['chmod','711',home]));
-  await ok(await guest.get(file(path))); expect((await guest.get(ls(home))).status()).toBe(401);
+  await ok(await guest.get(file(path))); expect(await errno(guest, { getdents: { path: home } })).toBe('EACCES');
   await ok(await command(alice,['chmod','000',home]));
   await ok(await root.get(file(path))); await ok(await command(root,['chmod','700',home]));
   expect((await alice.get(file('/home/../root/secret.txt'))).status()).toBe(403);
-  expect((await alice.post('/api/command',{headers:{Origin:'https://evil.invalid'},data:{args:['chmod','777',home],cwd:'/'}})).status()).toBe(403);
+  expect((await alice.post('/api/sys',{headers:{Origin:'https://evil.invalid'},data:{calls:[{chmod:{path:home,mode:0o777}}]}})).status()).toBe(403);
   expect(shared.headers()['cache-control']).toContain('no-store');
  } finally { await f.cleanup(); }
 });
@@ -76,7 +76,7 @@ test('sudo verifies the caller, stays per-command, revokes membership immediatel
   await ok(await command(alice,['users'],{sudo:true}));
   expect((await (await alice.get('/api/session')).json()).username).toBe(a);
   expect((await alice.storageState()).cookies.find(c=>c.name==='terminal_session').value).toBe(originalCookie);
-  expect((await alice.get(ls('/root'))).status()).toBe(403);
+  expect(await errno(alice, { getdents: { path: '/root' } })).toBe('EACCES');
   await ok(await alice.post('/api/sudo',{data:{revoke:true}}));
   expect((await command(alice,['users'],{sudo:true})).status()).toBe(403);
   await ok(await alice.post('/api/sudo',{data:{password}}));
@@ -88,7 +88,7 @@ test('sudo verifies the caller, stays per-command, revokes membership immediatel
   await ok(await command(root,['usermod','-d',next,'-m',a]));
   expect((await alice.get(file(home+'/kept.txt'))).status()).toBe(404);
   expect(await (await ok(await alice.get(file(next+'/kept.txt')))).text()).toBe('preserve bytes');
-  const metadata=await (await alice.get('/api/stat?path='+encodeURIComponent(next+'/kept.txt'))).json();expect(metadata.mode).toBe(0o600);expect(metadata.owner).toBe(a);
+  const metadata=await entry(alice, next+'/kept.txt');expect(metadata.mode).toBe(0o600);expect(metadata.owner).toBe(a);
   expect((await root.post('/api/command',{data:{args:['usermod','-d',next+'/inside','-m',a]}})).status()).toBe(400);
   await ok(await command(root,['usermod','-L',a]));
   expect((await alice.get(file(next+'/kept.txt'))).status()).toBe(401);
@@ -113,20 +113,21 @@ test('public directory write, file overwrite, recursive deletion, concurrent upd
  try {
   await ok(await command(root,['mkdir',shared]));await ok(await command(root,['chmod','o+wx',shared]));
   await ok(await guest.put(file(shared+'/guest.txt'),{data:'guest data'}),201);
-  await ok(await guest.delete(file(shared+'/guest.txt')));
+  expect(await errno(guest, { unlink: { path: shared+'/guest.txt' } })).toBe(null);
   await ok(await command(root,['chmod','755',shared]));expect((await guest.put(file(shared+'/denied.txt'),{data:'x'})).status()).toBe(401);
   await ok(await command(root,['chown',a+':'+team,shared]));await ok(await command(root,['chmod','770',shared]));
   await ok(await alice.put(file(shared+'/locked.txt'),{data:'old'}),201);await ok(await command(alice,['chmod','444',shared+'/locked.txt']));
   expect((await alice.put(file(shared+'/locked.txt')+'&overwrite=true',{data:'new'})).status()).toBe(403);
   // Deletion is controlled by the parent, not by the file's write bits.
-  await ok(await bob.delete(file(shared+'/locked.txt')));
-  await ok(await alice.post('/api/mkdir?path='+encodeURIComponent(shared+'/private')));await ok(await command(alice,['chmod','700',shared+'/private']));
-  expect((await bob.delete(file(shared)+'&recursive=true')).status()).toBe(403);
+  expect(await errno(bob, { unlink: { path: shared+'/locked.txt' } })).toBe(null);
+  await mkdirp(alice, shared+'/private');await ok(await command(alice,['chmod','700',shared+'/private']));
+  // rm -r takes what it may, as on Linux: what alice's private directory holds, it may not.
+  expect(await rmrf(bob, shared)).toBe('EACCES');
   await ok(await alice.put(file(shared+'/private/keep.txt'),{data:'intact'}),201);
   await Promise.all([ok(await command(root,['usermod','-aG','wheel',a])),ok(await command(root,['chmod','750',shared]))]);
   const results=await Promise.all([command(root,['groupadd',team+'one']),command(root,['groupadd',team+'two'])]);for(const result of results)await ok(result);
   await ok(await command(root,['groupmod','-n',team+'new',team]));
-  expect((await (await root.get('/api/stat?path='+encodeURIComponent(shared))).json()).group).toBe(team+'new');
+  expect((await entry(root, shared)).group).toBe(team+'new');
   await ok(await command(root,['groupdel',team+'new']));await ok(await command(root,['groupadd',team]));
   for(const name of [team+'one',team+'two'])await ok(await command(root,['groupdel',name]));
   expect((await command(root,['groupdel',a])).status()).toBe(400);
@@ -145,7 +146,7 @@ test('an upload goes on only while its account may still write where the file is
   // Shut out of the directory, the uploader may neither send nor publish the file.
   const revoked=await begin(dir+'/a.txt');
   await ok(await command(root,['chown','root',dir]));await ok(await command(root,['chmod','700',dir]));
-  expect((await alice.get('/api/stat?path='+encodeURIComponent(dir+'/a.txt'))).status()).toBe(403);
+  expect(await errno(alice, { stat: { path: dir+'/a.txt' } })).toBe('EACCES');
   expect((await chunk(revoked,'abcd')).status()).toBe(403);
   expect((await complete(revoked)).status()).toBe(403);
   // Let back in, the file being still hers, it goes on.
@@ -174,16 +175,18 @@ test('cp and mv tell nothing of a destination below a directory the caller may n
   for (const name of ['one.txt','two.txt']) await ok(await alice.put(file(home+'/'+name),{data:name}),201);
   for (const cmd of ['cp','mv']) for (const dest of ['/root/acl-hidden-'+f.a,'/root/acl-missing-'+f.a]) {
    const reply=await command(alice,[cmd,home+'/one.txt',home+'/two.txt',dest]);
-   expect(reply.status(),dest).toBe(403);expect((await reply.json()).error).toContain('cannot traverse /root');
+   // mv is user space's: the kernel says only EACCES; cp, still the server's, says where.
+   expect(reply.status(),dest).toBe(403);const body=await reply.json();
+   if (cmd === 'cp') expect(body.error).toContain('cannot traverse /root'); else expect(body.errno).toBe('EACCES');
   }
   // Nor below one deep in a merge: cp -ri is refused alike whether the file there is or not, and
   // names nothing it would ask about.
   const dst='/acl-merge-'+f.a,hidden=dst+'/src/private';
-  await ok(await alice.post('/api/mkdir?path='+encodeURIComponent(home+'/src/private')));
+  await mkdirp(alice, home+'/src/private');
   await ok(await alice.put(file(home+'/src/private/probe.txt'),{data:'probe'}),201);
   await ok(await command(root,['mkdir','-p',hidden]));await ok(await command(root,['chmod','777',dst,dst+'/src']));await ok(await command(root,['chmod','700',hidden]));
   for (const leaf of [true,false]) {
-   if (leaf) await ok(await root.put(file(hidden+'/probe.txt'),{data:'kept'}),201); else await ok(await root.delete(file(hidden+'/probe.txt')));
+   if (leaf) await ok(await root.put(file(hidden+'/probe.txt'),{data:'kept'}),201); else expect(await errno(root, { unlink: { path: hidden+'/probe.txt' } })).toBe(null);
    const reply=await command(alice,['cp','-ri',home+'/src',dst]);const body=await reply.json();
    expect(reply.status(),String(leaf)).toBe(403);expect(body.error).toContain('cannot traverse '+hidden);expect(body.existing).toBeUndefined();
   }
@@ -223,8 +226,8 @@ test('terminal account workflow uses password dialogs, su homes and a caller-aut
   await run('passwd '+username);await page.getByLabel('New password',{exact:true}).fill(password);await page.getByLabel('Confirm new password',{exact:true}).fill(password);await page.locator('#auth button[type=submit]').click();await expect(last()).toContainText('Password updated');
   await run('su - '+username);await expect(page.locator('.directory-bar')).toContainText(home);await expect(page.locator('.lock')).toContainText(username);
   await run('pwd');await expect(last()).toHaveText(home);
-  await run('mkdir secrets');await expect(last()).toContainText('Created '+home+'/secrets');
-  await run('chmod 700 secrets');await expect(last()).toContainText('Updated');
+  // Silent on success, as GNU's are; ls -l shows what they did.
+  await run('mkdir secrets');await run('chmod 700 secrets');
   await run('ls -l');await expect(last()).toContainText('drwx------');await expect(last()).toContainText(username);
   await run('sudo ls -l /root');await expect(page.locator('#auth-title')).toContainText('sudo');await page.getByLabel('Password',{exact:true}).fill(password);await page.locator('#auth button[type=submit]').click();await expect(page.locator('.busy')).toHaveText('↵');
   await run('whoami');await expect(last()).toHaveText(username);

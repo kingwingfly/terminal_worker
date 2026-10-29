@@ -3944,11 +3944,25 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_json",
  "sha2 0.10.9",
+ "terminal-worker-abi",
  "terminal-worker-core",
  "terminal-worker-preview",
+ "terminal-worker-userland",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "terminal-worker-userland"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "terminal-worker-abi",
+ "terminal-worker-core",
+ "terminal-worker-kernel",
 ]
 
 [[package]]

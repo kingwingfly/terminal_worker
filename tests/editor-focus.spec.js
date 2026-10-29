@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { fakeKernel } from './sys.js';
 
 // Keep this regression independent of local accounts, passwords and stored files.
 test('editor close restores actual typing after Escape, close button and discarded changes', async ({ page }) => {
@@ -7,8 +8,7 @@ test('editor close restores actual typing after Escape, close button and discard
   await page.route('**/api/**', async route => {
     const request = route.request(), url = new URL(request.url());
     if (url.pathname === '/api/session') return route.fulfill({json:{authenticated:true,username:'editor',uid:1000,home:'/',can_write:true}});
-    if (url.pathname === '/api/ls') return route.fulfill({json:{path:'/',entries:[entry()]}});
-    if (url.pathname === '/api/stat') return route.fulfill({json:entry()});
+    if (url.pathname === '/api/sys') return fakeKernel(() => ({'/focus.txt': {size: content.length, user: 'editor'}}))(route);
     if (url.pathname === '/api/file') {
       if (request.method() === 'PUT') { content = request.postData(); revision++; return route.fulfill({json:{etag:`"${revision}"`}}); }
       return route.fulfill({body:request.method() === 'HEAD' ? '' : content,headers:{'Content-Type':'text/plain','ETag':`"${revision}"`}});

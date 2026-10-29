@@ -103,12 +103,13 @@ Every command supports `-h` and `--help`, generated, as is its page in `man COMM
 
 | Command | Implemented syntax |
 | --- | --- |
-| Files | `ls [-l] [PATH]`, `cd [PATH/~]`, `pwd`, `open FILE`, `upload [DIR]` |
-| Create/remove | `mkdir [-p] PATH...`, `touch [-c] [--] FILE...`, `rm [-r] [-f] [--] PATH...` |
+| Files | `ls [-l] [-a] [-d] [PATH]`, `stat [-L] FILE...`, `cd [PATH/~]`, `pwd`, `open FILE`, `upload [DIR]` |
+| Create/remove | `mkdir [-p] PATH...`, `rmdir [-p] DIR...`, `touch [-c] [--] FILE...`, `rm [-r] [-f] [--] PATH...` |
+| Links | `ln [-s] [-f] [-n] [-L\|-P] [-v] TARGET... [LINK]`, `readlink [-f\|-e\|-m] [-n] FILE...`, `realpath [-e\|-m] FILE...` |
 | Move/copy | `mv [-f\|-n\|-i] [-v] SOURCE... DEST`, `cp [-r] [-f\|-n\|-i] [-v] SOURCE... DEST` |
 | Find | `fd [-H] [-t f\|d\|x] [-e EXT] [-d N] [-g\|-F] [-i\|-s] [-p] [-a] [-0] [PATTERN] [PATH...] [-x\|-X COMMAND...]` |
 | Text | `echo`, `cat`, `head`, `tail`, `grep`, `wc`, `sort`, `uniq`, `xargs`, joined by `\|` |
-| Permissions | `chmod [-R] MODE PATH...`, `chown [-R] USER[:GROUP] PATH...`, `chown :GROUP PATH...` |
+| Permissions | `chmod [-R] MODE PATH...`, `chown [-R] [-h] USER[:GROUP] PATH...`, `chgrp [-R] [-h] GROUP PATH...`, `getfacl`, `setfacl`, `getfattr`, `setfattr` |
 | Accounts | `useradd [-m\|-M] [-d HOME] [-g GROUP] [-G G1,G2] USER`; signed out, `useradd [-m\|-M] [--short-password] NAME` |
 | Update account | `usermod [-a] [-G G1,G2] [-g GROUP] [-d HOME [-m]] [-l NEW] [-L\|-U] USER` |
 | Remove account | `userdel [-r] USER`; an account in group guest, itself |
@@ -131,11 +132,11 @@ As root, `useradd -m` creates the home; `-d` selects its absolute path. Without 
 
 Passwords use random salts, PBKDF2-SHA256 (100,000 iterations), and a server-side pepper. Sessions use random opaque tokens and HttpOnly/SameSite=Strict cookies, with Secure on HTTPS and an eight-hour lifetime. Authentication endpoints are rate-limited.
 
-`touch` creates empty files with mode 644 (or what a default ACL gives), including extensionless names. Existing content and modes remain intact; modification timestamps are not maintained. `-c` skips missing files. Parents must already exist; all paths are validated before creation. `sudo touch` creates files as root for that request only.
+`touch` creates empty files with mode 644 (or what a default ACL gives), including extensionless names; of one that exists, it sets the times (`stat` shows them, in UTC), leaving content and mode intact. `-c` skips missing files. As GNU touch, each operand succeeds or fails on its own. `sudo touch` creates files as root for that command only.
 
-`mkdir`, `rm`, `chmod`, and `chown` accept several paths. As on Linux, each path succeeds or fails on its own: failures are reported, and the others are still done. `rm` protects root, the current directory, and its ancestors. There is no trash.
+`mkdir`, `rm`, `chmod`, and `chown` accept several paths. As on Linux, each path succeeds or fails on its own: failures are reported, and the others are still done; `rm -r` removes what it may of a tree and says what it may not, leaving the directories that hold it. As GNU's tools, they print nothing on success but with `-v`, and say why they failed as GNU's do (`rm: cannot remove 'x': Permission denied`). `rm` refuses `.` and `..`, and `-r` of `/`. There is no trash.
 
-`mv` and `cp` follow Linux defaults: an existing file at the destination is replaced. `-n` never replaces one; `-i` asks for each. A directory is never replaced. `mv` moves names, so the inode keeps its owner, mode, ACLs and other names, and moving is instant whatever the size; it needs w+x on both parents, and a directory that changes parent needs w itself. The working directory, its ancestors, and account homes cannot be moved (use `usermod -d HOME -m`).
+`mv` and `cp` follow Linux defaults: an existing file at the destination is replaced. `-n` never replaces one; `-i` asks for each. A directory is never replaced. `mv` moves names, so the inode keeps its owner, mode, ACLs and other names, and moving is instant whatever the size; it needs w+x on both parents, and a directory that changes parent needs w itself. A directory that is, or holds, an account's home cannot be moved, as a mount point in use cannot (use `usermod -d HOME -m`).
 
 `cp` follows GNU cp. New nodes belong to the caller, with the source mode less the umask, or what the destination's default ACL gives. An existing file is written in place, keeping its owner, mode and other names (which need w on it). With `-f`, a file that cannot be written is removed and copied anew. `-p` keeps the mode, ACLs, and, as far as the caller may, the owner and group. Without `-r`, a link named is followed. With `-r`, links are copied as links, unless `-L` follows them all or `-H` those named. `-d` copies a file's several names as one file; `-a` is `-dpR` plus extended attributes. Copying a file onto another of its names is refused ("the same file"), as is writing through a dangling link. Copies share the source's immutable content, so they are instant too; editing either later keeps the other unchanged. A file still uploading cannot be copied yet.
 
@@ -183,6 +184,7 @@ Every page keeps a WebSocket to the authority (`GET /api/events`, accepted only 
 
 | API | Purpose |
 | --- | --- |
+| `POST /api/sys` `{calls, umask, sudo}` | System calls (owner's design, 2026-10-29: the page is user space): a batch of calls, each run on its own, in order, each answered with its value or its errno (`crates/abi`). The terminal's file programs (ls, rm, chmod, setfacl...) are made of these, in the page (`crates/userland`) |
 | `POST /api/uploads?path=` `{size, sha256, overwrite, if_match}` | Start (or resume) a chunked upload; returns `{id, chunk_size, committed, hold}`, or 409 while another page holds it |
 | `PUT /api/uploads/chunk?id=&index=` with `X-Chunk-SHA256` and `X-Upload-Hold` | Send one chunk; sending it again replaces it |
 | `POST /api/uploads/hold?id=&hold=` / `POST /api/uploads/release?id=&hold=` | Keep the upload (every few seconds), or let go of it for another page to resume |

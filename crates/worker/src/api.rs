@@ -6,9 +6,7 @@ use crate::{auth, commands, devices, jobs, sound};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use terminal_worker_core::devices::{PRESENT, SOUND};
-use terminal_worker_core::{
-    CHUNK_SIZE, Listing, MAX_FILE, MAX_UPLOAD, mime, permissions::*, resolve,
-};
+use terminal_worker_core::{CHUNK_SIZE, MAX_FILE, MAX_UPLOAD, mime, permissions::*, resolve};
 use worker::*;
 
 /// How long an upload may go without a new chunk before it is cancelled, in seconds.
@@ -141,7 +139,6 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         Ok(p) => p,
         Err(e) => return Ok(Reply::error(&e, 400)),
     };
-    let flag = |name: &str| url.query_pairs().any(|(k, v)| k == name && v == "true");
     let param = |name: &str| {
         url.query_pairs()
             .find(|(k, _)| k == name)
@@ -216,38 +213,6 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             }
             Ok(Reply::ok(json!({ "results": results })))
         }
-        (Method::Get, "/api/stat") => {
-            let enter = flag("enter");
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                let real = real!(db, &who, &path, true);
-                let n = acl!(db.access(&who, &real, if enter { EXEC } else { 0 }), &who);
-                if enter && !n.directory {
-                    return Reply::error("Not a directory", 400);
-                }
-                let mut value = json!(commands::entry(db, &who, &path, &real, &n));
-                value["writable"] = json!(who.allows(&n, WRITE));
-                value["readable"] = json!(who.allows(&n, READ));
-                Reply::ok(value)
-            })
-        }
-        (Method::Get, "/api/ls") => run(state, move |db| {
-            let who = auth::identity(db, key.as_deref());
-            let real = real!(db, &who, &path, true);
-            let n = acl!(db.access(&who, &real, READ | EXEC), &who);
-            if !n.directory {
-                return Reply::error("Not a directory", 400);
-            }
-            let entries = commands::entries(db, &who, &real, &path, &db.children(&real));
-            Reply::ok(json!(Listing { path, entries }))
-        }),
-        (Method::Post, "/api/mkdir") => run(state, move |db| {
-            let who = auth::identity(db, key.as_deref());
-            let real = real!(db, &who, &path, false);
-            // Keep the original API's mkdir -p contract; CLI mkdir supports explicit -p.
-            acl!(db.mkdir(&who, &real, true), &who);
-            Reply::ok(json!({"path":path}))
-        }),
         // Presentations (devices.rs): what the account presents of the file at `path`, for the
         // bar of its pages showing it; start one of it, as `name`; stop one; and what one at
         // `path` (/dev/present/NAME) shows, to follow it.
@@ -322,28 +287,14 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let who = auth::identity(db, key.as_deref());
             Reply::ok(acl!(devices::attend(db, &who, &path), &who))
         }),
-        (Method::Delete, "/api/file") => {
-            let recursive = flag("recursive");
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                if path == "/" {
-                    return Reply::error("Cannot remove the root directory", 403);
-                }
-                let real = real!(db, &who, &path, false);
-                // A device stops (devices::remove); a directory removed ends those below it.
-                if let Some(stopped) = devices::remove(db, &who, &real) {
-                    acl!(stopped, &who);
-                    return Reply::ok(json!({"path":path}));
-                }
-                acl!(db.remove(&who, &real, recursive), &who);
-                devices::removed(db, &real);
-                Reply::ok(json!({"path":path}))
-            })
-        }
         (Method::Get, "/internal/read") => run(state, move |db| {
             let who = auth::identity(db, key.as_deref());
             let real = real!(db, &who, &path, true);
             let node = acl!(db.access(&who, &real, READ), &who);
+            // /etc/passwd and /etc/group are the kernel's to write as they are read.
+            if let Some(text) = crate::sys::generated(db, &real) {
+                return Reply::ok(json!({ "generated": text }));
+            }
             let Some(id) = node.file else {
                 return Reply::error("This is a directory", 400);
             };

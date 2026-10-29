@@ -648,6 +648,7 @@ impl TerminalAuthority {
         // /dev is there from the start, for storage made before it was too.
         transact(&self.state, |db| {
             devices::ensure(db);
+            crate::sys::ensure(db);
             ((), true)
         })?;
         self.ready.set(true);

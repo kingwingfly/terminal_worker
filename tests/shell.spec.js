@@ -1,11 +1,12 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { entry, listing, mkdirp, program, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 // Each test signs in as its own client, so that it does not use up others' login rate limit.
 let headers;
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
-const command = (request, args, cwd = '/') => request.post('/api/command', { headers, data: { args, cwd } });
+const command = (request, args, cwd = '/') => program(request, args, { cwd });
 let base;
 
 test.beforeEach(async ({ request, page }) => {
@@ -13,11 +14,11 @@ test.beforeEach(async ({ request, page }) => {
   headers = { Origin: origin, 'CF-Connecting-IP': 'shell-' + base };
   await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'shell-ui-' + base });
   expect((await request.post('/api/login', { headers, data: { password } })).ok()).toBe(true);
-  for (const dir of ['', '/docs', '/docs/deep', '/.hidden']) expect((await request.post('/api/mkdir?path=' + encodeURIComponent(base + dir), { headers })).ok()).toBe(true);
+  for (const dir of ['', '/docs', '/docs/deep', '/.hidden']) await mkdirp(request, base + dir);
   const files = { 'a.md': 'alpha\nbeta\n', 'docs/b.md': 'one\ntwo\nthree\n', 'docs/deep/spéctrum notes.md': 'γ\n', 'docs/c.txt': 'TODO later\ndone\nTODO now\n', '.hidden/d.md': 'x\n', 'x.tmp': '', 'y.tmp': '' };
   for (const [name, text] of Object.entries(files)) expect((await request.put(file(base + '/' + name), { headers, data: text || ' ' })).status()).toBe(201);
 });
-test.afterEach(async ({ request }) => { await request.delete(file(base) + '&recursive=true', { headers }); });
+test.afterEach(async ({ request }) => { await rmrf(request, base); });
 
 async function terminal(page) {
   await page.goto('/');
@@ -60,14 +61,14 @@ test('pipes join filters, fd finds what may be listed, and xargs and fd -x run c
   expect(await output(page, 'fd -x echo {} \\; tmp | sort')).toBe('x.tmp\ny.tmp');
   await run(page, 'rm -rf -f x.tmp');
   await run(page, 'fd -e tmp | xargs rm');
-  await expect.poll(async () => (await (await request.get('/api/ls?path=' + encodeURIComponent(base))).json()).entries.map(e => e.name)).toEqual(['.hidden', 'docs', 'a.md']);
+  await expect.poll(async () => (await listing(request, base)).map(e => e.name)).toEqual(['.hidden', 'docs', 'a.md']);
   // xargs with nothing to do still runs once, as GNU xargs does, unless -r.
   await run(page, 'fd -e none | xargs rm'); await expect(last(page)).toContainText('rm: missing PATH');
   expect(await output(page, 'fd -e none | xargs -r rm')).not.toContain('missing');
 });
 
 test('wildcards expand to sorted paths as bash expands them, and rm -rf * empties a directory', async ({ page, request }) => {
-  const names = async path => (await (await request.get('/api/ls?path=' + encodeURIComponent(base + path))).json()).entries.map(e => e.name).sort();
+  const names = async path => (await listing(request, base + path)).map(e => e.name).sort();
   await terminal(page);
   // Sorted, relative as typed, without hidden names, in every part of a path.
   expect(await output(page, 'echo *')).toBe('a.md docs x.tmp y.tmp');
@@ -144,33 +145,33 @@ test('mv and cp follow Linux defaults, ask with -i, share content, and refuse wh
   await run(page, 'mv -n docs/a.md copy/b.md');
   expect(await (await request.get(file(base + '/copy/b.md'))).text()).toBe('one\ntwo\nthree\n');
   await run(page, 'mv -i docs/a.md copy/b.md');
-  await expect(last(page)).toContainText("overwrite '" + base + "/copy/b.md'? (y/n)");
+  await expect(last(page)).toContainText("mv: overwrite 'copy/b.md'?");
   await expect(page.locator('.terminal-panel:not([hidden]) .busy')).toHaveText('Answer ↵');
   await page.locator('#command').fill('n'); await page.locator('#command').press('Enter');
   await expect(page.locator('.terminal-panel:not([hidden]) .busy')).toHaveText('↵');
   expect((await request.head(file(base + '/docs/a.md'))).status()).toBe(200);
   await run(page, 'mv -iv docs/a.md copy/b.md'); await expect(page.locator('.terminal-panel:not([hidden]) .busy')).toHaveText('Answer ↵');
   await page.locator('#command').fill('y'); await page.locator('#command').press('Enter');
-  await expect(last(page)).toContainText("renamed '" + base + "/docs/a.md' -> '" + base + "/copy/b.md'");
+  await expect(last(page)).toContainText("renamed 'docs/a.md' -> 'copy/b.md'");
   expect(await (await request.get(file(base + '/copy/b.md'))).text()).toBe('alpha\nbeta\n');
   // Long options, and one given again, are kept for the replacement.
   await run(page, 'cp -f --interactive docs/b.md copy/b.md'); await expect(page.locator('.terminal-panel:not([hidden]) .busy')).toHaveText('Answer ↵');
   await page.locator('#command').fill('y'); await page.locator('#command').press('Enter');
   await expect(page.locator('.terminal-panel:not([hidden]) .busy')).toHaveText('↵');
   expect(await (await request.get(file(base + '/copy/b.md'))).text()).toBe('one\ntwo\nthree\n');
-  for (const [line, message] of [['mv docs docs/inner', 'into itself'], ['cp docs docs-flat', '-r not specified'], ['mv . elsewhere', 'current directory'], ['cp -r copy copy/again', 'into itself'], ['mv /home elsewhere', 'home']]) {
+  for (const [line, message] of [['mv docs docs/inner', 'subdirectory of itself'], ['cp docs docs-flat', '-r not specified'], ['mv . elsewhere', 'Device or resource busy'], ['cp -r copy copy/again', 'into itself'], ['mv /root elsewhere', '/root holds the home of root']]) {
     await run(page, line); await expect(last(page)).toContainText(message);
   }
   // Several sources need a directory; each failure is reported while the others proceed.
-  await run(page, 'mv docs/b.md copy/deep copy/b.md'); await expect(last(page)).toContainText("target '" + base + "/copy/b.md' is not a directory");
+  await run(page, 'mv docs/b.md copy/deep copy/b.md'); await expect(last(page)).toContainText("mv: target 'copy/b.md' is not a directory");
   await run(page, 'rm copy/b.md nothing.md copy/deep');
-  await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText('Removed ' + base + '/copy/b.md');
-  await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText('does not exist');
-  await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText('use rm -r DIR');
-  // Batches run each command on its own, in order.
-  const batch = await (await request.post('/api/command', { headers, data: { batch: [{ args: ['touch', base + '/n1'] }, { args: ['rm', base + '/missing'] }, { args: ['touch', base + '/n2'] }] } })).json();
-  expect(batch.results.map(r => r.status)).toEqual([200, 404, 200]);
-  expect((await (await command(request, ['ls', base])).json()).entries.map(e => e.name)).toEqual(expect.arrayContaining(['n1', 'n2']));
+  await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText("rm: cannot remove 'nothing.md': No such file or directory");
+  await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText("rm: cannot remove 'copy/deep': Is a directory");
+  expect(await entry(request, base + '/copy/b.md')).toBe(null);
+  // A batch of system calls runs each on its own, in order.
+  const batch = await sys(request, [{ mknod: { path: base + '/n1', mode: 0o666 } }, { unlink: { path: base + '/missing' } }, { mknod: { path: base + '/n2', mode: 0o666 } }]);
+  expect(batch).toEqual([{ ok: null }, { err: { errno: 'ENOENT' } }, { ok: null }]);
+  expect((await listing(request, base)).map(e => e.name)).toEqual(expect.arrayContaining(['n1', 'n2']));
 });
 
 test('tabs run at once with their own directory and history, and Ctrl+C stops a tab between steps', async ({ page, request }) => {
@@ -212,6 +213,7 @@ test('cp and mv -i ask as well under sudo, xargs and fd -x, about each file they
   const transcript = page.locator('.terminal-panel:not([hidden]) .transcript');
   const answer = async text => { await expect(busy).toHaveText('Answer ↵'); await page.locator('#command').fill(text); await page.locator('#command').press('Enter'); };
   const read = async path => (await request.get(file(base + '/' + path), { headers })).text();
+  // cp, still the server's, asks of the path; mv, user space's, as GNU's does, of the name given.
   const asked = path => `overwrite '${base}/${path}'? (y/n)`;
   // xargs and fd -x run each cp -i on its own, which asks: no keeps the file, yes replaces it.
   await run(page, 'echo a.md | xargs -I {} cp -i {} docs/b.md');
@@ -223,9 +225,9 @@ test('cp and mv -i ask as well under sudo, xargs and fd -x, about each file they
   expect(await read('docs/b.md')).toBe('TODO later\ndone\nTODO now\n');
   // sudo asks too, and replaces as root.
   await run(page, 'sudo mv -iv a.md docs/b.md');
-  await expect(transcript).toContainText('mv: ' + asked('docs/b.md'));
+  await expect(transcript).toContainText("mv: overwrite 'docs/b.md'?");
   await answer('y'); await expect(busy).toHaveText('↵');
-  await expect(last(page)).toContainText(`renamed '${base}/a.md' -> '${base}/docs/b.md'`);
+  await expect(last(page)).toContainText("renamed 'a.md' -> 'docs/b.md'");
   expect(await read('docs/b.md')).toBe('alpha\nbeta\n');
   // cp -ri asks about each file below that exists, and copies the others.
   await run(page, 'cp -r docs copy'); await expect(busy).toHaveText('↵');

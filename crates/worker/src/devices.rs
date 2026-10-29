@@ -422,13 +422,6 @@ pub fn remove(db: &mut Db, who: &Identity, path: &str) -> Option<Result<Value, S
     Some(stop(db, who, directory, name, None, None))
 }
 
-/// End the devices below `directory`, which `rm -r` removed.
-pub fn removed(db: &mut Db, directory: &str) {
-    for device in db.devices_under(directory) {
-        end(db, &device);
-    }
-}
-
 /// What the account `who` presents of the file at `path`, for its pages' bar: who it is (none
 /// for guest, who presents nothing), its presentations of it, the listeners speaking in them, and those asking to (`asks`, as the
 /// lines say: presentation, ask, name).
