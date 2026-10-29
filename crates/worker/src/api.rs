@@ -308,11 +308,8 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 }
             })
         }
-        (_, endpoint)
-            if endpoint.starts_with("/api/jobs") || endpoint.starts_with("/internal/job") =>
-        {
+        (_, endpoint) if endpoint.starts_with("/internal/job") => {
             let id = param("id");
-            let since = param("since").parse::<u64>().unwrap_or(0);
             let body: Value = if matches!(method, Method::Post) {
                 req.json().await.unwrap_or_default()
             } else {
@@ -323,12 +320,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 let method = method.clone();
                 let upload = param("upload");
                 let file = param("file");
-                move |db| {
-                    let who = auth::identity(db, key.as_deref());
-                    job_reply(
-                        db, &who, &method, &endpoint, &id, since, &upload, &file, body,
-                    )
-                }
+                move |db| job_reply(db, &method, &endpoint, &id, &upload, &file, body)
             })?;
             kick(env, &reply.body).await;
             Ok(reply)
@@ -340,74 +332,22 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
     }
 }
 
-/// The jobs' endpoints: `/api/jobs` for their owners, `/internal/job` for their runners, which
-/// act as the job's account.
+/// The jobs' endpoints for their runners, which act as the job's account: a process's own way to
+/// the kernel (its owners reach it by the process calls, jobs::call).
 #[allow(clippy::too_many_arguments)]
 fn job_reply(
     db: &mut Db,
-    who: &Identity,
     method: &Method,
     endpoint: &str,
     id: &str,
-    since: u64,
     upload: &str,
     file: &str,
     body: Value,
 ) -> Reply {
     use crate::db::JobColumn;
-    if (method, endpoint) == (&Method::Get, "/api/jobs") && id.is_empty() {
-        let jobs: Vec<Value> = db
-            .jobs_of(who.id, 20)
-            .iter()
-            .map(|job| {
-                let mut view = jobs::view(db, job, u64::MAX);
-                view["command"] = jobs::Spec::of(job)
-                    .map(|s| json!(s.command))
-                    .unwrap_or_default();
-                view
-            })
-            .collect();
-        return Reply::ok(json!({ "jobs": jobs }));
-    }
     let Some(job) = db.job(id) else {
         return Reply::error("Job does not exist", 404);
     };
-    if endpoint.starts_with("/api/jobs") {
-        if who.id != job.owner && who.id != 0 {
-            return denied(
-                "Permission denied: this job belongs to another account",
-                who,
-            );
-        }
-        return match (method, endpoint) {
-            (Method::Get, "/api/jobs") => Reply::ok(jobs::view(db, &job, since)),
-            (Method::Delete, "/api/jobs") if job.finished() => {
-                Reply::ok(json!({"state": job.state}))
-            }
-            (Method::Delete, "/api/jobs") => {
-                db.set_job(id, JobColumn::State, Some("cancelling"));
-                Reply::ok(json!({"job": id, "state": "cancelling"}))
-            }
-            (Method::Post, "/api/jobs/answer") if job.state == "question" => {
-                let Ok(mut spec) = jobs::Spec::of(&job) else {
-                    return Reply::error("The job cannot be read", 500);
-                };
-                spec.decisions = serde_json::from_value(body["decisions"].clone()).ok();
-                if spec.decisions.is_none() {
-                    return Reply::error("Answer with {\"decisions\": {PATH: true|false}}", 400);
-                }
-                db.set_job(id, JobColumn::Spec, Some(&json!(spec).to_string()));
-                db.set_job(id, JobColumn::Question, None);
-                db.set_job(id, JobColumn::State, Some("queued"));
-                db.set_expiry("job", id, auth::now() + jobs::WAITING);
-                Reply::ok(json!({"job": id, "state": "queued"}))
-            }
-            (Method::Post, "/api/jobs/answer") => {
-                Reply::error("The job is not waiting for an answer", 409)
-            }
-            _ => Reply::error("Unknown endpoint or unsupported request method", 404),
-        };
-    }
     // The runner's requests, as the job's account.
     if (method, endpoint) == (&Method::Get, "/internal/job") {
         return Reply::ok(json!(job));
@@ -622,8 +562,7 @@ fn command_reply(db: &mut Db, key: Option<&str>, mut command: commands::Command)
     let actor = acl!(auth::elevated(db, key, command.sudo), &who);
     // `~` is the signed-in account's home, also under sudo, as the shell expands it before sudo.
     command.home = db.user_by_id(who.id).map(|(_, user)| user.home);
-    // zip, unzip, tar and faststart start a job, whose owner is who is signed in.
-    match commands::execute(db, &actor, who.id, command) {
+    match commands::execute(db, &actor, command) {
         Ok(value) => Reply::ok(value),
         Err(e) => denied(&e, &who),
     }

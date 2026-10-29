@@ -176,6 +176,8 @@ pub static DEFINITIONS: &[&dyn Definition] = &[
     &Def::<archives::Tar>::NEW,
     &Def::<archives::Faststart>::NEW,
     &Def::<archives::Jobs>::NEW,
+    &Def::<archives::Ps>::NEW,
+    &Def::<archives::Kill>::NEW,
 ];
 
 /// Every command's name, in the order of [`DEFINITIONS`].

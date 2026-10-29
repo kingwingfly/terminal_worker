@@ -410,31 +410,70 @@ impl Shell {
         Ok(out)
     }
     async fn manage(self, args: &[String], piped: bool) -> Result<Output, String> {
-        let value = self.call(args).await?;
-        // zip, unzip and tar start a job on the server; the tab follows it.
-        if let Some(job) = value["job"].as_str() {
-            return self.follow(job, piped).await;
+        let sudo = args.first().is_some_and(|a| a == "sudo");
+        let argv = &args[usize::from(sudo)..];
+        // zip, unzip, tar and faststart are processes (spawn), done apart; the tab follows one.
+        if matches!(
+            argv.first().map(String::as_str),
+            Some("zip" | "unzip" | "tar" | "faststart")
+        ) {
+            cli::check(argv)?;
+            if sudo
+                && JsFuture::from(crate::sudo())
+                    .await
+                    .map_err(js_message)?
+                    .as_bool()
+                    != Some(true)
+            {
+                return Err("sudo canceled".into());
+            }
+            let sys = crate::sys::HttpSys {
+                sudo,
+                ..Default::default()
+            };
+            let spawn = abi::Call::Spawn {
+                argv: argv.to_vec(),
+                cwd: self.cwd.get_untracked(),
+            };
+            let spawned: Value = userland::sys::call(&sys, spawn)
+                .await
+                .map_err(|error| error.to_string())?;
+            let pid = spawned["pid"].as_str().unwrap_or_default().to_string();
+            return self.follow(&pid, piped).await;
         }
+        let value = self.call(args).await?;
         let out = self.output(&value, piped)?;
         self.refresh().await?;
         Ok(out)
     }
-    /// Follow the job `id` to its end: write its lines as they come, answer its question in
-    /// this tab, and cancel it on Ctrl+C.
+    /// Follow the process `id` to its end: write its lines as they come, answer its question in
+    /// this tab (its stdin), and signal it on Ctrl+C.
     async fn follow(self, id: &str, piped: bool) -> Result<Output, String> {
+        use abi::Call;
+        let sys = crate::sys::HttpSys::default();
         let mut out = Output::default();
         let mut since = 0;
         let mut cancelling = false;
         loop {
-            // A closed tab stops following; the job goes on, and jobs lists it.
+            // A closed tab stops following; the process goes on, and jobs lists it.
             if self.detached.get_untracked() {
                 return Ok(out);
             }
             if self.cancelled() && !cancelling {
                 cancelling = true;
-                request(&format!("/api/jobs?id={id}"), "DELETE").await?;
+                userland::sys::call::<Value>(&sys, Call::Kill { pid: id.into() })
+                    .await
+                    .map_err(|error| error.to_string())?;
             }
-            let view = request(&format!("/api/jobs?id={id}&since={since}"), "GET").await?;
+            let view: Value = userland::sys::call(
+                &sys,
+                Call::Wait {
+                    pid: id.into(),
+                    since,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             for line in view["lines"].as_array().into_iter().flatten() {
                 since = line[0].as_u64().unwrap_or(since);
                 let text = line[2].as_str().unwrap_or_default();
@@ -447,7 +486,7 @@ impl Shell {
                     self.log(text);
                 }
             }
-            // A page at a time: what a job wrote before it ended is all read before it is
+            // A page at a time: what a process wrote before it ended is all read before it is
             // taken to have ended.
             if view["more"] == true {
                 continue;
@@ -466,12 +505,13 @@ impl Shell {
                     if self.cancelled() {
                         continue;
                     }
-                    let body = json!({"decisions": decisions});
-                    let request =
-                        gloo_net::http::Request::post(&format!("/api/jobs/answer?id={id}"))
-                            .json(&body)
-                            .map_err(|e| e.to_string())?;
-                    request.send().await.map_err(|e| e.to_string())?;
+                    let answer = Call::Write {
+                        pid: id.into(),
+                        data: json!({ "decisions": decisions }),
+                    };
+                    userland::sys::call::<Value>(&sys, answer)
+                        .await
+                        .map_err(|error| error.to_string())?;
                     continue;
                 }
                 _ => {}
@@ -523,9 +563,10 @@ impl Shell {
     /// upload, removed if it was making the file.
     async fn jobs(self, cancel: Option<&str>) -> Result<Output, String> {
         use abi::{Call, Fd, O_APPEND};
-        let value = request("/api/jobs", "GET").await?;
-        let jobs = value["jobs"].as_array().cloned().unwrap_or_default();
         let sys = crate::sys::HttpSys::default();
+        let jobs: Vec<Value> = userland::sys::call(&sys, Call::Ps)
+            .await
+            .unwrap_or_default();
         let fds: Vec<Fd> = userland::sys::call(&sys, Call::Fds)
             .await
             .unwrap_or_default();
@@ -577,7 +618,9 @@ impl Shell {
                 let starts = |v: &Value| v["id"].as_str().is_some_and(|id| id.starts_with(wanted));
                 if let Some(job) = jobs.iter().find(|j| starts(j)) {
                     let id = job["id"].as_str().unwrap_or_default();
-                    request(&format!("/api/jobs?id={id}"), "DELETE").await?;
+                    userland::sys::call::<Value>(&sys, Call::Kill { pid: id.into() })
+                        .await
+                        .map_err(|error| error.to_string())?;
                     Ok(Output::text(format!("Cancelling job {}\n", &id[..8])))
                 } else if let Some(fd) = fds.iter().find(|fd| format!("fd{}", fd.fd) == wanted) {
                     let mut calls = vec![Call::Close { fd: fd.fd }];

@@ -75,7 +75,12 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
         | Call::Close { .. }
         | Call::Lease { .. }
         | Call::Fds
-        | Call::Ioctl { .. } => Err(Errno::ENOSYS.into()),
+        | Call::Ioctl { .. }
+        | Call::Spawn { .. }
+        | Call::Ps
+        | Call::Kill { .. }
+        | Call::Wait { .. }
+        | Call::Write { .. } => Err(Errno::ENOSYS.into()),
         Call::Stat { path } => stat(fs, cred, &path, true).map(|stat| json!(stat)),
         Call::Lstat { path } => stat(fs, cred, &path, false).map(|stat| json!(stat)),
         Call::Getdents { path } => getdents(fs, cred, &path).map(|entries| json!(entries)),

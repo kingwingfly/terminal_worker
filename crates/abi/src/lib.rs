@@ -447,6 +447,32 @@ pub enum Call {
     },
     /// The session's descriptors.
     Fds,
+    /// A process of the session's account (zip, unzip, tar, faststart), run as the caller
+    /// (root under sudo), from `cwd`: its pid. Its work is done apart (a container), reading
+    /// and writing as it.
+    Spawn {
+        argv: Vec<String>,
+        cwd: String,
+    },
+    /// The account's processes, the latest first.
+    Ps,
+    /// Signal the process `pid`: it stops, between steps (SIGTERM).
+    Kill {
+        pid: String,
+    },
+    /// What the process `pid` is now, and what it wrote after line `since`, as waitid(2) with
+    /// WNOHANG and a read of its output: its state (`running`, `question`, `done`, `failed`,
+    /// `cancelled`), progress, question and new lines.
+    Wait {
+        pid: String,
+        #[serde(default)]
+        since: u64,
+    },
+    /// Write to the process `pid`'s standard input: unzip's answers to its question.
+    Write {
+        pid: String,
+        data: serde_json::Value,
+    },
     /// A request of the file or device `fd` reads or writes, about `arg`: FICLONE's the
     /// descriptor cloned from; a driver's, what its request takes.
     Ioctl {

@@ -51,6 +51,12 @@ pub async fn handle(
             });
             continue;
         }
+        // A process spawned, signalled or answered: its runner wakes.
+        let wakes = match &call {
+            Call::Kill { pid } | Call::Write { pid, .. } => Some(pid.clone()),
+            Call::Spawn { .. } => Some(String::new()),
+            _ => None,
+        };
         let result = transact(state, move |db| {
             // A descriptor call stands as it ends, failed or not: a close that fails closes.
             let descriptors = matches!(
@@ -66,6 +72,10 @@ pub async fn handle(
             };
             (result, commit)
         })?;
+        if let (Some(pid), Return::Ok(value)) = (wakes, &result) {
+            let pid = value["pid"].as_str().map(str::to_string).unwrap_or(pid);
+            crate::api::kick(env, &json!({ "job": pid })).await;
+        }
         results.push(result);
     }
     Ok(Reply::ok(json!(Results { results })))
@@ -108,6 +118,18 @@ fn run(
             rdev: Some(rdev),
         } => crate::dev::mknod(db, &process, &path, mode, &rdev).map(|()| serde_json::Value::Null),
         Call::Getcreds => Ok(json!(creds(db, key, &process.cred))),
+        call @ (Call::Spawn { .. }
+        | Call::Ps
+        | Call::Kill { .. }
+        | Call::Wait { .. }
+        | Call::Write { .. }) => {
+            let account = auth::identity(db, key);
+            let home = db
+                .user_by_id(account.id)
+                .map(|(_, user)| user.home)
+                .unwrap_or_else(|| "/".into());
+            crate::jobs::call(db, account.id, &home, &process, call)
+        }
         call @ (Call::Open { .. }
         | Call::Close { .. }
         | Call::Lease { .. }

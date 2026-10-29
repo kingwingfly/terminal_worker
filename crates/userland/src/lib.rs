@@ -12,6 +12,7 @@ mod find;
 pub mod io;
 mod names;
 mod perms;
+mod procs;
 pub mod sys;
 pub mod walk;
 
@@ -22,7 +23,7 @@ pub use sys::Sys;
 /// The programs of user space.
 pub const PROGRAMS: &[&str] = &[
     "ls", "stat", "mkdir", "rmdir", "rm", "mv", "cp", "ln", "readlink", "realpath", "touch",
-    "chmod", "chown", "chgrp", "getfacl", "setfacl", "getfattr", "setfattr", "fd",
+    "chmod", "chown", "chgrp", "getfacl", "setfacl", "getfattr", "setfattr", "fd", "ps", "kill",
 ];
 
 /// Run the program `io.args[0]`, with what `io` gives it: its exit status, as a shell sees it;
@@ -49,6 +50,8 @@ pub async fn run(sys: &impl Sys, io: &mut Io<'_>) -> Option<i32> {
         "getfattr" => perms::getfattr(sys, io).await,
         "setfattr" => perms::setfattr(sys, io).await,
         "fd" => find::fd(sys, io).await,
+        "ps" => procs::ps(sys, io).await,
+        "kill" => procs::kill(sys, io).await,
         _ => return None,
     };
     Some(status)

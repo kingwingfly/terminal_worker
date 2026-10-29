@@ -3,7 +3,6 @@
 //! help, are their definitions in [`terminal_worker_core::cli`].
 
 pub(crate) mod accounts;
-mod archives;
 
 use crate::db::Db;
 use serde::Deserialize;
@@ -133,9 +132,6 @@ pub struct Context<'a> {
     pub db: &'a mut Db,
     /// Who it acts as: root under sudo.
     pub who: &'a Identity,
-    /// The account signed in, whose a job is.
-    pub owner: u32,
-    pub command: &'a Command,
     /// Its arguments, after its name.
     pub args: &'a [String],
     /// What failed of what a command does several of (paths, mostly): each is reported, and
@@ -164,10 +160,6 @@ pub static COMMANDS: &[&dyn ServerCommand] = &[
     &accounts::Groupadd,
     &accounts::Groupmod,
     &accounts::Groupdel,
-    &archives::Job("zip"),
-    &archives::Job("unzip"),
-    &archives::Job("tar"),
-    &archives::Job("faststart"),
 ];
 
 /// The command named `name`, if the server runs it.
@@ -176,7 +168,7 @@ pub fn find(name: &str) -> Option<&'static dyn ServerCommand> {
 }
 
 /// Run `command` as `who` for the account `owner`.
-pub fn execute(db: &mut Db, who: &Identity, owner: u32, command: Command) -> Result<Value, String> {
+pub fn execute(db: &mut Db, who: &Identity, command: Command) -> Result<Value, String> {
     let (name, args) = command.args.split_first().ok_or("Missing command")?;
     let Some(runner) = find(name) else {
         return Err(
@@ -186,8 +178,6 @@ pub fn execute(db: &mut Db, who: &Identity, owner: u32, command: Command) -> Res
     let mut ctx = Context {
         db,
         who,
-        owner,
-        command: &command,
         args,
         errors: Vec::new(),
         succeeded: false,

@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { crc32 } from 'node:zlib';
-import { listing, mkdirp, program, put, rmrf } from './sys.js';
+import { call, errno, listing, mkdirp, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -92,6 +92,39 @@ test('zip, unzip and tar round-trip files, names and modes through the container
   await run(page, 'tar -cf notes.tgz docs/a.md'); await run(page, 'tar -tf notes.tgz');
   await expect(transcript(page).locator('pre').last()).toHaveText('docs/a.md');
   await run(page, 'jobs'); await expect(transcript(page).locator('pre').last()).toContainText('done');
+});
+
+test('a job is a process: spawned, waited for, listed by ps, asked on its stdin, and signalled by kill', async ({ page, request }) => {
+  const O = { cwd: base };
+  // spawn runs it apart, as the caller; wait reads what it wrote, and how it ended.
+  const { pid } = await call(request, { spawn: { argv: ['zip', '-r', 'docs.zip', 'docs'], ...O } });
+  const finished = async () => {
+    let state;
+    await expect.poll(async () => (state = await call(request, { wait: { pid } })).state, { timeout: 120_000 }).toMatch(/^(done|failed|cancelled)$/);
+    return state;
+  };
+  expect((await finished()).state).toBe('done');
+  expect((await ls(request, base)).map(entry => entry.name)).toContain('docs.zip');
+  expect((await call(request, 'ps')).map(process => process.pid)).toContain(pid);
+  // A question goes to its stdin: unzip asks before replacing what is there.
+  const asking = (await call(request, { spawn: { argv: ['unzip', 'docs.zip'], ...O } })).pid;
+  await expect.poll(async () => (await call(request, { wait: { pid: asking } })).state, { timeout: 120_000 }).toBe('question');
+  const { question } = await call(request, { wait: { pid: asking } });
+  const decisions = Object.fromEntries(question.replace.map(path => [path, false]));
+  expect((await call(request, { write: { pid: asking, data: { decisions } } })).state).toBe('queued');
+  await expect.poll(async () => (await call(request, { wait: { pid: asking } })).state, { timeout: 120_000 }).toBe('done');
+  // Only programs are spawned; signals go to what is there, and its owner's (or root's).
+  expect(await errno(request, { spawn: { argv: ['sh', '-c', 'true'], ...O } })).toBe('ENOENT');
+  expect(await errno(request, { kill: { pid: 'f'.repeat(32) } })).toBe('ESRCH');
+  const stranger = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'archive-stranger-' + base } });
+  try { expect(await errno(stranger, { kill: { pid } })).toBe('EPERM'); }
+  finally { await stranger.dispose(); }
+  // ps and kill, in the terminal, as procps' are.
+  await terminal(page);
+  await run(page, 'ps');
+  await expect(transcript(page).locator('pre').last()).toContainText(`${pid.slice(0, 8)}  done        zip`);
+  await run(page, 'kill ffffffff');
+  await expect(transcript(page).locator('pre').last()).toContainText('kill: (ffffffff) - No such process');
 });
 
 test('unzip asks before replacing, -o and -n decide, tar -k keeps, and hostile members are skipped', async ({ page, request }) => {

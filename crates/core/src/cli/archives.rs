@@ -217,3 +217,36 @@ impl Manual for Jobs {
     ];
     const SEE: &'static [&'static str] = &["zip", "unzip", "tar", "upload"];
 }
+
+/// list the account's processes
+///
+/// Lists your processes, the zip, unzip, tar and faststart you started, from any tab or device,
+/// the latest first: its PID, state and command. They run apart, and go on when their tab or
+/// the page closes.
+#[derive(Parser, Debug)]
+#[command(name = "ps")]
+pub struct Ps {}
+impl Manual for Ps {
+    const SECTION: Section = Section::Archives;
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("ps", "what runs, and what ran"),
+        ("ps | grep unzip", "the unzips"),
+    ];
+    const SEE: &'static [&'static str] = &["kill", "jobs"];
+}
+
+/// stop a process
+///
+/// Signals each process named by its PID (or the start of it, as ps shows it), which stops
+/// between steps: what it wrote is kept. Yours, or anyone's as root.
+#[derive(Parser, Debug)]
+#[command(name = "kill")]
+pub struct Kill {
+    #[arg(value_name = "PID", required = true)]
+    pub pids: Vec<String>,
+}
+impl Manual for Kill {
+    const SECTION: Section = Section::Archives;
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[("kill 3fa9", "stop it")];
+    const SEE: &'static [&'static str] = &["ps", "jobs"];
+}

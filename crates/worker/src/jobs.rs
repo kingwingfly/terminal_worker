@@ -477,3 +477,95 @@ pub fn finish(db: &mut Db, job: &str, state: &str) {
     db.unpin(job);
     db.clear_expiry("job", job);
 }
+
+/// The process calls (owner's design, 2026-10-29): a job is a process of the account signed in
+/// (`owner`), run as `process` (root under sudo).
+pub fn call(
+    db: &mut Db,
+    owner: u32,
+    home: &str,
+    process: &kernel::Process,
+    call: abi::Call,
+) -> std::result::Result<Value, abi::Error> {
+    use crate::db::JobColumn;
+    use abi::{Call, Errno, Error};
+    let refused = |why: String| {
+        let errno = if commands::is_permission_error(&why) {
+            Errno::EACCES
+        } else {
+            Errno::EINVAL
+        };
+        Error::because(errno, why)
+    };
+    // Its owner's, or root's, to see and signal.
+    let theirs = |db: &Db, pid: &str| -> std::result::Result<Job, Error> {
+        let job = db.job(pid).ok_or(Errno::ESRCH)?;
+        if job.owner != owner && process.cred.id != 0 {
+            return Err(Errno::EPERM.into());
+        }
+        Ok(job)
+    };
+    match call {
+        Call::Spawn { argv, cwd } => {
+            if !matches!(
+                argv.first().map(String::as_str),
+                Some("zip" | "unzip" | "tar" | "faststart")
+            ) {
+                return Err(Errno::ENOENT.into());
+            }
+            let command = commands::Command {
+                args: argv,
+                cwd,
+                sudo: process.cred.id == 0,
+                home: Some(home.to_string()),
+            };
+            let started = start(db, &process.cred, owner, &command).map_err(refused)?;
+            Ok(json!({ "pid": started["job"], "kind": started["kind"] }))
+        }
+        Call::Ps => Ok(json!(
+            db.jobs_of(owner, 20)
+                .iter()
+                .map(|job| {
+                    let mut view = view(db, job, u64::MAX);
+                    view["pid"] = json!(job.id);
+                    view["command"] = Spec::of(job).map(|s| json!(s.command)).unwrap_or_default();
+                    view
+                })
+                .collect::<Vec<_>>()
+        )),
+        Call::Kill { pid } => {
+            let job = theirs(db, &pid)?;
+            if !job.finished() {
+                db.set_job(&pid, JobColumn::State, Some("cancelling"));
+            }
+            Ok(json!({ "pid": pid, "state": db.job(&pid).map(|job| job.state) }))
+        }
+        Call::Wait { pid, since } => {
+            let job = theirs(db, &pid)?;
+            Ok(view(db, &job, since))
+        }
+        Call::Write { pid, data } => {
+            let job = theirs(db, &pid)?;
+            if job.state != "question" {
+                return Err(Error::because(
+                    Errno::EAGAIN,
+                    "the process is not waiting for an answer",
+                ));
+            }
+            let mut spec = Spec::of(&job).map_err(|why| Error::because(Errno::EIO, why))?;
+            spec.decisions = serde_json::from_value(data["decisions"].clone()).ok();
+            if spec.decisions.is_none() {
+                return Err(Error::because(
+                    Errno::EINVAL,
+                    "answer with {\"decisions\": {PATH: true|false}}",
+                ));
+            }
+            db.set_job(&pid, JobColumn::Spec, Some(&json!(spec).to_string()));
+            db.set_job(&pid, JobColumn::Question, None);
+            db.set_job(&pid, JobColumn::State, Some("queued"));
+            db.set_expiry("job", &pid, crate::auth::now() + WAITING);
+            Ok(json!({ "pid": pid, "state": "queued" }))
+        }
+        _ => Err(Errno::ENOSYS.into()),
+    }
+}
