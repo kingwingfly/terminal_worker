@@ -102,7 +102,7 @@ test('a visitor makes an account in /guest, which is sticky, and shares files wi
   await expect(busy(page)).toHaveText('↵');
   // Signed out, one is guest, a real account in group guest.
   expect(await output(page, 'id')).toBe('uid=65534(guest) gid=65534(guest) groups=65534(guest)');
-  await page.locator('#command').fill('useradd ' + ada); await page.locator('#command').press('Enter');
+  await page.locator('#command').fill('useradd -m ' + ada); await page.locator('#command').press('Enter');
   await expect(page.locator('#auth-title')).toHaveText('Create account ' + ada);
   await page.getByLabel('New password', { exact: true }).fill(pass); await page.getByLabel('Confirm new password').fill(pass);
   await page.locator('#auth button[type=submit]').click();

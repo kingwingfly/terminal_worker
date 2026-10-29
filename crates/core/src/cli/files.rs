@@ -97,6 +97,94 @@ impl Manual for Open {
     const SEE: &'static [&'static str] = &["vim", "cat"];
 }
 
+/// present slides or a PDF for others to follow
+///
+/// Shows FILE, slides (*.slides.md, or Markdown) or a PDF presented a page at a time, and makes
+/// /dev/present/NAME, a link to it. Whoever may read FILE follows the presentation with
+/// `open /dev/present/NAME`, guests too: each sees the slide shown here as it turns, until they
+/// turn elsewhere themselves, which pauses following until they follow again. Your own windows
+/// and devices turn it, as remotes, and open it where it is. Presenting again under the same
+/// name takes over your presentation of it.
+///
+/// It lasts until present --stop NAME, or 12 hours after its last turn. Guests cannot present:
+/// guest is everyone signed out, who could all turn the slides.
+#[derive(Parser, Debug)]
+#[command(name = "present")]
+pub struct Present {
+    /// the presentation's name, /dev/present/NAME; by default, FILE's name without its extension
+    #[arg(short = 'n', long = "name", value_name = "NAME")]
+    pub name: Option<String>,
+    /// end the presentation NAME
+    #[arg(short = 's', long = "stop", value_name = "NAME", conflicts_with_all = ["name", "file"])]
+    pub stop: Option<String>,
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE", required_unless_present = "stop")]
+    pub file: Option<String>,
+}
+impl Manual for Present {
+    const SECTION: Section = Section::Files;
+    const NEEDS: &'static str =
+        "r on FILE and an account of your own. Following it needs r on FILE.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("present talk.slides.md", "shows it, as /dev/present/talk"),
+        (
+            "open /dev/present/talk",
+            "follows it, from anywhere FILE may be read",
+        ),
+        ("present --stop talk", "ends it"),
+    ];
+    const SEE: &'static [&'static str] = &["open"];
+}
+
+/// send the microphone live, and record it into a file
+///
+/// Signed in, the sound is live as /dev/snd/NAME: whoever may hear it does with
+/// open /dev/snd/NAME, guests too, and whoever follows a presentation of the same name,
+/// /dev/present/NAME, hears it with the slides. Ctrl+C stops it. Live sound needs the site's
+/// Cloudflare Realtime app.
+///
+/// With FILE, the sound is also recorded into it, a new file: Opus in WebM (.weba or .webm),
+/// which every browser records. FILE grows as you speak, and may be read meanwhile; when stopped,
+/// it is complete, and a recording whose page goes away keeps what arrived. Those who may read
+/// FILE may hear the sound. Without the Realtime app, stream only records.
+///
+/// Without FILE, nothing is kept: /dev/snd/NAME is a file of its own, yours, and those who may
+/// read it may hear the sound.
+///
+/// -m gives entries as setfacl -m takes them to what decides who may hear, FILE or
+/// /dev/snd/NAME, as it is made: -m o::- lets no one else hear, -m u:ada:r,o::- only ada.
+#[derive(Parser, Debug)]
+#[command(name = "stream")]
+pub struct Stream {
+    /// the live sound's name, /dev/snd/NAME; with FILE, by default, FILE's name without its
+    /// extension
+    #[arg(
+        short = 'n',
+        long = "name",
+        value_name = "NAME",
+        required_unless_present = "file"
+    )]
+    pub name: Option<String>,
+    /// ACL entries, as setfacl -m takes them, for FILE, or /dev/snd/NAME without it
+    #[arg(short = 'm', long = "modify", value_name = "ENTRIES")]
+    pub modify: Vec<String>,
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE")]
+    pub file: Option<String>,
+}
+impl Manual for Stream {
+    const SECTION: Section = Section::Files;
+    const NEEDS: &'static str = "a microphone; live, an account of your own; with FILE, w and x on its directory. Hearing it, r on FILE, or on /dev/snd/NAME without FILE.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        (
+            "stream talk.weba",
+            "records into talk.weba, live as /dev/snd/talk",
+        ),
+        ("stream -n talk", "live as /dev/snd/talk, kept nowhere"),
+        ("stream -n talk -m o::-,g:lab:r", "only group lab hears it"),
+        ("open /dev/snd/talk", "hears it"),
+    ];
+    const SEE: &'static [&'static str] = &["present", "open"];
+}
+
 /// edit a text file
 ///
 /// Opens a floating editor with highlighting for Markdown, Rust, Python, JS/TS, JSON, HTML/CSS,

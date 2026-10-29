@@ -29,6 +29,21 @@ extern "C" {
     fn saved_place(path: &str) -> JsValue;
     #[wasm_bindgen(js_namespace = terminal, js_name = setPlace)]
     fn save_place(path: &str, value: JsValue);
+    /// Tell this browser's other windows, and the account's pages signed in elsewhere, that this
+    /// page presents `column`, `row` of the file at `path`: a slide, or a PDF's page and 0.
+    #[wasm_bindgen(js_namespace = terminal, js_name = present)]
+    fn tell_presenting(path: &str, column: usize, row: usize);
+    /// Ask where this page's account last showed the file at `path`, on any device: the answer
+    /// comes as what another presents (`terminal:present`).
+    #[wasm_bindgen(js_namespace = terminal, js_name = ask)]
+    fn ask_where(path: &str);
+    /// The last place this page heard of, or showed, in the file at `path`: `[column, row]`.
+    #[wasm_bindgen(js_namespace = terminal, js_name = presented)]
+    fn last_presented(path: &str) -> JsValue;
+    /// The presentation of the file at `path` that this page follows, if it does
+    /// (`open /dev/present/NAME`): `{device, owner, controller}`.
+    #[wasm_bindgen(js_namespace = terminal, js_name = attending)]
+    fn attending(path: &str) -> JsValue;
 }
 
 /// Where the preview of `path` was left, as web/app.js keeps it: `{"slide": [column, row]}`,
@@ -41,7 +56,7 @@ fn place(path: &str) -> serde_json::Value {
         .unwrap_or_default()
 }
 /// Keep `value`, merged with what is kept, as where the preview of `path` is.
-fn set_place(path: &str, value: serde_json::Value) {
+pub(crate) fn set_place(path: &str, value: serde_json::Value) {
     if let Ok(value) = js_sys::JSON::parse(&value.to_string()) {
         save_place(path, value);
     }
@@ -384,7 +399,7 @@ const AS_DOCUMENT: &str =
 /// A Markdown file, as a document, or as slides.
 #[component]
 fn MarkdownView(html: String, source: String, path: String) -> impl IntoView {
-    let as_slides = RwSignal::new(place(&path)["slides"] == true);
+    let as_slides = RwSignal::new(place(&path)["slides"] == true || speaker_window(&path));
     let kept = path.clone();
     Effect::new(move || set_place(&kept, serde_json::json!({ "slides": as_slides.get() })));
     let label = move || {
@@ -431,20 +446,29 @@ const SLIDE_THEMES: [(&str, &str); 4] = [
     ("night", "Night"),
 ];
 const SLIDE_THEME: &str = "terminal-slide-theme";
+/// The size of the speaker view's notes, in pixels, kept for every deck in this browser.
+const NOTES_SIZE: &str = "terminal-notes-size";
+const NOTES_SIZES: (u32, u32, u32) = (14, 24, 56);
+/// How many slides either side of the one shown are drawn ahead of it.
+const SLIDES_AHEAD: usize = 2;
+/// How far, in pixels, a touch must move across to turn a slide or a page.
+const SWIPE: i32 = 50;
+
+/// What this browser keeps under `key`, if it can keep anything.
+fn stored(key: &str) -> Option<String> {
+    let storage = window().local_storage().ok().flatten()?;
+    storage.get_item(key).ok().flatten()
+}
+fn store(key: &str, value: &str) {
+    if let Some(storage) = window().local_storage().ok().flatten() {
+        let _ = storage.set_item(key, value);
+    }
+}
 /// The slide theme chosen last in this browser, or Light.
 fn slide_theme() -> String {
-    window()
-        .local_storage()
-        .ok()
-        .flatten()
-        .and_then(|storage| storage.get_item(SLIDE_THEME).ok().flatten())
+    stored(SLIDE_THEME)
         .filter(|theme| SLIDE_THEMES.iter().any(|(value, _)| value == theme))
         .unwrap_or_else(|| "light".into())
-}
-fn set_slide_theme(theme: &str) {
-    if let Some(storage) = window().local_storage().ok().flatten() {
-        let _ = storage.set_item(SLIDE_THEME, theme);
-    }
 }
 
 /// Whether keys are the slides', rather than another dialog's or a text field's.
@@ -461,13 +485,349 @@ fn keys_for_slides() -> bool {
         .is_some();
     !typing && !elsewhere
 }
+/// Whether `key` would press what has the focus, rather than turn: Space a button, Enter a
+/// button or a link, tabbed to (a click leaves the focus where it was: app.js).
+fn pressing(key: &str) -> bool {
+    let pressed: &[&str] = match key {
+        " " => &["BUTTON", "SUMMARY"],
+        "Enter" => &["BUTTON", "A", "SUMMARY"],
+        _ => &[],
+    };
+    document()
+        .active_element()
+        .is_some_and(|element| pressed.contains(&element.tag_name().as_str()))
+}
+/// How far a key turns through slides, or a presented PDF's pages, in order: Space, N, Page Down
+/// (what a presenter's remote sends) on; Shift+Space, P, Page Up back.
+fn turn_key(event: &web_sys::KeyboardEvent) -> Option<isize> {
+    match event.key().as_str() {
+        " " if event.shift_key() => Some(-1),
+        " " | "PageDown" | "n" | "N" => Some(1),
+        "PageUp" | "p" | "P" => Some(-1),
+        _ => None,
+    }
+}
+/// Show the viewer full screen, or no longer, as its button does.
+fn toggle_fullscreen() {
+    if let Some(button) = document().get_element_by_id("fullscreen") {
+        button.unchecked_into::<HtmlElement>().click();
+    }
+}
 
-/// Slides, as reveal.js lays them out: the arrow keys go to the next column, left and right, and
-/// to the next slide in it, up and down; F shows the viewer full screen. They scale to the space
-/// they have, as reveal.js scales them.
+/// Where a touch on slides or a presented PDF began, to turn them as it ends: a swipe left goes
+/// on, right back.
+#[derive(Clone, Copy)]
+struct Swipe(StoredValue<Option<(i32, i32)>>);
+impl Swipe {
+    fn new() -> Self {
+        Self(StoredValue::new(None))
+    }
+    fn start(self, event: &web_sys::PointerEvent) {
+        if event.pointer_type() != "mouse" {
+            self.0.set_value(Some((event.client_x(), event.client_y())));
+        }
+    }
+    fn cancel(self) {
+        self.0.set_value(None);
+    }
+    /// How far the touch that `event` ends turns: 1 on, -1 back, 0 not at all.
+    fn end(self, event: &web_sys::PointerEvent) -> isize {
+        let Some(Some((x, y))) = self.0.try_update_value(Option::take) else {
+            return 0;
+        };
+        let (across, down) = (event.client_x() - x, event.client_y() - y);
+        if across.abs() > SWIPE && across.abs() > 2 * down.abs() {
+            -across.signum() as isize
+        } else {
+            0
+        }
+    }
+}
+
+/// Call `resized` with the element `node` refers to and its content box's width and height,
+/// once it is laid out and whenever that changes, for as long as the view lasts.
+fn on_resize(node: NodeRef<html::Div>, resized: impl Fn(&HtmlElement, f64, f64) + 'static) {
+    let call = Closure::<dyn FnMut(js_sys::Array)>::new(move |entries: js_sys::Array| {
+        for entry in entries.iter() {
+            let entry: ResizeObserverEntry = entry.unchecked_into();
+            let size = entry.content_rect();
+            resized(entry.target().unchecked_ref(), size.width(), size.height());
+        }
+    });
+    let observer = StoredValue::new_local(ResizeObserver::new(call.as_ref().unchecked_ref()).ok());
+    let call = StoredValue::new_local(Some(call));
+    Effect::new(move || {
+        if let (Some(element), Some(observer)) = (node.get(), observer.get_value()) {
+            observer.observe(&element);
+        }
+    });
+    on_cleanup(move || {
+        if let Some(Some(observer)) = observer.try_get_value() {
+            observer.disconnect();
+        }
+        let _ = call.try_update_value(Option::take);
+    });
+}
+
+/// Follow, with `apply`, the place that another window of this browser, or a page of this account
+/// signed in elsewhere, presents in the file at `path`, as app.js hears of it
+/// (`terminal:present`), for as long as the view lasts.
+fn follow_presenting(path: StoredValue<String>, apply: impl Fn(usize, usize) + Copy + 'static) {
+    // What came while the file was read.
+    let last = path.with_value(|path| last_presented(path));
+    if let Some(last) = last.dyn_ref::<js_sys::Array>()
+        && let (Some(column), Some(row)) = (last.get(0).as_f64(), last.get(1).as_f64())
+    {
+        apply(column as usize, row as usize);
+    }
+    let listener = window_event_listener_untyped("terminal:present", move |event| {
+        let Some(detail) = event
+            .dyn_ref::<web_sys::CustomEvent>()
+            .map(|event| event.detail())
+        else {
+            return;
+        };
+        let get = |name: &str| js_sys::Reflect::get(&detail, &name.into()).ok();
+        let Some(shown) = get("path").and_then(|path| path.as_string()) else {
+            return;
+        };
+        let at = get("at")
+            .and_then(|at| at.dyn_into::<js_sys::Array>().ok())
+            .unwrap_or_default();
+        let place = |index: u32| {
+            at.get(index)
+                .as_f64()
+                .filter(|n| *n >= 0.0 && n.fract() == 0.0)
+                .map(|n| n as usize)
+        };
+        if let (true, Some(column), Some(row)) =
+            (path.with_value(|path| *path == shown), place(0), place(1))
+        {
+            apply(column, row);
+        }
+    });
+    on_cleanup(move || listener.remove());
+}
+
+/// A page that follows another account's presentation of the file it shows (devices.rs), as a
+/// listener: it shows each place the presenter turns to, until its reader turns elsewhere,
+/// which pauses following until they follow again; and it says when the presentation ends.
+/// The presenter's own account turns a presentation it follows, and is no audience.
+#[derive(Clone, Copy)]
+struct Audience {
+    device: StoredValue<String>,
+    owner: StoredValue<String>,
+    paused: RwSignal<bool>,
+    /// Where the presenter is, as last heard.
+    latest: RwSignal<Option<(usize, usize)>>,
+    ended: RwSignal<bool>,
+}
+impl Audience {
+    /// What this page is of the file at `path`: an audience if it follows another account's
+    /// presentation of it.
+    fn of(path: &str) -> Option<Self> {
+        let attended = attending(path);
+        let get = |name: &str| js_sys::Reflect::get(&attended, &name.into()).ok();
+        if get("controller").and_then(|controller| controller.as_bool()) != Some(false) {
+            return None;
+        }
+        let audience = Self {
+            device: StoredValue::new(get("device")?.as_string()?),
+            owner: StoredValue::new(get("owner")?.as_string()?),
+            paused: RwSignal::new(false),
+            latest: RwSignal::new(None),
+            ended: RwSignal::new(get("ended").is_some_and(|ended| ended.is_truthy())),
+        };
+        let listener = window_event_listener_untyped("terminal:device", move |event| {
+            let Some(detail) = event.dyn_ref::<web_sys::CustomEvent>().map(|e| e.detail()) else {
+                return;
+            };
+            let get = |name: &str| js_sys::Reflect::get(&detail, &name.into()).ok();
+            let named = get("name").and_then(|name| name.as_string());
+            if audience
+                .device
+                .with_value(|device| named.as_ref() == Some(device))
+                && (get("ended").is_some_and(|ended| ended.is_truthy())
+                    || get("error").is_some_and(|error| error.is_truthy()))
+            {
+                audience.ended.set(true);
+            }
+        });
+        on_cleanup(move || listener.remove());
+        Some(audience)
+    }
+    /// The presenter turned to `at`: whether to show it, as the page is not paused.
+    fn heard(self, at: (usize, usize)) -> bool {
+        self.latest.set(Some(at));
+        !self.paused.get_untracked()
+    }
+    /// The reader turned to `at` themselves, which pauses following unless it is where the
+    /// presenter is.
+    fn turned(self, at: (usize, usize)) {
+        self.paused.set(self.latest.get_untracked() != Some(at));
+    }
+    /// Follow again, from where the presenter is.
+    fn resume(self) -> Option<(usize, usize)> {
+        self.paused.set(false);
+        self.latest.get_untracked()
+    }
+    /// What the bar says of it, a button that follows again.
+    fn badge(self, resume: impl Fn() + Copy + 'static) -> impl IntoView {
+        let label = move || {
+            let owner = self.owner.get_value();
+            if self.ended.get() {
+                "The presentation ended".to_string()
+            } else if self.paused.get() {
+                format!("Follow {owner}")
+            } else {
+                format!("Following {owner}")
+            }
+        };
+        let title = move || {
+            self.device.with_value(|device| {
+                if self.paused.get() {
+                    format!("Back to where {device} is")
+                } else {
+                    format!("{device}: turn yourself to pause following")
+                }
+            })
+        };
+        view! {
+            <button
+                class="presentation-badge"
+                class:paused=move || self.paused.get()
+                title=title
+                disabled=move || self.ended.get()
+                on:click=move |_| resume()
+            >
+                {label}
+            </button>
+        }
+    }
+}
+
+thread_local! {
+    /// The speaker view this page opened last, and the deck it was opened for, which S shows
+    /// again rather than open another.
+    static SPEAKER: std::cell::RefCell<Option<(web_sys::Window, String)>> = const { std::cell::RefCell::new(None) };
+}
+/// Whether this window is the speaker view of the deck at `path`, as S opened it: app.js opens
+/// the deck its address names.
+fn speaker_window(path: &str) -> bool {
+    window()
+        .location()
+        .search()
+        .ok()
+        .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
+        .and_then(|params| params.get("speaker"))
+        .is_some_and(|deck| deck == path)
+}
+/// Open the speaker view of the deck at `path` in a window of its own, to keep on this screen
+/// while the slides show on another; or show the one open already, taken to this deck if it
+/// showed another. Whether there is one.
+fn open_speaker(path: &str) -> bool {
+    let url = format!("/?speaker={}", js_sys::encode_uri_component(path));
+    let open = SPEAKER.with_borrow(|speaker| {
+        speaker
+            .clone()
+            .filter(|(speaker, _)| !speaker.closed().unwrap_or(true))
+    });
+    if let Some((speaker, deck)) = open {
+        if deck != path {
+            if speaker.location().set_href(&url).is_err() {
+                return false;
+            }
+            SPEAKER.set(Some((speaker.clone(), path.to_string())));
+        }
+        return speaker.focus().is_ok();
+    }
+    let opened = window()
+        .open_with_url_and_target_and_features(&url, "_blank", "popup,width=1280,height=800")
+        .ok()
+        .flatten();
+    let shown = opened.is_some();
+    SPEAKER.set(opened.map(|speaker| (speaker, path.to_string())));
+    shown
+}
+
+/// The slide of `deck` at `at`, one of the places in `order`, among the slides near it, in a stage
+/// it scales to fit, as reveal.js scales slides. Each slide is drawn once it comes near and kept,
+/// hidden, so that the next shows at once, its images loaded (files are served no-store: an
+/// image drawn again is fetched again) and its code highlighted.
+#[component]
+fn Stage(
+    deck: StoredValue<Vec<Vec<preview::Slide>>>,
+    order: StoredValue<Vec<(usize, usize)>>,
+    at: Signal<Option<(usize, usize)>>,
+    class: &'static str,
+) -> impl IntoView {
+    let drawn = Memo::new(move |before: Option<&BTreeSet<(usize, usize)>>| {
+        let mut drawn = before.cloned().unwrap_or_default();
+        if let Some(at) = at.get() {
+            order.with_value(|order| {
+                let index = order.iter().position(|slot| *slot == at).unwrap_or(0);
+                let end = (index + SLIDES_AHEAD + 1).min(order.len());
+                drawn.extend(&order[index.saturating_sub(SLIDES_AHEAD)..end]);
+            });
+        }
+        drawn
+    });
+    let node = NodeRef::<html::Div>::new();
+    on_resize(node, |stage, width, height| {
+        let scale = (width / SLIDE_SIZE.0).min(height / SLIDE_SIZE.1);
+        let _ = stage
+            .style()
+            .set_property("--scale", &scale.max(0.05).to_string());
+    });
+    view! {
+        <div class=format!("slides-stage {class}") node_ref=node>
+            <For
+                each=move || { drawn.get().into_iter().collect::<Vec<_>>() }
+                key=|slot| *slot
+                children=move |slot| {
+                    let html = deck.with_value(|deck| deck[slot.0][slot.1].html.clone());
+                    let class = if preview::image_slide(&html) {
+                        "slide markdown slide-image"
+                    } else {
+                        "slide markdown"
+                    };
+                    view! {
+                        <div class="slide-frame" hidden=move || at.get() != Some(slot)>
+                            <Enhanced>
+                                <div class=class inner_html=html></div>
+                            </Enhanced>
+                        </div>
+                    }
+                }
+            />
+        </div>
+    }
+}
+
+const OVERVIEW: &str = "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z";
+const SPEAKER_VIEW: &str = "M3 4h18v12H3zM7 20h10M12 16v4M7 8h6M7 11h10";
+
+/// Slides, as reveal.js shows them, scaled to the space they have. The arrow keys go to the next
+/// column, left and right, and to the next slide in it, up and down; Space, N and P, Page Down
+/// and Up, and a swipe go through them all in order, Home and End to the first and the last. F
+/// shows them full screen, O an overview, G goes to a slide by its number, and S opens the
+/// speaker view, with the notes, the next slide and a clock, in a window of its own; the bar
+/// shows it here too. A click on an image shows it large. Every window and device that shows
+/// the deck shows one slide: this browser's other windows, and the account's pages signed in
+/// elsewhere.
 #[component]
 fn Slides(source: String, path: String) -> impl IntoView {
     let deck = StoredValue::new(preview::slides(&source, &path));
+    // Every slide's place, in order: column by column, down each.
+    let order = StoredValue::new(deck.with_value(|deck| {
+        deck.iter()
+            .enumerate()
+            .flat_map(|(column, rows)| (0..rows.len()).map(move |row| (column, row)))
+            .collect::<Vec<_>>()
+    }));
+    let exists = move |(column, row): (usize, usize)| {
+        deck.with_value(|deck| deck.get(column).is_some_and(|rows| row < rows.len()))
+    };
     // The slide it was left at, if the deck still has it.
     let left = place(&path)["slide"]
         .as_array()
@@ -477,94 +837,266 @@ fn Slides(source: String, path: String) -> impl IntoView {
                 at.get(1)?.as_u64()? as usize,
             ))
         })
-        .filter(|&(column, row)| {
-            deck.with_value(|deck| deck.get(column).is_some_and(|rows| row < rows.len()))
-        });
+        .filter(|&at| exists(at));
     let position = RwSignal::new(left.unwrap_or((0, 0)));
+    let speaker = RwSignal::new(speaker_window(&path));
+    let audience = Audience::of(&path);
+    // Where the account showed it last, on any device, unless it shows another's presentation.
+    if audience.is_none() {
+        ask_where(&path);
+    }
+    let path = StoredValue::new(path);
     Effect::new(move || {
         let (column, row) = position.get();
-        set_place(&path, serde_json::json!({ "slide": [column, row] }));
+        path.with_value(|path| set_place(path, serde_json::json!({ "slide": [column, row] })));
     });
     let theme = RwSignal::new(slide_theme());
-    Effect::new(move || set_slide_theme(&theme.get()));
-    let node = NodeRef::<html::Div>::new();
-    let go = move |right: isize, down: isize| {
-        position.update(|(column, row)| {
-            deck.with_value(|deck| {
-                let last = |len: usize| len.saturating_sub(1) as isize;
-                if right != 0 {
-                    let next = (*column as isize + right).clamp(0, last(deck.len())) as usize;
-                    if next != *column {
-                        (*column, *row) = (next, 0);
-                    }
-                } else {
-                    *row = (*row as isize + down).clamp(0, last(deck[*column].len())) as usize;
-                }
-            })
-        })
-    };
-    let keys = window_event_listener(ev::keydown, move |event| {
-        if !keys_for_slides() || event.ctrl_key() || event.meta_key() || event.alt_key() {
+    Effect::new(move || store(SLIDE_THEME, &theme.get()));
+    let overview = RwSignal::new(false);
+    let jumping = RwSignal::new(false);
+    let enlarged = RwSignal::new(None::<String>);
+    let notice = RwSignal::new(None::<&'static str>);
+    // Shown by this page's keys, buttons and swipes: the other windows and devices follow, but
+    // for a listener's, which pause following.
+    let show = move |at: (usize, usize)| {
+        if position.get_untracked() == at {
             return;
         }
-        let (right, down) = match event.key().as_str() {
-            "ArrowRight" | "PageDown" => (1, 0),
-            "ArrowLeft" | "PageUp" => (-1, 0),
-            "ArrowDown" => (0, 1),
-            "ArrowUp" => (0, -1),
-            "f" | "F" => {
-                if let Some(button) = document().get_element_by_id("fullscreen") {
-                    event.prevent_default();
-                    button.unchecked_into::<HtmlElement>().click();
+        position.set(at);
+        match audience {
+            Some(audience) => audience.turned(at),
+            None => path.with_value(|path| tell_presenting(path, at.0, at.1)),
+        }
+    };
+    follow_presenting(path, move |column, row| {
+        if exists((column, row)) && audience.is_none_or(|audience| audience.heard((column, row))) {
+            position.set((column, row));
+        }
+    });
+    // An image enlarged is the slide's it came from: turned, by whoever, it closes.
+    Effect::new(move || {
+        position.track();
+        enlarged.set(None);
+    });
+    let resume = move || {
+        if let Some(at) = audience.and_then(Audience::resume) {
+            position.set(at);
+        }
+    };
+    let index = move |at: (usize, usize)| {
+        order.with_value(|order| order.iter().position(|slot| *slot == at).unwrap_or(0))
+    };
+    let go = move |right: isize, down: isize| {
+        let (column, row) = position.get_untracked();
+        let at = deck.with_value(|deck| {
+            let last = |len: usize| len.saturating_sub(1) as isize;
+            if right != 0 {
+                let next = (column as isize + right).clamp(0, last(deck.len())) as usize;
+                if next == column {
+                    (column, row)
+                } else {
+                    (next, 0)
                 }
+            } else {
+                let row = (row as isize + down).clamp(0, last(deck[column].len()));
+                (column, row as usize)
+            }
+        });
+        show(at);
+    };
+    // Through every slide, in order.
+    let step = move |by: isize| {
+        let next = index(position.get_untracked()) as isize + by;
+        let at = order.with_value(|order| order[next.clamp(0, order.len() as isize - 1) as usize]);
+        show(at);
+    };
+    let next = Memo::new(move |_| {
+        let after = index(position.get()) + 1;
+        order.with_value(|order| order.get(after).copied())
+    });
+    let say = move |text: &'static str| {
+        notice.set(Some(text));
+        set_timeout(
+            move || {
+                notice.try_set(None);
+            },
+            std::time::Duration::from_secs(4),
+        );
+    };
+    let speak_elsewhere = move || {
+        // The speaker view itself opens no other.
+        if path.with_value(|path| speaker_window(path)) {
+            return;
+        }
+        if !path.with_value(|path| open_speaker(path)) {
+            say("Allow pop-ups for the speaker view");
+        }
+    };
+    let keys = window_event_listener(ev::keydown, move |event| {
+        if !keys_for_slides()
+            || event.ctrl_key()
+            || event.meta_key()
+            || event.alt_key()
+            || event.default_prevented()
+        {
+            return;
+        }
+        let key = event.key();
+        if pressing(&key) {
+            return;
+        }
+        match key.as_str() {
+            "ArrowRight" => go(1, 0),
+            "ArrowLeft" => go(-1, 0),
+            "ArrowDown" => go(0, 1),
+            "ArrowUp" => go(0, -1),
+            "Home" => show((0, 0)),
+            "End" => show(order.with_value(|order| *order.last().expect("a deck has a slide"))),
+            "Enter" if overview.get_untracked() => overview.set(false),
+            "o" | "O" => overview.update(|shown| *shown = !*shown),
+            "g" | "G" => jumping.set(true),
+            "s" | "S" => speak_elsewhere(),
+            "f" | "F" => toggle_fullscreen(),
+            _ => match turn_key(&event) {
+                Some(by) => step(by),
+                None => return,
+            },
+        }
+        event.prevent_default();
+    });
+    // Escape closes an enlarged image or the overview before the viewer: it is taken before the
+    // page's own handler (app.js), which closes the dialog.
+    let escape =
+        Closure::<dyn Fn(web_sys::KeyboardEvent)>::new(move |event: web_sys::KeyboardEvent| {
+            if event.key() != "Escape" || event.default_prevented() {
                 return;
             }
-            _ => return,
-        };
-        event.prevent_default();
-        go(right, down);
-    });
-    // Scaled to fit the space the slides have, as it changes.
-    let fit = Closure::<dyn FnMut(js_sys::Array)>::new(move |entries: js_sys::Array| {
-        for entry in entries.iter() {
-            let entry: ResizeObserverEntry = entry.unchecked_into();
-            let size = entry.content_rect();
-            let target = entry.target();
-            // The room the bar takes, measured: none when it floats over the slides, as it does
-            // full screen.
-            let bar = target
-                .query_selector(".slides-bar")
-                .ok()
-                .flatten()
-                .filter(|bar| {
-                    window()
-                        .get_computed_style(bar)
-                        .ok()
-                        .flatten()
-                        .and_then(|style| style.get_property_value("position").ok())
-                        .is_none_or(|position| position != "absolute")
-                })
-                .map_or(0.0, |bar| {
-                    f64::from(bar.unchecked_into::<HtmlElement>().offset_height())
-                });
-            let scale = (size.width() / SLIDE_SIZE.0).min((size.height() - bar) / SLIDE_SIZE.1);
-            let style = target.unchecked_into::<HtmlElement>().style();
-            let _ = style.set_property("--scale", &scale.max(0.1).to_string());
-        }
-    });
-    let observer = StoredValue::new_local(ResizeObserver::new(fit.as_ref().unchecked_ref()).ok());
-    let fit = StoredValue::new_local(Some(fit));
-    Effect::new(move || {
-        if let (Some(slides), Some(observer)) = (node.get(), observer.get_value()) {
-            observer.observe(&slides);
-        }
-    });
+            if enlarged.with_untracked(Option::is_some) {
+                enlarged.set(None);
+            } else if overview.get_untracked() {
+                overview.set(false);
+            } else {
+                return;
+            }
+            event.prevent_default();
+        });
+    let _ = window().add_event_listener_with_callback_and_bool(
+        "keydown",
+        escape.as_ref().unchecked_ref(),
+        true,
+    );
+    let escape = StoredValue::new_local(Some(escape));
     on_cleanup(move || {
         keys.remove();
-        if let Some(Some(observer)) = observer.try_get_value() {
-            observer.disconnect();
+        if let Some(Some(escape)) = escape.try_update_value(Option::take) {
+            let _ = window().remove_event_listener_with_callback_and_bool(
+                "keydown",
+                escape.as_ref().unchecked_ref(),
+                true,
+            );
         }
-        let _ = fit.try_update_value(Option::take);
+    });
+    // The speaker view's clock: the time since the deck opened, which a click restarts, and the
+    // time of day.
+    let started = RwSignal::new(js_sys::Date::now());
+    let now = RwSignal::new(js_sys::Date::now());
+    let ticking = set_interval_with_handle(
+        move || now.set(js_sys::Date::now()),
+        std::time::Duration::from_secs(1),
+    )
+    .ok();
+    on_cleanup(move || {
+        if let Some(ticking) = ticking {
+            ticking.clear();
+        }
+    });
+    let elapsed = move || {
+        let seconds = ((now.get() - started.get()) / 1000.0).max(0.0) as u64;
+        let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+        if hours > 0 {
+            format!("{hours}:{minutes:02}:{seconds:02}")
+        } else {
+            format!("{minutes:02}:{seconds:02}")
+        }
+    };
+    let clock = move || {
+        now.track();
+        let date = js_sys::Date::new_0();
+        format!("{:02}:{:02}", date.get_hours(), date.get_minutes())
+    };
+    let (smallest, usual, largest) = NOTES_SIZES;
+    let notes_size = RwSignal::new(
+        stored(NOTES_SIZE)
+            .and_then(|size| size.parse::<u32>().ok())
+            .unwrap_or(usual)
+            .clamp(smallest, largest),
+    );
+    Effect::new(move || store(NOTES_SIZE, &notes_size.get().to_string()));
+    let resize_notes = move |by: i32| {
+        notes_size.update(|size| *size = size.saturating_add_signed(by).clamp(smallest, largest))
+    };
+    let notes = move || {
+        let (column, row) = position.get();
+        deck.with_value(|deck| deck[column][row].notes.clone())
+    };
+    let numbered = move |(column, row): (usize, usize)| {
+        deck.with_value(|deck| match deck[column].len() {
+            1 => (column + 1).to_string(),
+            _ => format!("{}.{}", column + 1, row + 1),
+        })
+    };
+    // The overview shows where the deck is, as it moves.
+    let grid = NodeRef::<html::Div>::new();
+    Effect::new(move || {
+        position.track();
+        if let (true, Some(grid)) = (overview.get(), grid.get()) {
+            request_animation_frame(move || {
+                if let Ok(Some(current)) = grid.query_selector(".slides-thumb.current") {
+                    let options = web_sys::ScrollIntoViewOptions::new();
+                    options.set_block(web_sys::ScrollLogicalPosition::Nearest);
+                    current.scroll_into_view_with_scroll_into_view_options(&options);
+                }
+            });
+        }
+    });
+    let jump = NodeRef::<html::Input>::new();
+    Effect::new(move || {
+        if let Some(input) = jump.get() {
+            let _ = input.focus();
+        }
+    });
+    let go_to = move |text: String| {
+        jumping.set(false);
+        match preview::slide_number(&text).filter(|&at| exists(at)) {
+            Some(at) => show(at),
+            None if text.trim().is_empty() => {}
+            None => say("No such slide"),
+        }
+    };
+    // An image clicked in the slide shown shows large, but for one a slide shows already whole
+    // and one that is a link.
+    let enlarge = move |event: ev::MouseEvent| {
+        let Some(image) = event
+            .target()
+            .and_then(|target| target.dyn_into::<Element>().ok())
+            .filter(|target| target.tag_name() == "IMG")
+        else {
+            return;
+        };
+        let elsewhere = image.closest(".slides-current").ok().flatten().is_none();
+        if elsewhere || image.closest("a, .slide-image").ok().flatten().is_some() {
+            return;
+        }
+        enlarged.set(image.get_attribute("src"));
+    };
+    let swipe = Swipe::new();
+    // The keys are the slides' from the start, not the viewer bar's first button's, which the
+    // dialog focused (Space would press it).
+    let body = NodeRef::<html::Div>::new();
+    Effect::new(move || {
+        if let Some(body) = body.get() {
+            let _ = body.focus();
+        }
     });
     let can = move |right: isize, down: isize| {
         let (column, row) = position.get();
@@ -575,11 +1107,10 @@ fn Slides(source: String, path: String) -> impl IntoView {
             _ => row + 1 < deck[column].len(),
         })
     };
-    let slide = move || {
-        let (column, row) = position.get();
-        deck.with_value(|deck| deck[column][row].clone())
-    };
     let counter = move || {
+        if let Some(notice) = notice.get() {
+            return notice.to_string();
+        }
         let (column, row) = position.get();
         deck.with_value(|deck| match deck[column].len() {
             1 => format!("{} / {}", column + 1, deck.len()),
@@ -587,9 +1118,15 @@ fn Slides(source: String, path: String) -> impl IntoView {
         })
     };
     let button = move |label: &'static str, path: &'static str, right: isize, down: isize| {
+        // Phones have no room for up and down; a swipe goes through the slides below others.
+        let class = if down == 0 {
+            "preview-button"
+        } else {
+            "preview-button slides-vertical"
+        };
         view! {
             <button
-                class="preview-button"
+                class=class
                 title=label
                 aria-label=label
                 disabled=move || !can(right, down)
@@ -599,27 +1136,142 @@ fn Slides(source: String, path: String) -> impl IntoView {
             </button>
         }
     };
+    // Up and down only for a deck with slides below others.
+    let vertical = deck.with_value(|deck| deck.iter().any(|rows| rows.len() > 1));
     view! {
-        <div class="slides" data-theme=move || theme.get() node_ref=node>
-            {move || {
-                // Read here, where it is tracked: a component's children are built untracked.
-                let html = slide();
-                let class = if preview::image_slide(&html) {
-                    "slide markdown slide-image"
-                } else {
-                    "slide markdown"
-                };
-                view! {
-                    <Enhanced>
-                        <div class=class inner_html=html></div>
-                    </Enhanced>
+        <div class="slides" class:speaking=move || speaker.get() data-theme=move || theme.get()>
+            <div
+                class="slides-body"
+                tabindex="-1"
+                node_ref=body
+                on:click=enlarge
+                on:pointerdown=move |event| swipe.start(&event)
+                on:pointercancel=move |_| swipe.cancel()
+                on:pointerup=move |event| {
+                    let by = swipe.end(&event);
+                    if by != 0 && !overview.get_untracked() {
+                        step(by);
+                    }
                 }
-            }}
+            >
+                <Stage deck order at=Signal::derive(move || Some(position.get())) class="slides-current" />
+                {move || {
+                    speaker.get().then(|| view! {
+                        <aside class="slides-speaker" aria-label="Speaker view">
+                            <div class="slides-time">
+                                <button class="slides-elapsed" title="Restart the timer" aria-label="Restart the timer" on:click=move |_| started.set(js_sys::Date::now())>
+                                    {elapsed}
+                                </button>
+                                <span class="slides-clock">{clock}</span>
+                            </div>
+                            <div class="slides-upcoming" aria-label="Next slide">
+                                <Stage deck order at=Signal::derive(move || next.get()) class="slides-next" />
+                                {move || next.get().is_none().then(|| view! { <p class="slides-end">"End of the deck"</p> })}
+                            </div>
+                            <div class="slides-notes-bar">
+                                <span>"Notes"</span>
+                                <button class="preview-button" aria-label="Smaller notes" title="Smaller notes" on:click=move |_| resize_notes(-2)>"A−"</button>
+                                <button class="preview-button" aria-label="Larger notes" title="Larger notes" on:click=move |_| resize_notes(2)>"A+"</button>
+                            </div>
+                            <div class="slides-notes" style=move || format!("font-size:{}px", notes_size.get())>
+                                {move || {
+                                    let html = notes();
+                                    if html.is_empty() {
+                                        view! { <p class="slides-no-notes">"No notes for this slide."</p> }.into_any()
+                                    } else {
+                                        view! { <Enhanced><div class="markdown" inner_html=html></div></Enhanced> }.into_any()
+                                    }
+                                }}
+                            </div>
+                        </aside>
+                    })
+                }}
+                {move || {
+                    overview.get().then(|| {
+                        let thumbs = order
+                            .get_value()
+                            .into_iter()
+                            .map(|at| {
+                                let html = deck.with_value(|deck| deck[at.0][at.1].html.clone());
+                                let class = if preview::image_slide(&html) {
+                                    "slide markdown slide-image"
+                                } else {
+                                    "slide markdown"
+                                };
+                                let number = numbered(at);
+                                view! {
+                                    <button
+                                        class="slides-thumb"
+                                        class:current=move || position.get() == at
+                                        aria-label=format!("Slide {number}")
+                                        on:click=move |_| {
+                                            show(at);
+                                            overview.set(false);
+                                        }
+                                    >
+                                        <div class=class inner_html=html></div>
+                                        <span class="slides-number">{number.clone()}</span>
+                                    </button>
+                                }
+                            })
+                            .collect_view();
+                        view! { <div class="slides-overview" node_ref=grid>{thumbs}</div> }
+                    })
+                }}
+                {move || {
+                    enlarged.get().map(|src| view! {
+                        <div class="slides-enlarged" title="Close · Esc" on:click=move |_| enlarged.set(None)>
+                            <img src=src alt="The image, enlarged" />
+                        </div>
+                    })
+                }}
+            </div>
             <div class="slides-bar">
+                <div class="slides-tools">
+                    <button class="preview-button" title="Overview · O" aria-label="Overview" aria-pressed=move || overview.get().to_string() on:click=move |_| overview.update(|shown| *shown = !*shown)>
+                        {icon(OVERVIEW)}
+                    </button>
+                    <button class="preview-button" title="Speaker view; S opens it in a window" aria-label="Speaker view" aria-pressed=move || speaker.get().to_string() on:click=move |_| speaker.update(|shown| *shown = !*shown)>
+                        {icon(SPEAKER_VIEW)}
+                    </button>
+                    {audience.map(|audience| audience.badge(resume))}
+                </div>
                 {button("Previous slide", PREVIOUS, -1, 0)}
-                {button("Slide above", UP, 0, -1)}
-                <span role="status">{counter}</span>
-                {button("Slide below", DOWN, 0, 1)}
+                {vertical.then(|| button("Slide above", UP, 0, -1))}
+                {move || {
+                    if jumping.get() {
+                        view! {
+                            <input
+                                class="slides-jump"
+                                aria-label="Go to slide"
+                                placeholder="3 or 3.2"
+                                enterkeyhint="go"
+                                node_ref=jump
+                                on:keydown=move |event| match event.key().as_str() {
+                                    "Enter" => {
+                                        event.prevent_default();
+                                        go_to(event_target_value(&event));
+                                    }
+                                    "Escape" => {
+                                        event.prevent_default();
+                                        jumping.set(false);
+                                    }
+                                    _ => {}
+                                }
+                                on:blur=move |_| jumping.set(false)
+                            />
+                        }
+                        .into_any()
+                    } else {
+                        view! {
+                            <button class="slides-counter" title="Go to slide · G" on:click=move |_| jumping.set(true)>
+                                <span role="status">{counter}</span>
+                            </button>
+                        }
+                        .into_any()
+                    }
+                }}
+                {vertical.then(|| button("Slide below", DOWN, 0, 1))}
                 {button("Next slide", NEXT, 1, 0)}
                 <select class="slides-theme" aria-label="Slide theme" prop:value=move || theme.get() on:change=move |e| theme.set(event_target_value(&e))>
                     {SLIDE_THEMES.iter().map(|(value, label)| view! { <option value=*value>{*label}</option> }).collect_view()}
@@ -632,21 +1284,30 @@ fn Slides(source: String, path: String) -> impl IntoView {
 /// The most pixels wide a PDF page is drawn: past that, the memory pages take outgrows what is
 /// seen of them.
 const PDF_PIXELS: f64 = 2000.0;
+/// The most pixels wide a page is drawn presented, alone on a screen, which may be a 4K one.
+const PDF_PRESENT_PIXELS: f64 = 3840.0;
 /// How far the view zooms out and in, from the stage's width.
 const PDF_ZOOM: (f64, f64) = (0.5, 3.0);
 
 /// A PDF as one document that scrolls. Every page has its place, at its size, from the start;
 /// a worker draws the pages near the view, one at a time, and those far from it are let go,
 /// so that a long document takes the memory of a few pages. The toolbar says which page is in
-/// view, goes to the one before or after it, and zooms.
+/// view, goes to the one before or after it, and zooms. Presented, a slide deck made a PDF, it
+/// shows one page at a time, filling the view, turned as slides are, which the other windows
+/// and devices showing it follow.
 #[component]
 fn PdfView(data: Arc<Vec<u8>>, path: String) -> impl IntoView {
     let pages = RwSignal::new(Vec::<(f64, f64)>::new());
     let failure = RwSignal::new(None::<String>);
-    // Where it was left: its page and zoom.
+    // Where it was left: its page and zoom, and whether it was presented.
     let left = place(&path);
+    let audience = Audience::of(&path);
+    let path = StoredValue::new(path);
+    let presenting = RwSignal::new(left["present"] == true || audience.is_some());
     let current = RwSignal::new(0usize);
-    let left_at = left["page"].as_u64().unwrap_or(0) as usize;
+    // The page it starts at, once its pages are known: where it was left, or where it is
+    // presented, as heard while it was read.
+    let start = StoredValue::new(left["page"].as_u64().unwrap_or(0) as usize);
     let zoom = RwSignal::new(
         left["zoom"]
             .as_f64()
@@ -797,7 +1458,7 @@ fn PdfView(data: Arc<Vec<u8>>, path: String) -> impl IntoView {
         observer.set_value(Some(watching));
         let _ = stage.focus();
         // Back to the page it was left at, once the pages are laid out.
-        let page = left_at.min(count - 1);
+        let page = start.get_value().min(count - 1);
         if page > 0 {
             request_animation_frame(move || {
                 if let Some(frame) = frame(page) {
@@ -808,9 +1469,10 @@ fn PdfView(data: Arc<Vec<u8>>, path: String) -> impl IntoView {
         }
     });
     Effect::new(move || {
-        let (page, level) = (current.get(), zoom.get());
+        let (page, level, presented) = (current.get(), zoom.get(), presenting.get());
         if pages.with(|pages| !pages.is_empty()) {
-            set_place(&path, serde_json::json!({ "page": page, "zoom": level }));
+            let place = serde_json::json!({ "page": page, "zoom": level, "present": presented });
+            path.with_value(|path| set_place(path, place));
         }
     });
     // A new zoom draws the pages in view at their new width, and keeps the page in view.
@@ -848,19 +1510,196 @@ fn PdfView(data: Arc<Vec<u8>>, path: String) -> impl IntoView {
             current.set(page);
         }
     };
+    // Turned here, presenting: the other windows and devices follow, but for a listener's turns,
+    // which pause following.
+    let turn = move |page: usize| {
+        let page = page.min(pages.with_untracked(Vec::len).saturating_sub(1));
+        if current.get_untracked() == page {
+            return;
+        }
+        current.set(page);
+        match audience {
+            Some(audience) => audience.turned((page, 0)),
+            None => path.with_value(|path| tell_presenting(path, page, 0)),
+        }
+    };
+    // Presented, it opens where the account showed it last, on any device.
+    Effect::new(move |_| {
+        if presenting.get() && audience.is_none() {
+            path.with_value(|path| ask_where(path));
+        }
+    });
     let go = move |page: usize| {
-        if let Some(frame) = frame(page) {
+        if presenting.get_untracked() {
+            turn(page);
+        } else if let Some(frame) = frame(page) {
             frame.scroll_into_view();
             current.set(page);
         }
     };
+    follow_presenting(path, move |page, _| {
+        if !presenting.get_untracked() || !audience.is_none_or(|audience| audience.heard((page, 0)))
+        {
+            return;
+        }
+        match pages.with_untracked(Vec::len) {
+            0 => start.set_value(page),
+            count if page < count => current.set(page),
+            _ => {}
+        }
+    });
+    let keys = window_event_listener(ev::keydown, move |event| {
+        if !presenting.get_untracked()
+            || !keys_for_slides()
+            || event.ctrl_key()
+            || event.meta_key()
+            || event.alt_key()
+            || event.default_prevented()
+        {
+            return;
+        }
+        let key = event.key();
+        if pressing(&key) {
+            return;
+        }
+        let page = current.get_untracked();
+        match key.as_str() {
+            "ArrowRight" | "ArrowDown" => turn(page + 1),
+            "ArrowLeft" | "ArrowUp" => turn(page.saturating_sub(1)),
+            "Home" => turn(0),
+            "End" => turn(usize::MAX),
+            "f" | "F" => toggle_fullscreen(),
+            _ => match turn_key(&event) {
+                Some(1) => turn(page + 1),
+                Some(_) => turn(page.saturating_sub(1)),
+                None => return,
+            },
+        }
+        event.prevent_default();
+    });
+    on_cleanup(move || keys.remove());
+    // Presented: the page shown, drawn as wide as it shows, and those either side, drawn ahead
+    // to turn to at once.
+    let screen = NodeRef::<html::Canvas>::new();
+    let shown = NodeRef::<html::Div>::new();
+    let room = RwSignal::new((0.0, 0.0));
+    on_resize(shown, move |_, width, height| room.set((width, height)));
+    let ready = StoredValue::new_local(BTreeMap::<usize, (u32, web_sys::ImageData)>::new());
+    let readying = StoredValue::new(false);
+    let present_width = move |index: usize| -> u32 {
+        let (width, height) = room.get_untracked();
+        let Some((page_width, page_height)) =
+            pages.with_untracked(|pages| pages.get(index).copied())
+        else {
+            return 0;
+        };
+        let fit = width.min(height * page_width / page_height);
+        let pixels = fit * window().device_pixel_ratio();
+        pixels.clamp(0.0, PDF_PRESENT_PIXELS).round() as u32
+    };
+    let show_ready = move || {
+        let page = current.get_untracked();
+        if let Some(Some(image)) =
+            ready.try_with_value(|ready| ready.get(&page).map(|(_, image)| image.clone()))
+            && let Err(e) = paint(screen.get_untracked(), &image)
+        {
+            failure.set(Some(format!("PDF rendering failed: {e}")));
+        }
+    };
+    let draw_ahead = move || {
+        if readying.get_value() {
+            return;
+        }
+        readying.set_value(true);
+        spawn_local(async move {
+            while let Some(pdf) = document.try_get_value().flatten() {
+                if !presenting.get_untracked() {
+                    break;
+                }
+                let page = current.get_untracked();
+                let count = pages.with_untracked(Vec::len);
+                // The page shown first, then the next, then the one before.
+                let wanted = [Some(page), Some(page + 1), page.checked_sub(1)]
+                    .into_iter()
+                    .flatten()
+                    .filter(|&index| index < count)
+                    .map(|index| (index, present_width(index)))
+                    .find(|&(index, pixels)| {
+                        pixels > 0
+                            && ready.with_value(|ready| {
+                                ready.get(&index).map(|(drawn, _)| *drawn) != Some(pixels)
+                            })
+                    });
+                let Some((index, pixels)) = wanted else {
+                    break;
+                };
+                match workers::render_pdf(pdf, index, pixels).await {
+                    Ok(image) => {
+                        // The view may have closed while the page was drawn.
+                        let Some(page) = current.try_get_untracked() else {
+                            return;
+                        };
+                        let kept = ready.try_update_value(|ready| {
+                            ready.insert(index, (pixels, image));
+                            ready.retain(|&kept, _| kept.abs_diff(page) <= 1);
+                        });
+                        if kept.is_none() {
+                            return;
+                        }
+                        if index == page {
+                            show_ready();
+                        }
+                    }
+                    Err(e) => {
+                        failure.try_set(Some(format!("PDF rendering failed: {e}")));
+                        break;
+                    }
+                }
+            }
+            let _ = readying.try_set_value(false);
+        });
+    };
+    Effect::new(move || {
+        let _ = (current.get(), room.get());
+        if presenting.get() && pages.with(|pages| !pages.is_empty()) {
+            show_ready();
+            draw_ahead();
+        }
+    });
+    // Back to scrolling, at the page it was presenting.
+    Effect::new(move |before: Option<bool>| {
+        let now = presenting.get();
+        if before == Some(true) && !now {
+            request_animation_frame(move || {
+                if let Some(frame) = frame(current.get_untracked()) {
+                    frame.scroll_into_view();
+                }
+                draw();
+            });
+        }
+        now
+    });
+    let swipe = Swipe::new();
     let count = move || pages.with(Vec::len);
     let zoom_by = move |factor: f64| {
         zoom.update(|zoom| *zoom = (*zoom * factor).clamp(PDF_ZOOM.0, PDF_ZOOM.1));
     };
+    let present_label = move || {
+        if presenting.get() {
+            "Scroll the pages"
+        } else {
+            "Present one page at a time"
+        }
+    };
+    let resume = move || {
+        if let Some((page, _)) = audience.and_then(Audience::resume) {
+            current.set(page);
+        }
+    };
     view! {
-        <div class="pdf-view">
+        <div class="pdf-view" class:presenting=move || presenting.get()>
             <div class="pdf-toolbar">
+                {audience.map(|audience| audience.badge(resume))}
                 <button
                     aria-label="Previous page"
                     disabled=move || current.get() == 0
@@ -885,15 +1724,38 @@ fn PdfView(data: Arc<Vec<u8>>, path: String) -> impl IntoView {
                 >
                     "↓"
                 </button>
-                <span class="pdf-zoom">
+                <span class="pdf-zoom" hidden=move || presenting.get()>
                     <button aria-label="Zoom out" disabled=move || { zoom.get() <= PDF_ZOOM.0 } on:click=move |_| zoom_by(1.0 / 1.25)>"−"</button>
                     <button aria-label="Fit width" on:click=move |_| zoom.set(1.0)>{move || format!("{:.0}%", zoom.get() * 100.0)}</button>
                     <button aria-label="Zoom in" disabled=move || { zoom.get() >= PDF_ZOOM.1 } on:click=move |_| zoom_by(1.25)>"+"</button>
                 </span>
+                <button
+                    class="pdf-present-button"
+                    title=present_label
+                    aria-label=present_label
+                    aria-pressed=move || presenting.get().to_string()
+                    on:click=move |_| presenting.update(|presenting| *presenting = !*presenting)
+                >
+                    {move || icon(if presenting.get() { AS_DOCUMENT } else { AS_SLIDES })}
+                </button>
+            </div>
+            <div
+                class="pdf-present"
+                node_ref=shown
+                hidden=move || !presenting.get()
+                on:pointerdown=move |event| swipe.start(&event)
+                on:pointercancel=move |_| swipe.cancel()
+                on:pointerup=move |event| match swipe.end(&event) {
+                    0 => {}
+                    by => turn((current.get_untracked() as isize + by).max(0) as usize),
+                }
+            >
+                <canvas class="pdf-slide" node_ref=screen aria-label=move || format!("Presented page {}", current.get() + 1)></canvas>
             </div>
             <div
                 class="pdf-stage"
                 tabindex="0"
+                hidden=move || presenting.get()
                 node_ref=stage
                 style=move || format!("--pdf-zoom:{}", zoom.get())
                 on:scroll=scrolled
@@ -931,7 +1793,7 @@ fn paint(canvas: Option<HtmlCanvasElement>, image: &web_sys::ImageData) -> Resul
 }
 
 /// `bytes`, in the largest unit they make at least one of.
-fn size(bytes: u64) -> String {
+pub(crate) fn size(bytes: u64) -> String {
     match bytes {
         0..1_000 => format!("{bytes} B"),
         1_000..1_000_000 => format!("{:.1} KB", bytes as f64 / 1e3),

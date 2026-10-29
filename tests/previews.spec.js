@@ -100,13 +100,13 @@ test('Rust previews: highlighted code, diagrams, maths, links within the filesys
   await close(page);
 
   await run(page,'open '+base+'/deck.slides.md');
-  await expect(page.locator('.slides .slide h1')).toHaveText('One');
+  await expect(page.locator('.slides-current .slide:visible h1')).toHaveText('One');
   // The separator in the code block is code.
-  await expect(page.locator('.slides .slide pre')).toContainText('key: value');
-  expect(Number(await page.locator('.slides').evaluate(e=>getComputedStyle(e).getPropertyValue('--scale')))).toBeGreaterThan(0.5);
-  await page.keyboard.press('ArrowRight');await expect(page.locator('.slides .slide h1')).toHaveText('Two');
-  await page.keyboard.press('ArrowDown');await expect(page.locator('.slides .slide h1')).toHaveText('Two, below');
-  await expect(page.locator('.slides .slide')).not.toContainText('not shown');
+  await expect(page.locator('.slides-current .slide:visible pre')).toContainText('key: value');
+  expect(Number(await page.locator('.slides-current').evaluate(e=>getComputedStyle(e).getPropertyValue('--scale')))).toBeGreaterThan(0.5);
+  await page.keyboard.press('ArrowRight');await expect(page.locator('.slides-current .slide:visible h1')).toHaveText('Two');
+  await page.keyboard.press('ArrowDown');await expect(page.locator('.slides-current .slide:visible h1')).toHaveText('Two, below');
+  await expect(page.locator('.slides-current .slide:visible')).not.toContainText('not shown');
   await expect(page.locator('.slides-bar [role=status]')).toHaveText('2 / 2 · 2 / 2');
   await close(page);
 
@@ -124,7 +124,7 @@ test('a link opens another file with a way back; slides, PDFs and text open wher
   for(const [name,text] of Object.entries(files))expect((await request.put(file(base+'/'+name),{headers,data:Buffer.from(text)})).status()).toBe(201);
   await page.goto('/');
   const status=page.locator('.slides-bar [role=status]'),theme=page.getByRole('combobox',{name:'Slide theme'});
-  await run(page,'open '+base+'/deck.slides.md');await expect(page.locator('.slides .slide')).toContainText('One');
+  await run(page,'open '+base+'/deck.slides.md');await expect(page.locator('.slides-current .slide:visible')).toContainText('One');
   // Slides look like a presentation, light by default, in a theme chosen for every deck.
   await expect(page.locator('.slides')).toHaveAttribute('data-theme','light');await expect(theme).toHaveValue('light');
   await theme.selectOption('sepia');await expect(page.locator('.slides')).toHaveAttribute('data-theme','sepia');

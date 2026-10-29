@@ -399,7 +399,7 @@ pub async fn chunk(req: Request, env: &Env) -> Result<Response> {
         "/internal/upload/commit",
         Some(json!({
             "id": id, "index": index.parse::<u64>().ok(), "key": key, "sha256": sha256,
-            "complete": false, "hold": hold,
+            "complete": false, "hold": hold, "length": length,
         })),
     )
     .await

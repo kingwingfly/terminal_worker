@@ -1,5 +1,7 @@
 import { inspectFaststart } from './faststart.mjs';
 import { uploadFile, Cancelled } from './upload.mjs';
+import { record, clock } from './record.mjs';
+import { speak, listen as hearLive } from './sound.mjs';
 
 let configuration;
 export const ready = fetch('/terminal-config.json').then(async response => {
@@ -25,7 +27,7 @@ async function api(url, options) {
 async function session(path = directory) { return (await api('/api/session?path=' + encodeURIComponent(path))).json(); }
 // Endpoints that change this browser's session. The session one replaces ends as it answers,
 // which this page hears of before its own identityChanged: until then, that is not news.
-const SESSION_CHANGES = new Set(['login', 'logout', 'passwd', 'register']);
+const SESSION_CHANGES = new Set(['login', 'logout', 'passwd', 'register', 'unregister']);
 let changingSession = 0;
 async function post(endpoint, data) {
   const changes = SESSION_CHANGES.has(endpoint);
@@ -84,13 +86,41 @@ function listen() {
   events?.close();
   const socket = events = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/events`);
   let ping;
-  socket.onopen = () => { if (eventsRetry) changed(); eventsRetry = 0; ping = setInterval(() => socket.send('ping'), 30000); };
+  socket.onopen = () => {
+    const reconnected = eventsRetry > 0;
+    if (eventsRetry) changed(); eventsRetry = 0; ping = setInterval(() => socket.send('ping'), 30000);
+    // A new line follows what the page follows (and hears where it is), and asks what it waited
+    // to ask.
+    if (following || hearing) socket.send(JSON.stringify({ follow: followed() }));
+    // A deck shown here asks where its account is now, as turns made elsewhere while the line
+    // was down were not heard; unless it turned itself meanwhile, which goes out below.
+    const turned = outbox.some(message => message.present?.path === shown?.path);
+    if (reconnected && shown && !following && !turned) outbox.push({ where: shown.path });
+    for (const message of outbox.splice(0)) socket.send(JSON.stringify(message));
+  };
   socket.onmessage = event => {
     // A line this page replaced, as its account changed, has nothing more to say.
     if (events !== socket) return;
     let message; try { message = JSON.parse(event.data); } catch { return; }
     // This page's session ended elsewhere, not by its own sign in or out: it is a guest's now.
     if (message.session === 'ended') { if (!changingSession) void identityChanged('ended'); return; }
+    if (message.present) { presented(message.present); return; }
+    // A device followed shows something else now: followed again, if it still may be.
+    if (message.device?.replaced) { followAgain(message.device.name, true, true); return; }
+    // What a device followed is, as the authority says on following it: one replaced while this
+    // page's line was down (another file, account or sound) is not what the page shows.
+    if (message.followed) {
+      const { name, version } = message.followed;
+      followAgain(name, following?.device === name && following.version !== version, hearing?.device === name && hearing.version !== version);
+      return;
+    }
+    // The presentation followed ended, or may not be followed.
+    if (message.device) {
+      if (following?.device === message.device.name) following.ended = true;
+      if (hearing?.device === message.device.name) stopHearing();
+      window.dispatchEvent(new CustomEvent('terminal:device', { detail: message.device }));
+      return;
+    }
     const dirs = message.changed;
     if (!Array.isArray(dirs)) return;
     dirs.forEach(dir => pendingDirs.add(dir));
@@ -100,6 +130,70 @@ function listen() {
   socket.onclose = () => { clearInterval(ping); if (events === socket) setTimeout(listen, Math.min(30000, 1000 * 2 ** eventsRetry++)); };
 }
 listen();
+// Slides and PDFs presented follow each other (owner's request, 2026-10-28): the place a page
+// presents (viewer.rs calls present) shows in this browser's other windows showing that file,
+// and in the account's pages signed in elsewhere, which the authority tells (store.rs relay).
+const presenting = 'BroadcastChannel' in window ? new BroadcastChannel('terminal-present') : null;
+// The last place this page heard of or showed, by path, which a deck shown later starts at
+// (viewer.rs follow_presenting): one may come while its file is still being read.
+const heard = new Map();
+const presented = detail => { heard.set(detail.path, detail.at); window.dispatchEvent(new CustomEvent('terminal:present', { detail })); };
+if (presenting) presenting.onmessage = event => presented(event.data);
+function present(path, column, row) {
+  const place = { path, at: [column, row] };
+  heard.set(path, place.at);
+  presenting?.postMessage(place);
+  // While the line is down, only the last place of each file waits for it.
+  const waiting = outbox.findIndex(message => message.present?.path === path);
+  if (waiting >= 0) outbox.splice(waiting, 1);
+  say({ present: place });
+}
+// Said once the line is open, if it is not yet: what this page asks, as it opens a deck.
+const outbox = [];
+function say(message) { if (events?.readyState === WebSocket.OPEN) events.send(JSON.stringify(message)); else outbox.push(message); }
+// Where the account last showed the file at `path`, on any device, which the authority answers
+// with a present message; a page opens a deck there (viewer.rs).
+function ask(path) { say({ where: path }); }
+// The presentation this page follows (devices.rs), as /api/device described it: /dev/present/NAME,
+// the file it shows, whose it is, and whether this page's account turns it.
+let following = null;
+// Each attend, and each unfollow, starts anew: an answer for an older one is not applied, as the
+// page has left the presentation, or gone to another, meanwhile.
+let followings = 0;
+// The devices this page follows, which the authority tells it the end of.
+const followed = () => [following?.device, hearing?.device].filter(Boolean);
+const follows = () => say({ follow: followed() });
+async function attend(device) {
+  const turn = ++followings;
+  // An answer, or a failure, for an attend the page has left since says nothing.
+  let info;
+  try { info = await (await api('/api/device?path=' + encodeURIComponent(device))).json(); }
+  catch (error) { if (turn === followings) throw error; return; }
+  if (turn !== followings) return;
+  following = info; follows();
+  // Slides and sound together: the presenter's live sound of the same name, if any.
+  if (info.sound && hearing?.device !== info.sound) hear(info.sound).catch(error => console.warn('No live sound', error));
+  // Shown as the presenter shows it, from where they are.
+  if (info.kind === 'pdf') setPlace(info.path, { present: true, ...(info.place ? { page: info.place[0] } : {}) });
+  else setPlace(info.path, { slides: true, ...(info.place ? { slide: info.place } : {}) });
+  return open(info.path, info.kind, false, true);
+}
+function unfollow() { followings++; if (!following) return; following = null; follows(); }
+// Follow the device `name` again, as it shows something else now: the presentation followed, the
+// sound heard, or both; if that may no longer be, the page says so.
+function followAgain(name, presentation, sound) {
+  const again = error => window.dispatchEvent(new CustomEvent('terminal:device', { detail: { name, error: error.message } }));
+  if (presentation && following?.device === name) attend(name).catch(again);
+  if (sound && hearing?.device === name) hear(name).catch(again);
+}
+// A speaker view, which a deck's S opened (viewer.rs): it shows the deck its address names once
+// the terminal runs.
+export function started() {
+  const deck = new URLSearchParams(location.search).get('speaker');
+  if (!deck) return;
+  document.title = 'Speaker view · ' + deck.split('/').pop();
+  void open(deck, /\.slides\.md$/i.test(deck) ? 'slides' : 'markdown');
+}
 // Windows of this browser share its session cookie: each tells the others when it changes it,
 // so that none goes on showing one account while its requests are another's.
 const windows = 'BroadcastChannel' in window ? new BroadcastChannel('terminal-session') : null;
@@ -148,7 +242,7 @@ async function accountCommand(args, cwd) {
     trail.length = 0; showTrail();
     viewerTitle(args[1] ? 'man · ' + args[1] : 'Terminal Worker · Manual'); $('download').hidden = true;
     const article = document.createElement('article'); article.className = 'markdown manual'; article.innerHTML = window.terminalPreview.markdown(text, '/'); $('viewer-content').replaceChildren(article);
-    if (!$('viewer').open) { opener = document.activeElement; $('viewer').showModal(); }
+    if (!$('viewer').open) { opener = document.activeElement; $('viewer').showModal(); placePlayer(); }
     return {};
   }
   if (args[0] === 'vim') {
@@ -185,17 +279,43 @@ async function accountCommand(args, cwd) {
     if (!result) throw new Error('Password change canceled');
     await identityChanged(); return { output: `Password updated for ${username}` };
   }
-  // Signed out, useradd NAME makes an account of one's own, with the password given here.
+  // Signed out, useradd NAME makes an account of one's own, with the password given here: its
+  // home is /guest/NAME, which -m makes, and it is in group guest; other options need sudo. The
+  // shell gives the options as useradd's definition spells them (shell.rs).
   if (args[0] === 'useradd' && !sudo && !(await session()).authenticated) {
-    const force = args.includes('--force');
-    const rest = args.slice(1).filter(arg => arg !== '--force');
-    if (rest.length !== 1 || rest[0].startsWith('-')) throw new Error('Usage: useradd [--force] NAME (signed out: an account of your own, home /guest/NAME); options need sudo');
-    const username = rest[0];
-    const result = await credentials({ title: `Create account ${username}`, description: (force ? '--force enabled: short passwords are allowed, but cannot be empty. ' : 'Use at least 12 characters, or run useradd --force NAME to allow a short password. ') + `Your home will be /guest/${username}, which only you may enter; you will be signed in.`, newPassword: true, action: 'Create account',
-      submit: fields => post('register', { username, password: fields.password, force }) });
+    let createHome = false, shortPassword = false, username = null, operands = false;
+    for (const arg of args.slice(1)) {
+      if (!operands && arg === '--') operands = true;
+      else if (!operands && arg === '-m') createHome = true;
+      else if (!operands && arg === '-M') createHome = false;
+      else if (!operands && arg === '--short-password') shortPassword = true;
+      else if (!operands && arg.startsWith('-')) throw new Error(`useradd: ${arg} needs sudo; signed out, useradd [-m|-M] [--short-password] NAME makes an account of your own, home /guest/NAME, in group guest`);
+      else if (username === null) username = arg;
+      else throw new Error('Usage: useradd [-m|-M] [--short-password] NAME');
+    }
+    if (!username) throw new Error('Usage: useradd [-m|-M] [--short-password] NAME');
+    const home = `/guest/${username}`;
+    const result = await credentials({ title: `Create account ${username}`, description: (shortPassword ? '--short-password: short passwords are allowed, but cannot be empty. ' : 'Use at least 12 characters, or run useradd --short-password NAME to allow a short password. ') + (createHome ? `Your home will be ${home}, which only you may enter; ` : `Your home, ${home}, will not be made (useradd -m makes it); `) + 'you will be signed in.', newPassword: true, action: 'Create account',
+      submit: fields => post('register', { username, password: fields.password, short_password: shortPassword, create_home: createHome }) });
     if (!result) throw new Error('Account creation canceled');
     await identityChanged();
-    return { output: `Created user ${username} and signed in; home ${result.home}`, home: result.home };
+    return result.created_home
+      ? { output: `Created user ${username} and signed in; home ${result.home}`, home: result.home }
+      : { output: `Created user ${username} and signed in; no home (${result.home} is not made)` };
+  }
+  // An account of group guest's deletes itself (userdel [-r] NAME, signed in as NAME), as its
+  // password confirms; others, and root, go to the server, which takes root.
+  if (args[0] === 'userdel' && !sudo) {
+    const remove = args.slice(1).some(arg => arg === '-r' || arg === '--remove');
+    const named = args.slice(1).filter(arg => !arg.startsWith('-'));
+    const current = await session();
+    if (current.authenticated && current.uid !== 0 && current.groups?.includes('guest') && named.length === 1 && named[0] === current.username) {
+      const result = await credentials({ title: `Delete account ${current.username}`, description: `This deletes your account, ends its sessions and signs you out; ${remove ? `-r removes its home, ${current.home}, and everything in it` : 'its home and files stay'}. It cannot be undone.`, action: 'Delete account',
+        submit: fields => post('unregister', { password: fields.password, remove }) });
+      if (!result) throw new Error('Account deletion canceled');
+      await identityChanged();
+      return { output: `Deleted user ${result.deleted}${result.kept ? `; ${result.kept}` : ''}; signed out as guest`, home: '/' };
+    }
   }
   if (['su', 'login'].includes(args[0])) {
     if (sudo) throw new Error('Use su root to switch accounts');
@@ -260,6 +380,77 @@ async function faststartWarning(file) {
 }
 // Cancel the uploads in progress, if any; whether there were.
 function cancelUploads() { if (!uploading) return false; uploading.abort(); return true; }
+// The microphone this page records (stream FILE), into `path`, and sends live as /dev/snd/NAME
+// when it may (sound.mjs); `progress` hears how it goes. Ctrl+C in its tab stops it
+// (stopRecording), which saves what was recorded. Settles with what was saved.
+let recording = null;
+async function recordSound(path, name, acl, progress) {
+  if (recording) throw new Error('This page is recording already; stop it with Ctrl+C in its tab');
+  const controller = recording = new AbortController();
+  let microphone, live = null, liveNote = '', speaking = Promise.resolve();
+  try {
+    try { microphone = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
+    catch (error) { throw new Error('No microphone: ' + error.message); }
+    // Live only, kept nowhere: until Ctrl+C, or the microphone ends.
+    if (!path) {
+      live = await speak(null, name, microphone, acl);
+      const started = performance.now(), track = microphone.getAudioTracks()[0];
+      const seconds = () => (performance.now() - started) / 1000;
+      const say = () => progress(`● live as ${live.device} · ${clock(seconds())}`);
+      const ticking = setInterval(say, 1000); say();
+      try { await new Promise(resolve => { controller.signal.addEventListener('abort', resolve, { once: true }); track.addEventListener('ended', resolve, { once: true }); }); }
+      finally { clearInterval(ticking); }
+      return { seconds: seconds(), device: live.device, note: track.readyState === 'ended' && !controller.signal.aborted ? ' · the microphone stopped' : '' };
+    }
+    const saved = await record(path, microphone, { acl, signal: controller.signal, progress: text => progress(text + liveNote),
+      // Live once the file is there, which its device links to; a recording all the same if not.
+      begun: () => { speaking = speak(path, name, microphone).then(sent => { live = sent; liveNote = ` · live as ${sent.device}`; }, error => { liveNote = ` · not live: ${error.message}`; }); } });
+    await speaking;
+    return { ...saved, device: live?.device ?? null, note: liveNote + (saved.stopped ? ` · ${saved.stopped}` : '') };
+  } finally {
+    recording = null;
+    microphone?.getTracks().forEach(track => track.stop());
+    // A recording that failed may still be connecting its live sound, which ends with it.
+    await speaking;
+    await live?.end();
+    changed();
+  }
+}
+function stopRecording() { if (!recording) return false; recording.abort(); return true; }
+// What this page hears live (/dev/snd/NAME), in a small player of its own, which goes on playing
+// whatever the viewer shows; one sound at a time.
+let hearing = null;
+// Which hear() is the latest: one stopped, or replaced by another, while it connects is let go.
+let hearings = 0;
+async function hear(device) {
+  stopHearing();
+  const turn = ++hearings;
+  // The sound plays from outside the player and the viewer, so that moving them never stops it.
+  const player = $('listening'), audio = Object.assign(document.createElement('audio'), { id: 'listening-audio', autoplay: true, hidden: true });
+  document.body.append(audio);
+  player.hidden = false; player.dataset.state = 'connecting'; $('listening-mute').textContent = 'Mute';
+  $('listening-name').textContent = device;
+  // A sound, or a failure, for a hear the page has left since says nothing.
+  let heard;
+  try { heard = await hearLive(device, audio); }
+  catch (error) { if (turn !== hearings) { audio.remove(); return; } stopHearing(); throw error; }
+  if (turn !== hearings) { heard.stop(); audio.remove(); return; }
+  hearing = { device, stop: heard.stop, version: heard.version }; player.dataset.state = 'live'; follows();
+  // A browser that wants a tap to play sound shows Listen.
+  try { await audio.play(); } catch { if (turn === hearings) player.dataset.state = 'paused'; }
+}
+function stopHearing() {
+  hearings++;
+  hearing?.stop(); hearing = null; follows();
+  $('listening-audio')?.remove();
+  const player = $('listening'); player.hidden = true; delete player.dataset.state;
+}
+$('listening-play').onclick = () => { $('listening-audio')?.play().then(() => { $('listening').dataset.state = 'live'; }, () => {}); };
+$('listening-mute').onclick = () => { const audio = $('listening-audio'); if (!audio) return; audio.muted = !audio.muted; $('listening-mute').textContent = audio.muted ? 'Unmute' : 'Mute'; };
+$('listening-stop').onclick = stopHearing;
+// The player goes where it can be used: in the viewer while it is open, as the page around a
+// modal dialog takes no clicks, and full screen with it. The sound plays from outside both.
+function placePlayer() { ($('viewer').open ? $('viewer-surface') : document.body).append($('listening')); }
 // Open the file chooser now, while the tap or the key that asked for it lets a page open one:
 // phones refuse once a request has been awaited. Settles with the files chosen; none if closed.
 const chooser = Object.assign(document.createElement('input'), { type: 'file', multiple: true });
@@ -352,6 +543,7 @@ document.addEventListener('keydown', event => {
   if (dialog.dispatchEvent(new Event('cancel', { cancelable: true }))) dialog.close();
 });
 $('viewer').addEventListener('close', async () => {
+  unfollow(); placePlayer();
   const returnFocus = opener;
   // Start exiting before removing a fullscreen child (e.g. a video or iframe),
   // and restore focus after the browser finishes its fullscreen transition.
@@ -381,7 +573,7 @@ $('fullscreen').onclick = async () => {
 // Full screen, the preview's bars float over the content, hidden until the pointer moves, as a
 // video player's controls are; they stay while the pointer, or the keyboard's focus, is on one
 // (a button clicked keeps the focus, but not :focus-visible).
-const bars = ':is(.viewer-bar, .preview-bar, .slides-bar)';
+const bars = ':is(.viewer-bar, .preview-bar, .slides-bar, .pdf-toolbar)';
 let chromeTimer;
 function showChrome() {
   const surface = $('viewer-surface');
@@ -392,6 +584,9 @@ function showChrome() {
   }, 2000);
 }
 const fullscreen = () => document.fullscreenElement === $('viewer-surface');
+// A button clicked in the viewer leaves the focus where it was, so that keys go on turning slides
+// and pages: Space would press it again (Fullscreen, say). One tabbed to takes Space and Enter.
+$('viewer-surface').addEventListener('mousedown', event => { if (event.target instanceof Element && event.target.closest('button')) event.preventDefault(); });
 // A tap moves no pointer: pointerdown shows them on touch screens.
 for (const type of ['pointermove', 'pointerdown']) $('viewer-surface').addEventListener(type, () => { if (fullscreen()) showChrome(); });
 $('viewer-surface').addEventListener('focusin', event => { if (fullscreen() && event.target.closest(bars)) showChrome(); });
@@ -404,7 +599,10 @@ document.addEventListener('fullscreenchange', () => {
   else { clearTimeout(chromeTimer); $('viewer-surface').classList.remove('chrome'); }
 });
 window.addEventListener('message', event => { if (event.origin === location.origin && event.source === $('viewer-content').querySelector('iframe')?.contentWindow && event.data === 'close-game') closeViewer(); });
-async function open(path, kind, followed = false) {
+async function open(path, kind, followed = false, attending = false) {
+  if (/^\/dev\/present\/[^/]+$/.test(path)) return attend(path);
+  if (/^\/dev\/snd\/[^/]+$/.test(path)) return hear(path);
+  if (!attending && following?.path !== path) unfollow();
   if (!followed) trail.length = 0;
   const version = await cleanupViewer();
   if (version !== viewerVersion) return;
@@ -412,7 +610,7 @@ async function open(path, kind, followed = false) {
   const content = $('viewer-content'), dialog = $('viewer');
   $('download').hidden = false;
   viewerTitle(path); $('download').href = fileUrl(path); $('download').download = path.split('/').pop();
-  if (!dialog.open) { opener = document.activeElement; dialog.showModal(); }
+  if (!dialog.open) { opener = document.activeElement; dialog.showModal(); placePlayer(); }
   content.textContent = 'Loading...';
   try {
     if (kind === 'game') {
@@ -472,7 +670,7 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, unlock, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
+window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, present, presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, attending: path => following?.path === path ? following : null, unlock, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]')) return;

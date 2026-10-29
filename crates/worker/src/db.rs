@@ -34,7 +34,7 @@ const ROLLBACK: &str = "rollback";
 /// The version of the tables below, which local state made by an older one does not have.
 pub const SCHEMA_VERSION: &str = "3";
 
-const SCHEMA: [&str; 20] = [
+const SCHEMA: [&str; 22] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
@@ -68,6 +68,12 @@ const SCHEMA: [&str; 20] = [
     "CREATE TABLE IF NOT EXISTS job_lines(job TEXT NOT NULL, seq INTEGER NOT NULL, err INTEGER NOT NULL, text TEXT NOT NULL, PRIMARY KEY(job, seq))",
     "CREATE TABLE IF NOT EXISTS job_files(job TEXT NOT NULL, file TEXT NOT NULL, PRIMARY KEY(job, file))",
     "CREATE INDEX IF NOT EXISTS job_files_file ON job_files(file)",
+    // Where each account last showed a deck or a presented PDF (store.rs relay), which its
+    // pages open at, on any device. Tables of their own, made where they are missing.
+    "CREATE TABLE IF NOT EXISTS places(uid INTEGER NOT NULL, path TEXT NOT NULL, col INTEGER NOT NULL, row INTEGER NOT NULL, PRIMARY KEY(uid, path))",
+    // What /dev holds (devices.rs): presentations others follow, whose they are, and the file
+    // presented; `media`, what a live sound has to be heard by.
+    "CREATE TABLE IF NOT EXISTS devices(name TEXT PRIMARY KEY, owner INTEGER NOT NULL, path TEXT NOT NULL, media TEXT, started INTEGER NOT NULL)",
 ];
 
 thread_local! {
@@ -81,6 +87,12 @@ thread_local! {
     static CHANGED: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
     /// Whether a transaction ended sessions, which the pages holding them hear of.
     static ENDED: Cell<bool> = const { Cell::new(false) };
+    /// The devices the running transaction removed, or replaced (true) with one of the same name
+    /// that shows something else, ...
+    static REMOVING: RefCell<Vec<(String, bool)>> = const { RefCell::new(Vec::new()) };
+    /// ... and those committed transactions removed or replaced, which the pages following them
+    /// hear of.
+    static REMOVED: RefCell<Vec<(String, bool)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The directories whose listings committed transactions changed since this was last asked.
@@ -91,6 +103,11 @@ pub fn take_changes() -> BTreeSet<String> {
 /// Whether sessions ended since this was last asked: signed out, renewed, revoked or expired.
 pub fn take_ended() -> bool {
     ENDED.replace(false)
+}
+
+/// The devices committed transactions removed, or replaced (true), since this was last asked.
+pub fn take_removed() -> Vec<(String, bool)> {
+    REMOVED.take()
 }
 
 /// Whether the alarm should run soon, clearing the request.
@@ -161,15 +178,18 @@ pub fn transact<T: 'static>(
         };
         FAILED.with(|f| f.borrow_mut().take());
         CHANGING.take();
+        REMOVING.take();
         let mut db = Db { sql: sql.clone() };
         let (value, commit) = work(&mut db);
         *slot.borrow_mut() = Some(value);
         let changing = CHANGING.take();
+        let removing = REMOVING.take();
         match FAILED.with(|f| f.borrow_mut().take()) {
             Some(error) => JsValue::from_str(&error),
             None if !commit => JsValue::from_str(ROLLBACK),
             None => {
                 CHANGED.with(|changed| changed.borrow_mut().extend(changing));
+                REMOVED.with(|removed| removed.borrow_mut().extend(removing));
                 JsValue::UNDEFINED
             }
         }
@@ -291,6 +311,11 @@ impl File {
     pub fn complete(&self) -> bool {
         self.state == "complete"
     }
+    /// Whether it is a recording still being made (`stream`): it has as many bytes as have
+    /// arrived, in order, and grows by a chunk at a time until it completes.
+    pub fn recording(&self) -> bool {
+        self.state == "recording"
+    }
     /// How many chunks the whole file has.
     pub fn chunk_count(&self) -> u64 {
         self.size.div_ceil(self.chunk_size)
@@ -306,6 +331,15 @@ impl File {
 }
 pub fn etag(file: &str) -> String {
     format!("\"{file}\"")
+}
+/// A device of /dev: its path there, whose it is, the file it presents, and what its live sound
+/// is heard by, if it has one.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Device {
+    pub name: String,
+    pub owner: u32,
+    pub path: String,
+    pub media: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct Chunk {
@@ -506,6 +540,30 @@ impl Db {
             vec![int(now), text(file)],
         );
     }
+    /// Make the new upload `file` a recording, which grows as it is heard.
+    pub fn record_file(&mut self, file: &str) {
+        self.run(
+            "UPDATE files SET state = 'recording' WHERE id = ?",
+            vec![text(file)],
+        );
+    }
+    /// Set the size of the recording `file`, and of the nodes showing it, as it grows; and its
+    /// SHA-256 once it is whole, if known.
+    pub fn grow_file(&mut self, file: &str, size: u64, sha256: Option<&str>) {
+        self.run(
+            "UPDATE files SET size = ?, sha256 = COALESCE(?, sha256) WHERE id = ?",
+            vec![
+                int(size),
+                sha256.map_or(SqlStorageValue::Null, text),
+                text(file),
+            ],
+        );
+        for path in self.showing(file) {
+            if let Some(node) = self.node(&path) {
+                self.set_node(&path, &Node { size, ..node });
+            }
+        }
+    }
     pub fn finish_file(&mut self, file: &str) {
         for path in self.showing(file) {
             changes(&path);
@@ -686,14 +744,14 @@ impl Db {
     /// The unfinished uploads that nodes in directory `dir` show.
     pub fn uploading_in(&self, dir: &str) -> Vec<File> {
         self.rows(
-            "SELECT DISTINCT f.id, f.size, f.chunk_size, f.state, f.sha256, f.uploader, f.target, f.base FROM files f JOIN inodes i ON i.file = f.id JOIN nodes n ON n.ino = i.id WHERE n.parent = ? AND f.state = 'uploading'",
+            "SELECT DISTINCT f.id, f.size, f.chunk_size, f.state, f.sha256, f.uploader, f.target, f.base FROM files f JOIN inodes i ON i.file = f.id JOIN nodes n ON n.ino = i.id WHERE n.parent = ? AND f.state IN ('uploading', 'recording')",
             vec![text(dir)],
         )
     }
     /// The uploads `uploader` has not finished.
     pub fn uploads_of(&self, uploader: u32) -> Vec<File> {
         self.rows(
-            "SELECT id, size, chunk_size, state, sha256, uploader, target, base FROM files WHERE uploader = ? AND state = 'uploading' ORDER BY touched DESC LIMIT 50",
+            "SELECT id, size, chunk_size, state, sha256, uploader, target, base FROM files WHERE uploader = ? AND state IN ('uploading', 'recording') ORDER BY touched DESC LIMIT 50",
             vec![int(uploader)],
         )
     }
@@ -747,12 +805,106 @@ impl Db {
             self.run("DELETE FROM garbage WHERE key = ?", vec![text(key)]);
         }
     }
+    /// Where `uid` last showed the deck or presented PDF at `path`: its column and row (a PDF's
+    /// page and 0).
+    pub fn place(&self, uid: u32, path: &str) -> Option<(u32, u32)> {
+        #[derive(Deserialize)]
+        struct Place {
+            col: u32,
+            row: u32,
+        }
+        self.rows::<Place>(
+            "SELECT col, row FROM places WHERE uid = ? AND path = ?",
+            vec![int(uid), text(path)],
+        )
+        .pop()
+        .map(|place| (place.col, place.row))
+    }
+    pub fn set_place(&mut self, uid: u32, path: &str, (col, row): (u32, u32)) {
+        self.run(
+            "INSERT OR REPLACE INTO places(uid, path, col, row) VALUES(?, ?, ?, ?)",
+            vec![int(uid), text(path), int(col), int(row)],
+        );
+    }
+    /// Forget where `uid` showed anything: its account is gone, and a new one may take its uid.
+    pub fn delete_places(&mut self, uid: u32) {
+        self.run("DELETE FROM places WHERE uid = ?", vec![int(uid)]);
+    }
+    pub fn device(&self, name: &str) -> Option<Device> {
+        self.rows::<Device>(
+            "SELECT name, owner, path, media FROM devices WHERE name = ?",
+            vec![text(name)],
+        )
+        .pop()
+    }
+    /// The devices of `owner` presenting the file at `path`.
+    pub fn presenting(&self, owner: u32, path: &str) -> Vec<Device> {
+        self.rows::<Device>(
+            "SELECT name, owner, path, media FROM devices WHERE owner = ? AND path = ?",
+            vec![int(owner), text(path)],
+        )
+    }
+    /// The names of `owner`'s live sounds.
+    pub fn sounds_of(&self, owner: u32) -> Vec<String> {
+        self.rows::<Device>(
+            "SELECT name, owner, path, media FROM devices WHERE owner = ? AND media IS NOT NULL",
+            vec![int(owner)],
+        )
+        .into_iter()
+        .map(|device| device.name)
+        .collect()
+    }
+    /// The names of `owner`'s devices.
+    pub fn devices_of(&self, owner: u32) -> Vec<String> {
+        self.rows::<Device>(
+            "SELECT name, owner, path, media FROM devices WHERE owner = ?",
+            vec![int(owner)],
+        )
+        .into_iter()
+        .map(|device| device.name)
+        .collect()
+    }
+    pub fn set_device(&mut self, device: &Device, started: u64) {
+        self.run(
+            "INSERT OR REPLACE INTO devices(name, owner, path, media, started) VALUES(?, ?, ?, ?, ?)",
+            vec![
+                text(&device.name),
+                int(device.owner),
+                text(&device.path),
+                device.media.as_deref().map_or(SqlStorageValue::Null, text),
+                int(started),
+            ],
+        );
+    }
+    /// Remove the device `name`, whose followers hear so once this commits.
+    pub fn delete_device(&mut self, name: &str) {
+        self.run("DELETE FROM devices WHERE name = ?", vec![text(name)]);
+        REMOVING.with(|removing| removing.borrow_mut().push((name.to_string(), false)));
+    }
+    /// Note that the device `name` now shows something else, which its followers hear once this
+    /// commits, to follow it again, if they still may.
+    pub fn replaced_device(&mut self, name: &str) {
+        REMOVING.with(|removing| removing.borrow_mut().push((name.to_string(), true)));
+    }
     pub fn set_expiry(&mut self, kind: &str, id: &str, due: u64) {
         self.run(
             "INSERT INTO expiries(kind, id, due) VALUES(?, ?, ?) ON CONFLICT(kind, id) DO UPDATE SET due = excluded.due",
             vec![text(kind), text(id), int(due)],
         );
         ALARM.set(true);
+    }
+    /// When the deadline of `kind` `id` falls, if it has one.
+    pub fn expiry(&self, kind: &str, id: &str) -> Option<u64> {
+        #[derive(Deserialize)]
+        struct Due {
+            due: u64,
+        }
+        self.rows::<Due>(
+            "SELECT due FROM expiries WHERE kind = ? AND id = ?",
+            vec![text(kind), text(id)],
+        )
+        .pop()
+        .map(|d| d.due)
     }
     pub fn clear_expiry(&mut self, kind: &str, id: &str) {
         self.run(
@@ -968,6 +1120,15 @@ impl Store for Db {
         self.rows::<UserRow>(&format!("{USER} WHERE id = ?"), vec![int(id)])
             .pop()
             .map(UserRow::pair)
+    }
+    fn home_of(&self, path: &str) -> Option<u32> {
+        #[derive(Deserialize)]
+        struct Id {
+            id: u32,
+        }
+        self.rows::<Id>("SELECT id FROM users WHERE home = ?", vec![text(path)])
+            .pop()
+            .map(|user| user.id)
     }
     fn users(&self) -> Vec<(String, User)> {
         self.rows::<UserRow>(&format!("{USER} ORDER BY name"), vec![])

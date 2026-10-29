@@ -124,6 +124,8 @@ pub static DEFINITIONS: &[&dyn Definition] = &[
     &Def::<files::Cd>::NEW,
     &Def::<files::Pwd>::NEW,
     &Def::<files::Open>::NEW,
+    &Def::<files::Present>::NEW,
+    &Def::<files::Stream>::NEW,
     &Def::<files::Vim>::NEW,
     &Def::<files::Mkdir>::NEW,
     &Def::<files::Touch>::NEW,

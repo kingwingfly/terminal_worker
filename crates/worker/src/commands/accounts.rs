@@ -1,6 +1,7 @@
 //! Accounts: whoami, id, groups, users, useradd, usermod, userdel, groupadd, groupmod and
 //! groupdel. Those that change accounts are root's; a signed-out useradd NAME goes to
-//! /api/register instead, through the terminal's dialog.
+//! /api/register instead, and an account of group guest's userdel of itself to
+//! /api/unregister, through the terminal's dialog.
 
 use terminal_worker_core::cli::{accounts as args, parse};
 use terminal_worker_core::parent;
@@ -235,20 +236,53 @@ impl ServerCommand for Userdel {
     fn run(&self, ctx: &mut Context) -> Result<String, String> {
         let userdel = parse::<args::Userdel>(ctx.args)?;
         root(ctx)?;
-        let db = &mut *ctx.db;
-        let name = userdel.user.as_str();
-        let user = db.user(name).ok_or("User does not exist")?;
-        if user.id == 0 || user.id == GUEST {
-            return Err(format!("Cannot delete {name}"));
-        }
-        if userdel.remove && db.node(&user.home).is_some() {
+        let kept = delete_account(ctx.db, &userdel.user, userdel.remove)?;
+        Ok(match kept {
+            Some(why) => format!("Deleted user {}; {why}", userdel.user),
+            None => format!("Deleted user {}", userdel.user),
+        })
+    }
+}
+
+/// Delete the account `name`, and with `remove` its home, if it is a directory of its own, as
+/// userdel -r does; its group of the same name goes too, unless another account is in it, as
+/// userdel does (USERGROUPS_ENAB). Its sessions end, its devices end (their followers hear so),
+/// and where it showed decks is forgotten, as a new account may take its uid. Its files keep its
+/// uid. root and guest are never deleted. Says why a home was kept, if it was.
+pub fn delete_account(
+    db: &mut crate::db::Db,
+    name: &str,
+    remove: bool,
+) -> Result<Option<String>, String> {
+    let user = db.user(name).ok_or("User does not exist")?;
+    if user.id == 0 || user.id == GUEST {
+        return Err(format!("Cannot delete {name}"));
+    }
+    let mut kept = None;
+    if remove && let Some(home) = db.node(&user.home) {
+        if home.directory && home.owner == user.id {
             protect_home(db, &user.home, user.id)?;
             db.remove(&Identity::root(), &user.home, true)?;
+        } else {
+            kept = Some(format!("{} is not {name}'s, not removed", user.home));
         }
-        db.delete_user(name);
-        db.delete_sessions(user.id);
-        Ok(format!("Deleted user {name}"))
     }
+    db.delete_user(name);
+    if let Some(gid) = db.group(name).filter(|gid| *gid == user.group)
+        && !SYSTEM_GROUPS.contains(&name)
+        && !db
+            .users()
+            .iter()
+            .any(|(_, other)| other.group == gid || other.groups.contains(&gid))
+    {
+        db.delete_group(name);
+    }
+    db.delete_sessions(user.id);
+    for device in db.devices_of(user.id) {
+        crate::devices::end(db, &device);
+    }
+    db.delete_places(user.id);
+    Ok(kept)
 }
 
 pub struct Groupadd;

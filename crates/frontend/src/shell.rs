@@ -19,7 +19,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::{
     account_command, cancel_choosing, cancel_uploads, choose_files, completion_focus, endpoint,
-    focus_input, listing, request, set_directory,
+    focus_input, listing, request, set_directory, stop_recording,
 };
 
 /// The most transcript lines kept, ...
@@ -118,6 +118,8 @@ pub struct Shell {
     cancelled: RwSignal<bool>,
     /// ... which, for an upload, cancels it, ...
     uploading: RwSignal<bool>,
+    /// ... for a recording (`stream`), stops it, ...
+    recording: RwSignal<bool>,
     /// ... and, waiting for files to upload, gives it none.
     choosing: RwSignal<bool>,
     /// The files the next upload sends: chosen as the command started, or dropped.
@@ -192,8 +194,9 @@ fn spelled(args: &[String]) -> Result<Vec<String>, String> {
         // Signed out, app.js makes the account; signed in, the server, which reads it again.
         "useradd" => {
             let useradd = cli::parse::<accounts::Useradd>(rest)?;
-            option(useradd.force, "--force", None);
+            option(useradd.short_password, "--short-password", None);
             option(useradd.create_home, "-m", None);
+            option(useradd.no_create_home, "-M", None);
             option(false, "-d", useradd.home);
             option(false, "-g", useradd.group);
             option(false, "-G", useradd.groups);
@@ -282,6 +285,7 @@ impl Shell {
             completion_offset: RwSignal::new(0),
             cancelled: RwSignal::new(false),
             uploading: RwSignal::new(false),
+            recording: RwSignal::new(false),
             choosing: RwSignal::new(false),
             chosen: StoredValue::new_local(None),
             detached: RwSignal::new(false),
@@ -545,12 +549,20 @@ impl Shell {
                     ));
                 }
                 for upload in &uploads {
-                    let size = upload["size"].as_u64().unwrap_or(0).max(1);
+                    let id = &upload["id"].as_str().unwrap_or_default()[..8];
+                    let path = upload["path"].as_str().unwrap_or_default();
+                    let size = upload["size"].as_u64().unwrap_or(0);
+                    // A recording has as many bytes as have arrived, and grows.
+                    if upload["recording"] == true {
+                        text.push_str(&format!(
+                            "{id}  recording  {path}  {}\n",
+                            crate::viewer::size(size)
+                        ));
+                        continue;
+                    }
                     text.push_str(&format!(
-                        "{}  uploading  {}  {}%\n",
-                        &upload["id"].as_str().unwrap_or_default()[..8],
-                        upload["path"].as_str().unwrap_or_default(),
-                        upload["received"].as_u64().unwrap_or(0) * 100 / size,
+                        "{id}  uploading  {path}  {}%\n",
+                        upload["received"].as_u64().unwrap_or(0) * 100 / size.max(1),
                     ));
                 }
                 if text.is_empty() {
@@ -566,12 +578,15 @@ impl Shell {
                     Ok(Output::text(format!("Cancelling job {}\n", &id[..8])))
                 } else if let Some(upload) = uploads.iter().find(|u| starts(u)) {
                     let id = upload["id"].as_str().unwrap_or_default();
+                    let path = upload["path"].as_str().unwrap_or_default();
                     request(&format!("/api/uploads?id={id}"), "DELETE").await?;
                     self.refresh().await?;
-                    Ok(Output::text(format!(
-                        "Cancelled the upload of {}\n",
-                        upload["path"].as_str().unwrap_or_default()
-                    )))
+                    // A recording stops, keeping what arrived; an upload is cancelled.
+                    Ok(Output::text(if upload["recording"] == true {
+                        format!("Stopped the recording of {path}; what arrived is kept\n")
+                    } else {
+                        format!("Cancelled the upload of {path}\n")
+                    }))
                 } else {
                     Err(format!("jobs: no job or upload {wanted}"))
                 }
@@ -1176,6 +1191,9 @@ impl Shell {
             self.cancelled.set(true);
             if self.uploading.get_untracked() {
                 cancel_uploads();
+            }
+            if self.recording.get_untracked() {
+                stop_recording();
             }
             if self.choosing.get_untracked() {
                 cancel_choosing();

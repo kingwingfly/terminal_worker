@@ -4,6 +4,8 @@
 // at a time: it holds it, saying every few seconds that it is still there, and no other page
 // resumes it until it has not for a while (api::HOLD). Each chunk carries its own SHA-256, which
 // R2 checks. Others can read a file while it uploads.
+import { json } from './http.mjs';
+
 const PARALLEL = 3;
 const RETRIES = 3;
 const HEARTBEAT = 5000;
@@ -17,11 +19,6 @@ try { for (const key of Object.keys(localStorage)) if (key.startsWith('terminal-
 
 export class Cancelled extends Error { constructor() { super('Upload cancelled'); this.name = 'Cancelled'; } }
 
-async function json(response) {
-  let body = {}; try { body = await response.json(); } catch {}
-  if (!response.ok) { const error = new Error(body.error || `Request failed (${response.status})`); error.status = response.status; throw error; }
-  return body;
-}
 // As the file panel counts it (lib.rs upload_progress): whole percents of the bytes arrived.
 const percent = (done, total) => total ? Math.floor(done * 100 / total) + '%' : '100%';
 

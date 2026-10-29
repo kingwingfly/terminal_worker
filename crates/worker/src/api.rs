@@ -2,9 +2,10 @@
 //! awaiting (reading the body, hashing a password) is done. It never touches file bytes; the
 //! Worker asks it whether it may, and tells it what it wrote.
 use crate::db::{Db, File, etag, transact};
-use crate::{auth, commands, jobs};
+use crate::{auth, commands, devices, jobs, sound};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use terminal_worker_core::devices::{PRESENT, SOUND};
 use terminal_worker_core::{
     CHUNK_SIZE, Listing, MAX_FILE, MAX_UPLOAD, mime, permissions::*, resolve,
 };
@@ -12,6 +13,19 @@ use worker::*;
 
 /// How long an upload may go without a new chunk before it is cancelled, in seconds.
 pub const UPLOAD_TTL: u64 = 24 * 60 * 60;
+/// The chunks of a recording (`stream`): small, as each is sent once it is whole, and lost if
+/// its page goes first (about half a minute of speech at 64 kbit/s); not too small, as reading a
+/// file takes an R2 request a chunk, of the Worker's subrequests (1000 a request).
+pub const RECORDING_CHUNK: u64 = 256 * 1024;
+/// The most a recording may be: as many chunks as one read can take, with room for what else it
+/// asks (240 MiB, about eight hours at 64 kbit/s).
+pub const RECORDING_MAX: u64 = RECORDING_CHUNK * 960;
+/// How long a recording's page may go unheard (chunks, its hold) before the recording is
+/// completed with what arrived, in seconds.
+pub const RECORDING_IDLE: u64 = 10 * 60;
+/// What a recording that reached the most it may be is told: it takes no more.
+const RECORDING_FULL: &str =
+    "The recording reached the most a recording may be (240 MB, about eight hours)";
 
 pub struct Reply {
     pub status: u16,
@@ -68,6 +82,8 @@ pub fn denied(message: &str, who: &Identity) -> Reply {
     } else if message.contains("already exists")
         || message.contains("with this name")
         || message.contains("This is a directory")
+        || message.contains("File exists")
+        || message.contains("Device or resource busy")
     {
         409
     } else {
@@ -76,7 +92,7 @@ pub fn denied(message: &str, who: &Identity) -> Reply {
     Reply::error(message, status)
 }
 
-fn run(state: &State, work: impl FnOnce(&mut Db) -> Reply + 'static) -> Result<Reply> {
+pub fn run(state: &State, work: impl FnOnce(&mut Db) -> Reply + 'static) -> Result<Reply> {
     transact(state, move |db| {
         let reply = work(db);
         let commit = reply.commit;
@@ -154,6 +170,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         (Method::Post, "/api/sudo") => sudo(req, env, state, key).await,
         (Method::Post, "/api/passwd") => passwd(req, env, state, key, https).await,
         (Method::Post, "/api/register") => register(req, env, state, key, https).await,
+        (Method::Post, "/api/unregister") => unregister(req, env, state, key, https).await,
         (Method::Post, "/api/command") => {
             if !body_size(req, 1 << 20) {
                 return Ok(Reply::error(
@@ -229,6 +246,57 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             acl!(db.mkdir(&who, &real, true), &who);
             Reply::ok(json!({"path":path}))
         }),
+        // Presentations (devices.rs): start one of the file at `path`, as `name`; stop one; and
+        // what one at `path` (/dev/present/NAME) shows, to follow it.
+        (Method::Post, "/api/present") => {
+            let name = param("name");
+            run(state, move |db| {
+                let who = auth::identity(db, key.as_deref());
+                let name = (!name.is_empty()).then_some(name.as_str());
+                Reply::ok(acl!(devices::start(db, &who, &path, name), &who))
+            })
+        }
+        (Method::Delete, "/api/present") => {
+            let name = param("name");
+            run(state, move |db| {
+                let who = auth::identity(db, key.as_deref());
+                Reply::ok(acl!(devices::stop(db, &who, PRESENT, &name, None), &who))
+            })
+        }
+        // Live sound (sound.rs): send it, as the recording at `path` is made; stop it; hear the
+        // device at `path` (/dev/snd/NAME); answer what Realtime offered, to hear it.
+        (Method::Post, "/api/sound") => {
+            let name = Some(param("name")).filter(|name| !name.is_empty());
+            let entries = Some(param("acl")).filter(|entries| !entries.is_empty());
+            // Of a recording, or kept nowhere.
+            let recording = (!param("path").is_empty()).then_some(path);
+            sound::speak(req, env, state, key, recording, name, entries).await
+        }
+        // The page sending a live sound still does: it lasts (devices::SOUND_IDLE).
+        (Method::Post, "/api/sound/hold") => {
+            let (name, version) = (param("name"), param("version"));
+            run(state, move |db| {
+                let who = auth::identity(db, key.as_deref());
+                Reply::ok(acl!(devices::keep(db, &who, &name, &version), &who))
+            })
+        }
+        (Method::Delete, "/api/sound") => {
+            let name = param("name");
+            let version = Some(param("version")).filter(|version| !version.is_empty());
+            run(state, move |db| {
+                let who = auth::identity(db, key.as_deref());
+                let stopped = devices::stop(db, &who, SOUND, &name, version.as_deref());
+                Reply::ok(acl!(stopped, &who))
+            })
+        }
+        (Method::Post, "/api/sound/listen") => sound::listen(req, env, state, key, path).await,
+        (Method::Put, "/api/sound/answer") => {
+            sound::answer(req, env, state, param("session")).await
+        }
+        (Method::Get, "/api/device") => run(state, move |db| {
+            let who = auth::identity(db, key.as_deref());
+            Reply::ok(acl!(devices::attend(db, &who, &path), &who))
+        }),
         (Method::Delete, "/api/file") => {
             let recursive = flag("recursive");
             run(state, move |db| {
@@ -298,16 +366,29 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         (Method::Post, "/api/uploads") => {
             #[derive(Deserialize)]
             struct Start {
-                size: u64,
+                /// What it will be; a recording has none yet.
+                size: Option<u64>,
                 sha256: Option<String>,
                 #[serde(default)]
                 overwrite: bool,
                 if_match: Option<String>,
+                /// A recording (`stream`): a new file of no size yet, which grows.
+                #[serde(default)]
+                record: bool,
+                /// A recording's ACL entries, as setfacl -m takes them (stream -m).
+                #[serde(default)]
+                acl: Option<String>,
             }
             if !body_size(req, 4096) {
                 return Ok(Reply::error("Invalid upload request", 400));
             }
-            let Ok(start) = req.json::<Start>().await else {
+            let Ok(start) = req.json::<Start>().await.map_err(|_| ()).and_then(|start| {
+                if start.record || start.size.is_some() {
+                    Ok(start)
+                } else {
+                    Err(())
+                }
+            }) else {
                 return Ok(Reply::error("Invalid upload request", 400));
             };
             if start
@@ -320,24 +401,48 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     400,
                 ));
             }
+            if start.record && !matches!(mime(&path), "audio/webm" | "video/webm") {
+                return Ok(Reply::error(
+                    "A recording is Opus in WebM: name it NAME.weba",
+                    400,
+                ));
+            }
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
-                begin_upload(
+                let reply = begin_upload(
                     db,
                     &who,
                     &path,
                     Begun {
-                        size: start.size,
-                        chunk_size: CHUNK_SIZE,
+                        size: start.size.filter(|_| !start.record).unwrap_or(0),
+                        chunk_size: if start.record {
+                            RECORDING_CHUNK
+                        } else {
+                            CHUNK_SIZE
+                        },
                         limit: MAX_FILE,
-                        sha256: start.sha256,
-                        overwrite: start.overwrite,
+                        sha256: start.sha256.filter(|_| !start.record),
+                        overwrite: start.overwrite && !start.record,
                         if_match: start.if_match,
                         if_none_match: None,
                         mode: None,
                         hold: true,
                     },
-                )
+                );
+                if start.record
+                    && reply.status < 400
+                    && let Some(id) = reply.body["id"].as_str().map(str::to_string)
+                {
+                    db.record_file(&id);
+                    db.set_expiry("upload", &id, auth::now() + RECORDING_IDLE);
+                    // Who may hear it, as it is made (stream -m), or it is not made.
+                    if let (Some(entries), Some(made)) = (&start.acl, db.showing(&id).pop())
+                        && let Err(message) = devices::grant(db, &who, &made, entries)
+                    {
+                        return denied(&message, &who);
+                    }
+                }
+                reply
             })
         }
         // The page sending an upload is still there: it keeps its hold.
@@ -359,7 +464,14 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 // arrive after it. A page that goes on sending without one is refused once
                 // another resumes the upload, holding it.
                 match held(db, &id, Some(&hold)) {
-                    Ok(()) => Reply::ok(json!({"held": true})),
+                    Ok(()) => {
+                        // A recording lasts while its page is heard; its live sound, as that page
+                        // keeps it (/api/sound/hold).
+                        if file.recording() {
+                            db.set_expiry("upload", &id, auth::now() + RECORDING_IDLE);
+                        }
+                        Reply::ok(json!({"held": true}))
+                    }
                     Err(reply) => reply,
                 }
             })
@@ -402,8 +514,18 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
         (Method::Post, "/api/uploads/complete") => {
             let id = param("id");
             let hold = param("hold");
+            // A recording's, which nobody knew before it ended.
+            let sha256 = Some(param("sha256"))
+                .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()));
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
+                if let Some(sha256) = &sha256
+                    && let Some(file) = db
+                        .file(&id)
+                        .filter(|f| f.recording() && f.uploader == who.id)
+                {
+                    db.grow_file(&id, file.size, Some(sha256));
+                }
                 finish_upload(db, &who, &id, Some(&hold), true)
             })
         }
@@ -425,6 +547,12 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 // jobs cancel ID, which holds nothing, cancels it wherever it goes on.
                 if !hold.is_empty() && db.hold(&id).is_some_and(|(token, _)| token != hold) {
                     return Reply::error(ELSEWHERE, 409);
+                }
+                // A recording is stopped, not cancelled: it keeps what arrived, as when its page
+                // goes, and its live sound ends.
+                if file.recording() {
+                    finish_recording(db, &file);
+                    return Reply::ok(json!({"stopped":true}));
                 }
                 cancel(db, &file);
                 Reply::ok(json!({"cancelled":true}))
@@ -448,6 +576,27 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 }
                 if let Err(reply) = held(db, &id, Some(&hold)) {
                     return reply;
+                }
+                // A recording takes its next chunk, whole or, last, short; or one sent again.
+                if file.recording()
+                    && index == Some(file.chunk_count())
+                    && file.size.is_multiple_of(file.chunk_size)
+                {
+                    if !length.is_some_and(|n| n > 0 && n <= file.chunk_size) {
+                        return Reply::error(
+                            &format!("A recording's chunk is at most {} bytes", file.chunk_size),
+                            400,
+                        );
+                    }
+                    if file.size + length.unwrap_or_default() > RECORDING_MAX {
+                        return Reply::error(RECORDING_FULL, 413);
+                    }
+                    let (path, _) = match destination(db, &who, &file) {
+                        Ok(found) => found,
+                        Err(reply) => return reply,
+                    };
+                    let index = file.chunk_count();
+                    return Reply::ok(json!({"key": chunk_key(&id, index), "mime": mime(&path)}));
                 }
                 let Some(index) = index.filter(|i| *i < file.chunk_count()) else {
                     return Reply::error("Chunk index is out of range", 400);
@@ -475,6 +624,8 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 #[serde(default)]
                 complete: bool,
                 hold: Option<String>,
+                /// The chunk's length, which a recording grows by.
+                length: Option<u64>,
             }
             let Ok(commit) = req.json::<Commit>().await else {
                 return Ok(Reply::error("Invalid upload request", 400));
@@ -489,6 +640,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     commit.sha256,
                     commit.hold.as_deref(),
                     commit.complete,
+                    commit.length,
                 )
             })
         }
@@ -577,7 +729,12 @@ fn job_reply(
         let uploads: Vec<Value> = db
             .uploads_of(who.id)
             .iter()
-            .map(|f| json!({"id": f.id, "path": f.target, "size": f.size, "received": db.received(f)}))
+            .map(|f| {
+                json!({
+                    "id": f.id, "path": f.target, "size": f.size, "received": db.received(f),
+                    "recording": f.recording(),
+                })
+            })
             .collect();
         return Reply::ok(json!({"jobs": jobs, "uploads": uploads}));
     }
@@ -800,6 +957,8 @@ fn job_reply(
             body["sha256"].as_str().map(String::from),
             None,
             body["complete"] == true,
+            // Jobs write whole files, never recordings.
+            None,
         ),
         (Method::Post, "/internal/job/abort") => {
             if let Some(file) = db.file(body["upload"].as_str().unwrap_or_default())
@@ -1060,6 +1219,7 @@ fn held(db: &mut Db, file: &str, hold: Option<&str>) -> std::result::Result<(), 
 /// Record `chunk`, an index and the object written for it, as part of upload `id`, and complete
 /// the upload if asked. A chunk is committed once: what readers have seen of it never changes,
 /// and an object written for nothing goes to the garbage.
+#[allow(clippy::too_many_arguments)]
 fn commit_upload(
     db: &mut Db,
     who: &Identity,
@@ -1068,12 +1228,43 @@ fn commit_upload(
     sha256: Option<String>,
     hold: Option<&str>,
     complete: bool,
+    length: Option<u64>,
 ) -> Reply {
     let Some((index, key)) = chunk else {
         return finish_upload(db, who, id, hold, complete);
     };
     if !chunk_of(&key, id, index) {
         return Reply::error("Chunk key does not belong to this upload", 400);
+    }
+    // A recording's next chunk, which it grows by.
+    let growing = db.file(id).filter(|file| {
+        file.recording()
+            && file.uploader == who.id
+            && index == file.chunk_count()
+            && file.size.is_multiple_of(file.chunk_size)
+    });
+    if let Some(file) = growing {
+        let length = length.filter(|n| *n > 0 && *n <= file.chunk_size);
+        let refused = match (
+            length,
+            held(db, id, hold).and_then(|()| destination(db, who, &file)),
+        ) {
+            (None, _) => Some(Reply::error("A recording's chunk must say its length", 400)),
+            (Some(length), _) if file.size + length > RECORDING_MAX => {
+                Some(Reply::error(RECORDING_FULL, 413))
+            }
+            (_, Err(reply)) => Some(reply),
+            _ => None,
+        };
+        if let (Some(length), None) = (length, &refused) {
+            let now = auth::now();
+            db.add_chunk(id, index, &key, sha256.as_deref(), now);
+            db.grow_file(id, index * file.chunk_size + length, None);
+            db.set_expiry("upload", id, now + RECORDING_IDLE);
+            return Reply::ok(json!({"committed":index}));
+        }
+        db.discard(&key);
+        return refused.expect("refused").keep();
     }
     let refused = match db.file(id) {
         None => Some(Reply::error("Upload was cancelled or has expired", 409)),
@@ -1156,6 +1347,9 @@ fn finish_upload(
         );
     }
     db.finish_file(id);
+    if file.recording() {
+        end_live(db, &file, &path);
+    }
     Reply::ok(json!({"path":path,"size":file.size,"etag":file.etag()}))
         .status(if file.base.is_none() { 201 } else { 200 })
 }
@@ -1199,6 +1393,27 @@ fn destination(
         }
         (None, Some(node)) if node.owner == who.id || who.allows(&node, WRITE) => Ok((path, node)),
         (None, _) => Err(denial()),
+    }
+}
+
+/// A recording whose page went away: it is complete with what arrived, in order; one with
+/// nothing is abandoned. Its live sound ends.
+pub fn finish_recording(db: &mut Db, file: &File) {
+    if let Some(path) = db.showing(&file.id).pop() {
+        end_live(db, file, &path);
+    }
+    // A recording takes only its next chunk, so what arrived is all there, in order.
+    if file.size == 0 {
+        return cancel(db, file);
+    }
+    db.finish_file(&file.id);
+}
+
+/// End the live sound of the recording `file`, which shows at `path`: a recording that ended is
+/// live no more.
+fn end_live(db: &mut Db, file: &File, path: &str) {
+    for device in db.presenting(file.uploader, path) {
+        devices::end(db, &device.name);
     }
 }
 
@@ -1479,8 +1694,76 @@ async fn passwd(
 /// The most accounts guests may make, all told.
 const REGISTERED_MAX: usize = 1000;
 
-/// useradd NAME, signed out: an account of one's own, in its own group and in guest's, with a
-/// home in /guest that only it may enter, and the password given; signed in as it at once.
+/// An account of group guest's deleting itself (userdel NAME, signed in as NAME), as its
+/// password confirms, and with `remove` its home: its sessions end, this one too.
+async fn unregister(
+    req: &mut Request,
+    env: &Env,
+    state: &State,
+    key: Option<String>,
+    https: bool,
+) -> Result<Reply> {
+    let who = read(state, {
+        let key = key.clone();
+        move |db| auth::identity(db, key.as_deref())
+    })?;
+    if who.id == GUEST {
+        return Ok(Reply::error("Sign in first", 401));
+    }
+    if who.id == 0 || !who.groups.contains(&GUEST) {
+        return Ok(Reply::error(
+            "Permission denied: an account deletes itself only if it is in group guest; root deletes others with sudo userdel",
+            403,
+        ));
+    }
+    if auth::limited(req, env, "unregister").await? {
+        return Ok(Reply::error(
+            "Too many attempts; please try again later",
+            429,
+        ));
+    }
+    if !body_size(req, 2048) {
+        return Ok(Reply::error("Invalid account request", 400));
+    }
+    #[derive(Deserialize)]
+    struct Unregister {
+        password: String,
+        #[serde(default)]
+        remove: bool,
+    }
+    let Ok(wanted) = req.json::<Unregister>().await else {
+        return Ok(Reply::error("Invalid account request", 400));
+    };
+    let (name, user) = read(state, {
+        let id = who.id;
+        move |db| {
+            let name = db.username(id);
+            let user = db.user(&name);
+            (name, user)
+        }
+    })?;
+    let Some(user) = user.filter(|user| user.id == who.id) else {
+        return Ok(Reply::error("User does not exist", 404));
+    };
+    if !auth::verify(&wanted.password, &user, env).await? {
+        return Ok(Reply::error("Incorrect password", 401));
+    }
+    run(state, move |db| {
+        if auth::identity(db, key.as_deref()).id != who.id {
+            return Reply::error("Signed out meanwhile; please try again", 409);
+        }
+        let kept = match commands::accounts::delete_account(db, &name, wanted.remove) {
+            Ok(kept) => kept,
+            Err(message) => return denied(&message, &who),
+        };
+        Reply::ok(json!({ "username": "guest", "deleted": name, "home": "/", "kept": kept }))
+            .cookie(auth::cookie(https, "", 0))
+    })
+}
+
+/// useradd NAME, signed out: an account of one's own, in its own group and in guest's, its home
+/// /guest/NAME (made, only it may enter, with -m), and the password given; signed in as it at
+/// once.
 async fn register(
     req: &mut Request,
     env: &Env,
@@ -1511,8 +1794,12 @@ async fn register(
     struct Register {
         username: String,
         password: String,
+        /// One shorter than 12 characters is meant (useradd --short-password).
         #[serde(default)]
-        force: bool,
+        short_password: bool,
+        /// Its home, /guest/NAME, is made too (useradd -m).
+        #[serde(default)]
+        create_home: bool,
     }
     let Ok(wanted) = req.json::<Register>().await else {
         return Ok(Reply::error("Invalid account request", 400));
@@ -1530,12 +1817,13 @@ async fn register(
             400,
         ));
     }
-    if !wanted.force && !auth::password_valid(&wanted.password) {
+    if !wanted.short_password && !auth::password_valid(&wanted.password) {
         return Ok(Reply::error(
-            "Use at least 12 characters; useradd --force allows a short password",
+            "Use at least 12 characters; useradd --short-password allows a short password",
             400,
         ));
     }
+    let create_home = wanted.create_home;
     // Refused before the slow hash, and again in the transaction that makes it.
     let taken = |db: &Db, name: &str| {
         if db.user(name).is_some() || db.group(name).is_some() {
@@ -1592,9 +1880,13 @@ async fn register(
                 hash,
             },
         );
-        db.set_node(&home, &Node::directory(uid, gid, 0o700));
+        // Its home is /guest/NAME, made as useradd -m makes one, or not at all.
+        if create_home {
+            db.set_node(&home, &Node::directory(uid, gid, 0o700));
+        }
         let (mut body, token) = auth::issue(db, key.as_deref(), uid);
         body["home"] = json!(home);
+        body["created_home"] = json!(create_home);
         Reply::ok(body)
             .status(201)
             .cookie(auth::cookie(https, &token, auth::TTL))

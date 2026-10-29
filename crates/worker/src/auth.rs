@@ -125,12 +125,16 @@ pub async fn verify(password: &str, user: &User, env: &Env) -> Result<bool> {
             == 0)
 }
 pub async fn limited(req: &Request, env: &Env, action: &str) -> Result<bool> {
+    limited_by(req, env, "LOGIN_LIMIT", action).await
+}
+/// Whether the client of `req` did `action` too often, as the rate limiter `binding` counts.
+pub async fn limited_by(req: &Request, env: &Env, binding: &str, action: &str) -> Result<bool> {
     let ip = req
         .headers()
         .get("CF-Connecting-IP")?
         .unwrap_or_else(|| "local".into());
     Ok(!env
-        .rate_limiter("LOGIN_LIMIT")?
+        .rate_limiter(binding)?
         .limit(format!("{action}:{ip}"))
         .await?
         .success)

@@ -415,7 +415,21 @@ pub trait Store {
         if !node.directory {
             return Err("Parent path is not a directory".into());
         }
+        // A home not made yet is its account's to make, or root's: no one else takes its name,
+        // as anyone could in /guest, which everyone may write in.
+        if who.id != 0 && self.home_of(path).is_some_and(|owner| owner != who.id) {
+            return Err(format!(
+                "Permission denied: {path} is another account's home"
+            ));
+        }
         Ok(())
+    }
+    /// The account whose home is `path`, if any.
+    fn home_of(&self, path: &str) -> Option<u32> {
+        self.users()
+            .into_iter()
+            .find(|(_, user)| user.home == path)
+            .map(|(_, user)| user.id)
     }
     /// Whether `who` may remove or rename `node`, named `path`, from its directory, which it
     /// may write: in a sticky one, only its owner, the directory's owner and root may.
@@ -1830,6 +1844,37 @@ mod tests {
         // Removing a link leaves what it points to.
         c.remove(&alice(), "/home/alice/rel", false).unwrap();
         assert!(c.names.contains_key("/home/alice/docs/b.md"));
+    }
+    #[test]
+    fn a_home_not_made_yet_is_its_accounts_to_make() {
+        let mut c = store();
+        c.set_node("/guest", &Node::directory(0, 0, 0o1777));
+        c.set_user(
+            "alice",
+            &User {
+                id: 1000,
+                group: 1000,
+                groups: BTreeSet::new(),
+                home: "/guest/alice".into(),
+                locked: false,
+                salt: String::new(),
+                hash: String::new(),
+            },
+        );
+        // /guest is anyone's to write in, but not to take another's home in.
+        for made in [
+            c.mkdir(&bob(), "/guest/alice", false),
+            c.symlink(&bob(), "/tmp", "/guest/alice", false),
+        ] {
+            assert!(made.unwrap_err().contains("another account's home"));
+        }
+        c.mkdir(&bob(), "/guest/bob-notes", false).unwrap();
+        assert!(
+            c.rename(&bob(), "/guest/bob-notes", "/guest/alice", false)
+                .is_err()
+        );
+        c.mkdir(&alice(), "/guest/alice", false).unwrap();
+        assert_eq!(c.node("/guest/alice").unwrap().owner, 1000);
     }
     #[test]
     fn links_in_a_sticky_directory_others_may_write_are_followed_only_by_their_owners() {

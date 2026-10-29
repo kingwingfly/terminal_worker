@@ -90,6 +90,10 @@ test('long names keep one line and scroll; titles keep the file name; either pan
   const [title, text] = await page.locator('#viewer-title').evaluate(e => [e.getBoundingClientRect(), e.firstElementChild.getBoundingClientRect()].map(r => [r.left, r.right]));
   expect(text[1]).toBeLessThanOrEqual(title[1] + 1); expect(text[0]).toBeLessThan(title[0]);
   expect(await page.locator('.viewer-bar').evaluate(e => e.scrollWidth <= e.clientWidth)).toBe(true);
+  // The download button shows too, small, within the bar.
+  await expect(page.getByRole('link', { name: 'Download' })).toBeVisible();
+  const [bar, link] = await page.evaluate(() => [document.querySelector('.viewer-bar'), document.getElementById('download')].map(e => e.getBoundingClientRect().right));
+  expect(link).toBeLessThanOrEqual(bar);
   // Escape closes the dialog, and the page takes the key, which Safari would also take to leave
   // a full-screen window.
   await page.evaluate(() => window.addEventListener('keydown', e => { window.escapeTaken = e.defaultPrevented; }));

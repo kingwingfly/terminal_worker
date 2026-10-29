@@ -30,6 +30,15 @@ extern "C" {
     fn upload_files(files: &JsValue, path: &str, progress: &js_sys::Function) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = cancelUploads)]
     fn cancel_uploads() -> bool;
+    #[wasm_bindgen(js_namespace = terminal, js_name = recordSound)]
+    fn record_sound(
+        path: Option<String>,
+        name: Option<String>,
+        acl: Option<String>,
+        progress: &js_sys::Function,
+    ) -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = terminal, js_name = stopRecording)]
+    fn stop_recording() -> bool;
     #[wasm_bindgen(js_namespace = terminal, js_name = cancelChoosing)]
     fn cancel_choosing() -> bool;
     #[wasm_bindgen(js_namespace = terminal, js_name = setDirectory)]
@@ -110,6 +119,9 @@ fn file_icon(kind: &str, directory: bool) -> impl IntoView + use<> {
 /// How much of a file still uploading has arrived, as shown after its name.
 fn upload_progress(entry: &Entry) -> Option<String> {
     let uploaded = entry.uploaded?;
+    if entry.recording {
+        return Some("● recording".into());
+    }
     // An empty file has all of itself.
     Some(format!(
         "↑ {}%",
