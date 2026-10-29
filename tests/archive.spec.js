@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { crc32 } from 'node:zlib';
-import { call, errno, listing, mkdirp, program, put, rmrf } from './sys.js';
+import { api, call, errno, listing, mkdirp, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -14,7 +14,7 @@ test.beforeEach(async ({ request, page }) => {
   base = '/archive-' + Date.now().toString(36);
   headers = { Origin: origin, 'CF-Connecting-IP': 'archive-' + base };
   await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'archive-ui-' + base });
-  expect((await request.post('/api/login', { headers, data: { password } })).ok()).toBe(true);
+  expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
   for (const dir of ['/docs/deep', '/ro']) await mkdirp(request, base + dir);
   const files = { 'docs/a.md': 'alpha\n'.repeat(2000), 'docs/deep/spéctrum notes.txt': 'γάμμα\n', 'docs/run.sh': '#!/bin/sh\necho hi\n' };
   for (const [name, text] of Object.entries(files)) expect((await put(request, file(base + '/' + name), { headers, data: text })).status()).toBe(201);

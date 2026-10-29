@@ -3,6 +3,7 @@ import { uploadFile, Cancelled } from './upload.mjs';
 import { record, clock } from './record.mjs';
 import { speak, listen as hearLive } from './sound.mjs';
 import * as dev from './dev.mjs';
+import { answered as resultOf, call, sys } from './http.mjs';
 
 let configuration;
 export const ready = fetch('/terminal-config.json').then(async response => {
@@ -25,9 +26,16 @@ async function api(url, options) {
   if (!response.ok) { let error; try { error = (await response.json()).error; } catch {} const failure = new Error(error || `Request failed (${response.status})`); failure.status = response.status; throw failure; }
   return response;
 }
-async function session(path = directory) { return (await api('/api/session?path=' + encodeURIComponent(path))).json(); }
-// Endpoints that change this browser's session. The session one replaces ends as it answers,
-// which this page hears of before its own identityChanged: until then, that is not news.
+// Who this session is (getcreds), and whether it may write in the directory `path` (access).
+async function session(path = directory) {
+  const [creds, writable] = await sys(['getcreds', { access: { path, mode: 3 } }]);
+  const who = resultOf(creds);
+  return { authenticated: who.signed_in, writable: who.signed_in, username: who.user, uid: who.uid, group: who.group,
+    groups: who.group_names, home: who.home, can_sudo: who.can_sudo, sudo_active: who.sudo_active, can_write: 'ok' in writable };
+}
+// The account calls that change this browser's session. The session one replaces ends as it
+// answers, which this page hears of before its own identityChanged: until then, that is not
+// news.
 const SESSION_CHANGES = new Set(['login', 'logout', 'passwd', 'register', 'unregister']);
 let changingSession = 0;
 async function post(endpoint, data) {
@@ -35,8 +43,17 @@ async function post(endpoint, data) {
   if (changes) changingSession++;
   try { return await postJson(endpoint, data); } catch (error) { if (changes) changingSession--; throw error; }
 }
+// The account system calls, as the dialogs below ask them (crates/worker/src/sys.rs).
 async function postJson(endpoint, data) {
-  return (await api('/api/' + endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) })).json();
+  switch (endpoint) {
+    case 'login': return call('login', { username: data.username ?? 'root', password: data.password ?? '' }, { sudo: !!data.sudo });
+    case 'logout': return call('logout');
+    case 'sudo': return call('sudo', { password: data.password ?? '', revoke: !!data.revoke });
+    case 'passwd': return call('passwd', { username: data.username ?? null, password: data.password ?? '', current_password: data.current_password ?? null, force: !!data.force }, { sudo: !!data.sudo });
+    case 'register': return call('useradd', { name: data.username, password: data.password ?? '', short_password: !!data.short_password, create_home: !!data.create_home });
+    case 'unregister': return call('userdel', { name: (await call('getcreds')).user, remove: !!data.remove, password: data.password ?? '' });
+  }
+  throw new Error('no such account call: ' + endpoint);
 }
 // One dialog at a time: a request made while another is open, as from another tab, waits for it
 // to close and then asks its own question, rather than receiving the other's answer.
@@ -141,7 +158,7 @@ function listen() {
 }
 // The line opens once the browser has its session, signed out too (its terminal_guest cookie,
 // which the first request is given): a driver's news to it is for that session.
-fetch('/api/session').catch(() => {}).finally(listen);
+sys(['getcreds']).catch(() => {}).finally(listen);
 // Slides and PDFs presented follow each other (owner's request, 2026-10-28): the place a page
 // presents (viewer.rs calls present) shows in this browser's other windows showing that file,
 // and in the account's pages signed in elsewhere, which the authority tells (store.rs relay).
@@ -351,8 +368,8 @@ async function accountCommand(args, cwd) {
     if (sudo || args.length !== 1) throw new Error(`Usage: ${args[0]}`);
     await post('logout', {}); await identityChanged(); return { output: 'Signed out as guest (access depends on directory permissions)', home: '/' };
   }
-  const result = await post('command', { args, cwd, sudo });
-  changed(); return result;
+  // The rest are user space's programs, which the shell runs (crates/userland).
+  return { program: true };
 }
 let uploading = null;
 // Upload `files` into `path`, one after another, in chunks that resume if interrupted;

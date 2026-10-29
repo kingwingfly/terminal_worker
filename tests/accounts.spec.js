@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { entry, mkdirp, program, rmrf } from './sys.js';
+import { api, entry, mkdirp, program, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 let sequence = 0;
@@ -29,7 +29,7 @@ async function answer(page, password, confirm = true) {
 let root;
 test.beforeAll(async () => {
   root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
-  expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
+  expect((await api(root, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
 });
 test.afterAll(async () => { await root.dispose(); });
 const stat = path => entry(root, path);
@@ -82,7 +82,7 @@ test('an account in group guest deletes itself with its password; others need ro
   const one = await visitor(browser);
   // An account root made, in no group guest.
   expect((await command(['useradd', '-m', kept])).ok()).toBe(true);
-  expect((await root.post('/api/passwd', { data: { username: kept, password } })).ok()).toBe(true);
+  expect((await api(root, 'passwd', { data: { username: kept, password } })).ok()).toBe(true);
   try {
     await run(one.page, `useradd -m ${self}`); await answer(one.page, password);
     await expect(last(one.page)).toContainText(`Created user ${self} and signed in`);
@@ -110,16 +110,16 @@ test('an account in group guest deletes itself with its password; others need ro
     expect(await stat('/guest/' + self)).not.toBe(null);
     await rmrf(root, '/guest/' + self);
     const again = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('again') } });
-    expect((await again.post('/api/login', { data: { username: self, password } })).ok()).toBe(false);
+    expect((await api(again, 'login', { data: { username: self, password } })).ok()).toBe(false);
     await again.dispose();
     // An account in no group guest is root's to delete, itself too.
     const other = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': address('kept') } });
-    expect((await other.request.post('/api/login', { headers: { Origin: origin }, data: { username: kept, password } })).ok()).toBe(true);
+    expect((await api(other.request, 'login', { headers: { Origin: origin }, data: { username: kept, password } })).ok()).toBe(true);
     const page = await other.newPage(); await page.goto(origin + '/');
     await expect(page.locator('.lock')).toContainText(kept);
     await run(page, `userdel ${kept}`);
     await expect(last(page)).toContainText('Root permission required');
-    expect((await other.request.post('/api/unregister', { headers: { Origin: origin }, data: { password } })).status()).toBe(403);
+    expect((await api(other.request, 'unregister', { headers: { Origin: origin }, data: { password } })).status()).toBe(403);
     await other.close();
   } finally {
     for (const name of [self, kept]) { await command(['userdel', '-r', name]); await command(['groupdel', name]); }

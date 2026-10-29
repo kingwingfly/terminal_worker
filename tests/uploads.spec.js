@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { call, errno, listing, mkdirp, rmrf, sys } from './sys.js';
+import { api, call, errno, listing, mkdirp, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const CHUNK = 8 * 1024 * 1024;
@@ -10,7 +10,7 @@ const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 let sequence = 0;
 async function root() {
   const client = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'uploads-' + Date.now() + '-' + (++sequence) } });
-  expect((await client.post('/api/login', { data: { username: 'root', password: rootPassword } })).status()).toBe(200);
+  expect((await api(client, 'login', { data: { username: 'root', password: rootPassword } })).status()).toBe(200);
   return client;
 }
 // Two and a half chunks of bytes that differ by position, so that a misplaced chunk shows.

@@ -447,6 +447,92 @@ pub enum Call {
     },
     /// The session's descriptors.
     Fds,
+    /// Sign this session in as `username`, its password said (none needed by root, or under
+    /// sudo): the session is a new one, its cookie the reply's. Rate-limited.
+    Login {
+        #[serde(default = "root")]
+        username: String,
+        #[serde(default)]
+        password: String,
+    },
+    /// Sign this session out: it is a guest's from then on.
+    Logout,
+    /// sudo's timestamp: the account's own password said, the session may act as root for five
+    /// minutes (a wheel member's); `revoke` ends it (sudo -k).
+    Sudo {
+        #[serde(default)]
+        password: String,
+        #[serde(default)]
+        revoke: bool,
+    },
+    /// Set `username`'s password (the caller's by default): its own needs the current one, as
+    /// passwd asks; root's sets any. Its other sessions end. `force` takes a short one.
+    Passwd {
+        #[serde(default)]
+        username: Option<String>,
+        password: String,
+        #[serde(default)]
+        current_password: Option<String>,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Make an account, as useradd does: root's, of any name, home and groups, locked until
+    /// passwd gives it a password; or, signed out, one's own, in group guest, home
+    /// /guest/NAME, with `password`, which signs the session in as it.
+    Useradd {
+        name: String,
+        #[serde(default)]
+        create_home: bool,
+        #[serde(default)]
+        home: Option<String>,
+        #[serde(default)]
+        group: Option<String>,
+        #[serde(default)]
+        groups: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
+        #[serde(default)]
+        short_password: bool,
+    },
+    /// Change an account, as usermod does: root's.
+    Usermod {
+        name: String,
+        #[serde(default)]
+        append: bool,
+        #[serde(default)]
+        groups: Option<String>,
+        #[serde(default)]
+        group: Option<String>,
+        #[serde(default)]
+        home: Option<String>,
+        #[serde(default)]
+        move_home: bool,
+        #[serde(default)]
+        rename: Option<String>,
+        #[serde(default)]
+        lock: bool,
+        #[serde(default)]
+        unlock: bool,
+    },
+    /// Delete an account, and with `remove` its home: root's; or an account of group guest's
+    /// own, its `password` said, which signs the session out.
+    Userdel {
+        name: String,
+        #[serde(default)]
+        remove: bool,
+        #[serde(default)]
+        password: Option<String>,
+    },
+    Groupadd {
+        name: String,
+    },
+    Groupmod {
+        name: String,
+        new_name: String,
+    },
+    Groupdel {
+        name: String,
+    },
     /// A process of the session's account (zip, unzip, tar, faststart), run as the caller
     /// (root under sudo), from `cwd`: its pid. Its work is done apart (a container), reading
     /// and writing as it.
@@ -481,6 +567,9 @@ pub enum Call {
         #[serde(default)]
         arg: serde_json::Value,
     },
+}
+fn root() -> String {
+    "root".into()
 }
 fn creation_mode() -> u16 {
     0o666

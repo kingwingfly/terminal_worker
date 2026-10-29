@@ -80,7 +80,17 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
         | Call::Ps
         | Call::Kill { .. }
         | Call::Wait { .. }
-        | Call::Write { .. } => Err(Errno::ENOSYS.into()),
+        | Call::Write { .. }
+        | Call::Login { .. }
+        | Call::Logout
+        | Call::Sudo { .. }
+        | Call::Passwd { .. }
+        | Call::Useradd { .. }
+        | Call::Usermod { .. }
+        | Call::Userdel { .. }
+        | Call::Groupadd { .. }
+        | Call::Groupmod { .. }
+        | Call::Groupdel { .. } => Err(Errno::ENOSYS.into()),
         Call::Stat { path } => stat(fs, cred, &path, true).map(|stat| json!(stat)),
         Call::Lstat { path } => stat(fs, cred, &path, false).map(|stat| json!(stat)),
         Call::Getdents { path } => getdents(fs, cred, &path).map(|entries| json!(entries)),

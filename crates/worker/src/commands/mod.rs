@@ -1,14 +1,14 @@
-//! The commands the server runs, each a [`ServerCommand`] registered by name in [`COMMANDS`],
-//! a module a section: files, permissions, accounts and archives. Their arguments, and their
-//! help, are their definitions in [`terminal_worker_core::cli`].
+//! What the account calls (`accounts`) and processes (jobs.rs) share: a command line as a
+//! process is spawned with it (`Command`), the paths it names, and the groups and homes it
+//! names. The server runs no commands (owner's design, 2026-10-29): they are user space's.
 
 pub(crate) mod accounts;
 
 use crate::db::Db;
 use serde::Deserialize;
-use serde_json::{Value, json};
+
 use std::collections::BTreeSet;
-use terminal_worker_core::{Entry, permissions::*, resolve};
+use terminal_worker_core::{permissions::*, resolve};
 
 #[derive(Deserialize)]
 pub struct Command {
@@ -67,20 +67,6 @@ fn protect_home(c: &Db, path: &str, except: u32) -> std::result::Result<(), Stri
     }
     Ok(())
 }
-fn show_id(c: &Db, who: &Identity) -> String {
-    format!(
-        "uid={}({}) gid={}({}) groups={}",
-        who.id,
-        c.username(who.id),
-        who.group,
-        c.groupname(who.group),
-        who.groups
-            .iter()
-            .map(|g| format!("{g}({})", c.groupname(*g)))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
 
 /// `value`, a path typed in `command`, from its working directory, `~` its home, physically: a
 /// link on the way, and at its end, followed, as most commands take a path (stat(2)).
@@ -117,97 +103,6 @@ fn typed_path(c: &Db, who: &Identity, command: &Command, value: &str) -> Result<
         value.into()
     };
     resolve(&cwd, &value)
-}
-
-/// A command the server runs.
-pub trait ServerCommand: Sync {
-    /// Its name, as [`terminal_worker_core::cli`] defines it.
-    fn name(&self) -> &'static str;
-    /// Run it, as `ctx.who`: what it writes, with what it gathers in `ctx` on the way.
-    fn run(&self, ctx: &mut Context) -> Result<String, String>;
-}
-
-/// What a command runs with, and gathers.
-pub struct Context<'a> {
-    pub db: &'a mut Db,
-    /// Who it acts as: root under sudo.
-    pub who: &'a Identity,
-    /// Its arguments, after its name.
-    pub args: &'a [String],
-    /// What failed of what a command does several of (paths, mostly): each is reported, and
-    /// what did not fail is kept.
-    pub errors: Vec<String>,
-    /// Whether any of those succeeded.
-    pub succeeded: bool,
-    /// A listing, and whether it is long, which the terminal shows as a view.
-    pub listing: Option<(Vec<Entry>, bool)>,
-    /// fd's results, one by one.
-    pub results: Option<Vec<String>>,
-    /// The files mv and cp -i did not replace, which the terminal asks about.
-    pub existing: Vec<Value>,
-    /// The whole reply, for a command that answers more than text, as a job does.
-    pub reply: Option<Value>,
-}
-/// Every command the server runs.
-pub static COMMANDS: &[&dyn ServerCommand] = &[
-    &accounts::Whoami,
-    &accounts::Id,
-    &accounts::Groups,
-    &accounts::Users,
-    &accounts::Useradd,
-    &accounts::Usermod,
-    &accounts::Userdel,
-    &accounts::Groupadd,
-    &accounts::Groupmod,
-    &accounts::Groupdel,
-];
-
-/// The command named `name`, if the server runs it.
-pub fn find(name: &str) -> Option<&'static dyn ServerCommand> {
-    COMMANDS.iter().copied().find(|c| c.name() == name)
-}
-
-/// Run `command` as `who` for the account `owner`.
-pub fn execute(db: &mut Db, who: &Identity, command: Command) -> Result<Value, String> {
-    let (name, args) = command.args.split_first().ok_or("Missing command")?;
-    let Some(runner) = find(name) else {
-        return Err(
-            "Unsupported server command; sudo supports file and account management commands. Use su root to browse restricted content".into(),
-        );
-    };
-    let mut ctx = Context {
-        db,
-        who,
-        args,
-        errors: Vec::new(),
-        succeeded: false,
-        listing: None,
-        results: None,
-        existing: Vec::new(),
-        reply: None,
-    };
-    let output = runner.run(&mut ctx)?;
-    if let Some(reply) = ctx.reply {
-        return Ok(reply);
-    }
-    if !ctx.errors.is_empty() && !ctx.succeeded && ctx.results.is_none() {
-        return Err(ctx.errors.join("\n"));
-    }
-    let mut value = json!({"output": output});
-    if !ctx.errors.is_empty() {
-        value["errors"] = json!(ctx.errors);
-    }
-    if let Some((entries, long)) = ctx.listing {
-        value["entries"] = json!(entries);
-        value["long"] = json!(long);
-    }
-    if let Some(results) = ctx.results {
-        value["results"] = json!(results);
-    }
-    if !ctx.existing.is_empty() {
-        value["existing"] = json!(ctx.existing);
-    }
-    Ok(value)
 }
 
 pub fn is_permission_error(message: &str) -> bool {

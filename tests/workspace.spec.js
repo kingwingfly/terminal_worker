@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { mkdirp, program, put, rmrf } from './sys.js';
+import { api, mkdirp, program, put, rmrf } from './sys.js';
 const origin=process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password=(await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const headers={Origin:origin,'CF-Connecting-IP':'workspace-regression'};
@@ -45,7 +45,7 @@ test('manual, large terminal, collapsible layouts, prompt/listing colors, icons 
 });
 
 test('vim edits highlighted Rust, saves conditionally, preserves conflicting drafts, and respects read-only permissions',async({page,request})=>{
- const base='/editor-'+Date.now();await request.post('/api/login',{headers,data:{password}});await mkdirp(request, base);
+ const base='/editor-'+Date.now();await api(request, 'login',{headers,data:{password}});await mkdirp(request, base);
  // Browser and fixture request intentionally have separate sessions.
  try{
   await page.goto('/');await run(page,'su root');await page.getByLabel('Password',{exact:true}).fill(password);await page.locator('#auth button[type=submit]').click();await expect(page.locator('.lock')).toContainText('root');
@@ -65,7 +65,7 @@ test('vim edits highlighted Rust, saves conditionally, preserves conflicting dra
 });
 
 test('PDF pages and PNG/JPEG/WebP previews load through protected file APIs',async({page,request})=>{
- const base='/preview-'+Date.now();await request.post('/api/login',{headers,data:{password}});await mkdirp(request, base);
+ const base='/preview-'+Date.now();await api(request, 'login',{headers,data:{password}});await mkdirp(request, base);
  try{
   expect((await put(request, file(base+'/sample.pdf'),{headers,data:pdfBytes()})).status()).toBe(201);
   await page.goto('/');

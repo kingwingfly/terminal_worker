@@ -1,6 +1,6 @@
 import { test, expect, devices } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { mkdirp, put, rmrf } from './sys.js';
+import { api, mkdirp, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const { defaultBrowserType, ...pixel } = devices['Pixel 7'];
@@ -11,7 +11,7 @@ test.beforeEach(async ({ context }) => {
   base = '/phone-' + Date.now().toString(36);
   await context.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'phone-' + base });
   const headers = { Origin: origin };
-  expect((await context.request.post('/api/login', { headers, data: { password } })).ok()).toBe(true);
+  expect((await api(context.request, 'login', { headers, data: { password } })).ok()).toBe(true);
   await mkdirp(context.request, base);
 });
 test.afterEach(async ({ context }) => {

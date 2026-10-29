@@ -57,20 +57,6 @@ extern "C" {
     fn completion_focus(value: &str, inside_quote: bool);
 }
 
-async fn request(url: &str, method: &str) -> Result<serde_json::Value, String> {
-    let response = match method {
-        "POST" => gloo_net::http::Request::post(url).send().await,
-        "DELETE" => gloo_net::http::Request::delete(url).send().await,
-        _ => gloo_net::http::Request::get(url).send().await,
-    }
-    .map_err(|e| e.to_string())?;
-    let value: serde_json::Value = response.json().await.map_err(|e| e.to_string())?;
-    if response.ok() {
-        Ok(value)
-    } else {
-        Err(value["error"].as_str().unwrap_or("Request failed").into())
-    }
-}
 fn endpoint(api: &str, path: &str) -> String {
     format!("/api/{api}?path={}", js_sys::encode_uri_component(path))
 }

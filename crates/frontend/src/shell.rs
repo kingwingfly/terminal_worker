@@ -20,7 +20,7 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::{
     account_command, cancel_choosing, cancel_uploads, choose_files, completion_focus, endpoint,
-    focus_input, listing, request, set_directory, stop_recording, sudo,
+    focus_input, listing, set_directory, stop_recording, sudo,
 };
 
 /// What a program of user space left: its exit status, its output and errors, its listing,
@@ -41,16 +41,11 @@ const SHOWN: usize = 2000;
 const PIPED_MAX: usize = 10_000_000;
 /// How many paths xargs passes to one command, at most.
 const XARGS_MAX: usize = 1000;
-/// How many commands one batch request runs, at most.
-const BATCH: usize = 100;
 /// How many filesystem lookups one wildcard pattern makes, and paths it expands to, at most.
 const GLOB_LOOKUPS: usize = 1000;
 const GLOB_PATHS: usize = 10_000;
 /// How many of a wildcard's lookups run at once.
 const GLOB_CONCURRENCY: usize = 8;
-
-/// Server commands that xargs and fd -x may run many of in one request.
-const BATCHED: &[&str] = &["whoami", "id", "groups"];
 
 #[derive(Clone)]
 pub enum LogLine {
@@ -101,6 +96,10 @@ pub struct Account {
     pub username: RwSignal<String>,
     pub home: RwSignal<String>,
 }
+
+/// The programs web/app.js asks for a password for first, in a dialog: a guest's own useradd,
+/// an account's own userdel.
+const DIALOGS: &[&str] = &["useradd", "userdel"];
 
 #[derive(Clone, Copy)]
 pub struct Shell {
@@ -330,14 +329,13 @@ impl Shell {
         self.run(command);
     }
     pub async fn refresh(self) -> Result<(), String> {
-        if let Ok(value) = request("/api/session", "GET").await {
-            self.account.writable.set(value["authenticated"] == true);
-            self.account
-                .username
-                .set(value["username"].as_str().unwrap_or("guest").into());
-            self.account
-                .home
-                .set(value["home"].as_str().unwrap_or("/").into());
+        if let Ok(creds) =
+            userland::sys::call::<abi::Creds>(&crate::sys::HttpSys::default(), abi::Call::Getcreds)
+                .await
+        {
+            self.account.writable.set(creds.signed_in);
+            self.account.username.set(creds.user);
+            self.account.home.set(creds.home);
         }
         match listing(&self.cwd.get_untracked()).await {
             Ok(entries) => {
@@ -442,6 +440,10 @@ impl Shell {
             return self.follow(&pid, piped).await;
         }
         let value = self.call(args).await?;
+        // Not one of web/app.js's dialogs: a program of user space.
+        if value["program"] == true {
+            return self.program(argv.to_vec(), None, piped, sudo).await;
+        }
         let out = self.output(&value, piped)?;
         self.refresh().await?;
         Ok(out)
@@ -646,69 +648,9 @@ impl Shell {
             }
         }
     }
-    /// Run commands on the server, a batch a request, each in its own transaction.
-    async fn batch(self, commands: Vec<Vec<String>>, trace: bool) -> Output {
-        let mut out = Output::default();
-        for group in commands.chunks(BATCH) {
-            if self.cancelled() {
-                break;
-            }
-            if trace {
-                for command in group {
-                    self.log(format!("+ {}", command.join(" ")));
-                }
-            }
-            let cwd = self.cwd.get_untracked();
-            let body = json!({"batch": group.iter().map(|args| json!({"args": args, "cwd": cwd})).collect::<Vec<_>>()});
-            let reply = match gloo_net::http::Request::post("/api/command").json(&body) {
-                Ok(request) => request.send().await.map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            };
-            let value: Result<Value, String> = match reply {
-                Ok(response) if response.ok() => response.json().await.map_err(|e| e.to_string()),
-                Ok(response) => Err(response
-                    .json::<Value>()
-                    .await
-                    .ok()
-                    .and_then(|v| v["error"].as_str().map(String::from))
-                    .unwrap_or_else(|| format!("Request failed ({})", response.status()))),
-                Err(e) => Err(e),
-            };
-            match value {
-                Ok(value) => {
-                    for result in value["results"].as_array().into_iter().flatten() {
-                        if let Some(error) = result["error"].as_str() {
-                            self.error(error);
-                            out.failed = true;
-                        } else if let Ok(o) = self.output(result, true) {
-                            out.stdout.push_str(&o.stdout);
-                            out.failed |= o.failed;
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.error(e);
-                    out.failed = true;
-                    break;
-                }
-            }
-        }
-        let _ = self.refresh().await;
-        out
-    }
-    /// Run each of `commands` as xargs or fd -x would: the server's in batches, others one by
-    /// one. Their output joins in order; a failure does not stop the next.
+    /// Run each of `commands` as xargs or fd -x would, one by one. Their output joins in order;
+    /// a failure does not stop the next.
     async fn run_all(self, commands: Vec<Vec<String>>, trace: bool) -> Output {
-        let Some(first) = commands.first() else {
-            return Output::default();
-        };
-        if BATCHED.contains(&first[0].as_str())
-            && commands
-                .iter()
-                .all(|c| c[0] == first[0] && !cli::wants_help(c))
-        {
-            return self.batch(commands, trace).await;
-        }
         let mut out = Output::default();
         for command in commands {
             if self.cancelled() {
@@ -1000,7 +942,12 @@ impl Shell {
                     return Ok(Output::text(help + "\n"));
                 }
             }
-            if userland::PROGRAMS.contains(&name.as_str()) && commands::find(&name).is_none() {
+            // A guest's own useradd and an account's own userdel take a password, in web/app.js's
+            // dialog, which hands back what is not that to run here.
+            if userland::PROGRAMS.contains(&name.as_str())
+                && commands::find(&name).is_none()
+                && !DIALOGS.contains(&name.as_str())
+            {
                 return self.program(args, stdin, piped, false).await;
             }
             match commands::find(&name) {

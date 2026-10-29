@@ -1,13 +1,13 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import http from 'node:http';
-import { errno, listing, mkdirp, put, rmrf, sys } from './sys.js';
+import { api, errno, listing, mkdirp, put, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 async function root() {
   const client = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'storage-' + Date.now() } });
-  expect((await client.post('/api/login', { data: { username: 'root', password: rootPassword } })).status()).toBe(200);
+  expect((await api(client, 'login', { data: { username: 'root', password: rootPassword } })).status()).toBe(200);
   return client;
 }
 // pwrite(2) of chunk 0 through the descriptor `fd`, its body arriving slowly, in `parts` pieces

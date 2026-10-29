@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { entry, errno, mkdirp, program, put, rmrf } from './sys.js';
+import { api, entry, errno, mkdirp, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -10,7 +10,7 @@ test.beforeEach(async ({ request, page }) => {
   base = '/links-' + Date.now().toString(36);
   headers = { Origin: origin, 'CF-Connecting-IP': 'links-' + base };
   await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'links-ui-' + base });
-  expect((await request.post('/api/login', { headers, data: { password } })).ok()).toBe(true);
+  expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
   for (const dir of ['', '/docs']) await mkdirp(request, base + dir);
   for (const [name, text] of Object.entries({ 'a.md': 'alpha\n', 'docs/b.md': 'beta\n' })) expect((await put(request, file(base + '/' + name), { headers, data: text })).status()).toBe(201);
 });
@@ -117,10 +117,10 @@ test('a visitor makes an account in /guest, which is sticky, and shares files wi
   // Another visitor makes another account through the API, signed in by it.
   const other = await visitor();
   try {
-    const made = await other.post('/api/register', { data: { username: bob, password: pass } });
+    const made = await api(other, 'register', { data: { username: bob, password: pass } });
     expect(made.status(), await made.text()).toBe(201);
-    expect((await other.post('/api/register', { data: { username: bob + 'x', password: pass } })).status()).toBe(409);
-    expect((await (await visitor()).post('/api/register', { data: { username: ada, password: pass } })).status()).toBe(409);
+    expect((await api(other, 'register', { data: { username: bob + 'x', password: pass } })).status()).toBe(409);
+    expect((await api(await visitor(), 'register', { data: { username: ada, password: pass } })).status()).toBe(409);
     // Homes are their owners' only.
     await run(page, 'touch note.txt');
     expect((await other.get(file(`/guest/${ada}/note.txt`))).status()).toBe(403);
@@ -144,7 +144,7 @@ test('a visitor makes an account in /guest, which is sticky, and shares files wi
     await run(page, 'setfattr -n trusted.tag -v x note.txt'); await expect(last(page)).toContainText('Operation not permitted');
     // guest cannot get a password, nor be changed.
     await run(page, 'exit');
-    expect((await request.post('/api/passwd', { headers, data: { username: 'guest', password: pass, sudo: true } })).status()).toBe(400);
+    expect((await api(request, 'passwd', { headers, data: { username: 'guest', password: pass, sudo: true } })).status()).toBe(400);
     expect((await program(request, ['userdel', 'guest'])).status()).toBe(400);
   } finally {
     for (const name of [ada, bob]) {

@@ -49,7 +49,7 @@ impl Reply {
         self.status = status;
         self
     }
-    fn cookie(mut self, cookie: String) -> Self {
+    pub fn cookie(mut self, cookie: String) -> Self {
         self.cookie = Some(cookie);
         self
     }
@@ -112,14 +112,6 @@ fn read<T: 'static>(state: &State, work: impl FnOnce(&mut Db) -> T + 'static) ->
     transact(state, move |db| (work(db), false))
 }
 
-fn body_size(req: &Request, max: u64) -> bool {
-    req.headers()
-        .get("Content-Length")
-        .ok()
-        .flatten()
-        .and_then(|s| s.parse::<u64>().ok())
-        .is_some_and(|n| n > 0 && n <= max)
-}
 macro_rules! acl {
     ($result:expr, $who:expr) => {
         match $result {
@@ -140,7 +132,6 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
     let endpoint = url.path().to_string();
     let method = req.method();
     let key = auth::token_key(req);
-    let https = url.scheme() == "https";
     let raw_path = url
         .query_pairs()
         .find(|(k, _)| k == "path")
@@ -157,73 +148,8 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             .unwrap_or_default()
     };
     match (method.clone(), endpoint.as_str()) {
-        (Method::Get, "/api/session") => run(state, move |db| {
-            let mut view = auth::session_view(db, key.as_deref());
-            let who = auth::identity(db, key.as_deref());
-            let real = db.physical(&who, &path, true).unwrap_or_default();
-            view["can_write"] = json!(
-                db.access(&who, &real, WRITE | EXEC)
-                    .is_ok_and(|n| n.directory)
-            );
-            Reply::ok(view)
-        }),
         // System calls (sys.rs): what user space, the page, asks of the kernel.
         (Method::Post, "/api/sys") => crate::sys::handle(req, env, state, key).await,
-        (Method::Post, "/api/login") => login(req, env, state, key, https).await,
-        (Method::Post, "/api/logout") => run(state, move |db| {
-            if let Some(key) = &key {
-                db.delete_session(key);
-            }
-            Reply::ok(json!({"writable":false,"username":"guest"}))
-                .cookie(auth::cookie(https, "", 0))
-        }),
-        (Method::Post, "/api/sudo") => sudo(req, env, state, key).await,
-        (Method::Post, "/api/passwd") => passwd(req, env, state, key, https).await,
-        (Method::Post, "/api/register") => register(req, env, state, key, https).await,
-        (Method::Post, "/api/unregister") => unregister(req, env, state, key, https).await,
-        (Method::Post, "/api/command") => {
-            if !body_size(req, 1 << 20) {
-                return Ok(Reply::error(
-                    "Command is too long or has an unknown length",
-                    400,
-                ));
-            }
-            #[derive(Deserialize)]
-            #[serde(untagged)]
-            enum Body {
-                /// Commands run one after another, each in its own transaction, as xargs runs
-                /// them: a failure does not stop the next.
-                Batch {
-                    batch: Vec<commands::Command>,
-                },
-                One(commands::Command),
-            }
-            let commands = match req.json::<Body>().await {
-                Ok(Body::One(command)) => {
-                    let reply = run(state, move |db| command_reply(db, key.as_deref(), command))?;
-                    kick(env, &reply.body).await;
-                    return Ok(reply);
-                }
-                Ok(Body::Batch { batch }) if batch.len() <= BATCH_MAX => batch,
-                Ok(Body::Batch { .. }) => {
-                    return Ok(Reply::error(
-                        &format!("A batch runs at most {BATCH_MAX} commands"),
-                        400,
-                    ));
-                }
-                Err(_) => return Ok(Reply::error("Invalid command request", 400)),
-            };
-            let mut results = Vec::new();
-            for command in commands {
-                let key = key.clone();
-                let reply = run(state, move |db| command_reply(db, key.as_deref(), command))?;
-                kick(env, &reply.body).await;
-                let mut result = reply.body;
-                result["status"] = json!(reply.status);
-                results.push(result);
-            }
-            Ok(Reply::ok(json!({ "results": results })))
-        }
         (Method::Get, "/internal/read") => {
             let guest = auth::guest_key(req);
             run(state, move |db| {
@@ -553,21 +479,7 @@ fn job_reply(
     }
 }
 
-/// The most commands one batch runs.
-const BATCH_MAX: usize = 100;
-
 /// Run one command as the session `key`, elevated if it asks for sudo.
-fn command_reply(db: &mut Db, key: Option<&str>, mut command: commands::Command) -> Reply {
-    let who = auth::identity(db, key);
-    let actor = acl!(auth::elevated(db, key, command.sudo), &who);
-    // `~` is the signed-in account's home, also under sudo, as the shell expands it before sudo.
-    command.home = db.user_by_id(who.id).map(|(_, user)| user.home);
-    match commands::execute(db, &actor, command) {
-        Ok(value) => Reply::ok(value),
-        Err(e) => denied(&e, &who),
-    }
-}
-
 /// Wake the runner of the job a reply started or changed, if any.
 pub async fn kick(env: &Env, reply: &Value) {
     let Some(job) = reply["job"].as_str() else {
@@ -844,12 +756,13 @@ pub fn cancel(db: &mut Db, file: &File) {
     }
 }
 
-async fn login(
-    req: &mut Request,
+pub async fn login(
+    req: &Request,
     env: &Env,
     state: &State,
     key: Option<String>,
     https: bool,
+    body: Value,
 ) -> Result<Reply> {
     if auth::limited(req, env, "login").await? {
         return Ok(Reply::error(
@@ -871,13 +784,7 @@ async fn login(
     fn root_user() -> String {
         "root".into()
     }
-    if !body_size(req, 2048) {
-        return Ok(Reply::error(
-            "Login request is too large or has an unknown length",
-            400,
-        ));
-    }
-    let Ok(login) = req.json::<Login>().await else {
+    let Ok(login) = serde_json::from_value::<Login>(body) else {
         return Ok(Reply::error("Invalid login request", 400));
     };
     let (who, user, root, sudo) = read(state, {
@@ -937,7 +844,13 @@ async fn login(
     })
 }
 
-async fn sudo(req: &mut Request, env: &Env, state: &State, key: Option<String>) -> Result<Reply> {
+pub async fn sudo(
+    req: &Request,
+    env: &Env,
+    state: &State,
+    key: Option<String>,
+    body: Value,
+) -> Result<Reply> {
     let (who, can_sudo, account) = read(state, {
         let key = key.clone();
         move |db| {
@@ -956,12 +869,7 @@ async fn sudo(req: &mut Request, env: &Env, state: &State, key: Option<String>) 
             403,
         ));
     }
-    if !body_size(req, 2048) {
-        return Ok(Reply::error("Invalid sudo request", 400));
-    }
-    let Ok(value) = req.json::<Value>().await else {
-        return Ok(Reply::error("Invalid sudo request", 400));
-    };
+    let value = body;
     let revoke = value["revoke"] == true;
     if !revoke && who.id != 0 {
         if auth::limited(req, env, "sudo").await? {
@@ -988,12 +896,13 @@ async fn sudo(req: &mut Request, env: &Env, state: &State, key: Option<String>) 
     })
 }
 
-async fn passwd(
-    req: &mut Request,
+pub async fn passwd(
+    req: &Request,
     env: &Env,
     state: &State,
     key: Option<String>,
     https: bool,
+    body: Value,
 ) -> Result<Reply> {
     let who = read(state, {
         let key = key.clone();
@@ -1008,9 +917,6 @@ async fn passwd(
             429,
         ));
     }
-    if !body_size(req, 4096) {
-        return Ok(Reply::error("Invalid password request", 400));
-    }
     #[derive(Deserialize)]
     struct Password {
         #[serde(default)]
@@ -1023,7 +929,7 @@ async fn passwd(
         #[serde(default)]
         force: bool,
     }
-    let Ok(value) = req.json::<Password>().await else {
+    let Ok(value) = serde_json::from_value::<Password>(body) else {
         return Ok(Reply::error("Invalid password request", 400));
     };
     let checked = read(state, {
@@ -1110,12 +1016,13 @@ const REGISTERED_MAX: usize = 1000;
 
 /// An account of group guest's deleting itself (userdel NAME, signed in as NAME), as its
 /// password confirms, and with `remove` its home: its sessions end, this one too.
-async fn unregister(
-    req: &mut Request,
+pub async fn unregister(
+    req: &Request,
     env: &Env,
     state: &State,
     key: Option<String>,
     https: bool,
+    body: Value,
 ) -> Result<Reply> {
     let who = read(state, {
         let key = key.clone();
@@ -1136,16 +1043,13 @@ async fn unregister(
             429,
         ));
     }
-    if !body_size(req, 2048) {
-        return Ok(Reply::error("Invalid account request", 400));
-    }
     #[derive(Deserialize)]
     struct Unregister {
         password: String,
         #[serde(default)]
         remove: bool,
     }
-    let Ok(wanted) = req.json::<Unregister>().await else {
+    let Ok(wanted) = serde_json::from_value::<Unregister>(body) else {
         return Ok(Reply::error("Invalid account request", 400));
     };
     let (name, user) = read(state, {
@@ -1178,12 +1082,13 @@ async fn unregister(
 /// useradd NAME, signed out: an account of one's own, in its own group and in guest's, its home
 /// /guest/NAME (made, only it may enter, with -m), and the password given; signed in as it at
 /// once.
-async fn register(
-    req: &mut Request,
+pub async fn register(
+    req: &Request,
     env: &Env,
     state: &State,
     key: Option<String>,
     https: bool,
+    body: Value,
 ) -> Result<Reply> {
     let who = read(state, {
         let key = key.clone();
@@ -1201,9 +1106,6 @@ async fn register(
             429,
         ));
     }
-    if !body_size(req, 2048) {
-        return Ok(Reply::error("Invalid account request", 400));
-    }
     #[derive(Deserialize)]
     struct Register {
         username: String,
@@ -1215,7 +1117,7 @@ async fn register(
         #[serde(default)]
         create_home: bool,
     }
-    let Ok(wanted) = req.json::<Register>().await else {
+    let Ok(wanted) = serde_json::from_value::<Register>(body) else {
         return Ok(Reply::error("Invalid account request", 400));
     };
     let name = wanted.username;

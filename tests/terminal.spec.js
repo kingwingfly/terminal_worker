@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { errno, listing, mkdirp, put } from './sys.js';
+import { api, errno, listing, mkdirp, put } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 // A line is typed at the prompt, once the one before has ended, as the shell takes no other.
@@ -10,9 +10,9 @@ const run = async (page, command) => { const input = page.getByRole('combobox', 
 test('R2 API enforces auth, same-origin writes, no-overwrite and byte ranges', async ({ request }) => {
   const name = '/test-' + Date.now();
   expect(await errno(request, { mkdir: { path: name, mode: 0o777 } })).toBe('EACCES');
-  expect((await request.post('/api/login', { headers: { Origin: 'https://elsewhere.invalid' }, data: { password } })).status()).toBe(403);
-  expect((await request.post('/api/login', { headers: { Origin: origin }, data: { password: 'wrong' } })).status()).toBe(401);
-  expect((await request.post('/api/login', { headers: { Origin: origin }, data: { password } })).ok()).toBeTruthy();
+  expect((await api(request, 'login', { headers: { Origin: 'https://elsewhere.invalid' }, data: { password } })).status()).toBe(403);
+  expect((await api(request, 'login', { headers: { Origin: origin }, data: { password: 'wrong' } })).status()).toBe(401);
+  expect((await api(request, 'login', { headers: { Origin: origin }, data: { password } })).ok()).toBeTruthy();
   await mkdirp(request, name);
   const url = '/api/file?path=' + encodeURIComponent(name + '/With spaces.txt');
   expect((await put(request, url, { headers: { Origin: origin }, data: '0123456789' })).status()).toBe(201);
@@ -29,7 +29,7 @@ test('R2 API enforces auth, same-origin writes, no-overwrite and byte ranges', a
 
   // Bytes are written from this site only.
   expect((await request.put('/api/pwrite?fd=3&index=0', { headers: { Origin: 'https://elsewhere.invalid' }, data: 'x' })).status()).toBe(403);
-  await request.post('/api/logout', { headers: { Origin: origin } });
+  await api(request, 'logout', { headers: { Origin: origin } });
   expect((await request.get(url)).ok()).toBeTruthy();
   expect((await put(request, '/api/file?path=' + name + '/x.txt', { headers: { Origin: origin }, data: 'x' })).status()).toBe(401);
 });

@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { call, entry, errno, mkdirp, names, program, put, rmrf, sys } from './sys.js';
+import { api, call, entry, errno, mkdirp, names, program, put, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const vars = await readFile('.dev.vars', 'utf8');
 const rootPassword = vars.match(/^ADMIN_PASSWORD=(.+)$/m)[1];
@@ -31,7 +31,7 @@ async function device(browser, username, password) {
     window.RTCPeerConnection = function (config) { const pc = new Real(config); window.connections.push(pc); return pc; };
     window.RTCPeerConnection.prototype = Real.prototype;
   });
-  if (username) expect((await context.request.post('/api/login', { headers: { Origin: origin }, data: { username, password } })).ok()).toBe(true);
+  if (username) expect((await api(context.request, 'login', { headers: { Origin: origin }, data: { username, password } })).ok()).toBe(true);
   const page = await context.newPage(); await page.goto(origin + '/');
   await expect(page.locator('.lock')).toContainText(username || 'guest');
   return { context, page };
@@ -45,10 +45,10 @@ const realtime = async () => /^REALTIME_APP_ID=.+$/m.test(vars) && /^REALTIME_AP
 const NO_REALTIME = 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)';
 test.beforeAll(async () => {
   root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
-  expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
+  expect((await api(root, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
   name = 'live' + Date.now().toString(36); password = 'live-password-' + Date.now();
   expect((await program(root, ['useradd', '-m', name])).ok()).toBe(true);
-  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
   // The speaker's directory, which everyone may read, guests too.
   base = '/live-' + Date.now().toString(36);
   await mkdirp(root, base);
@@ -110,7 +110,7 @@ test('a presentation is a character device: ls -l and cat tell of it; chmod deci
   const { stem, path } = await deck();
   const cohost = 'cohost' + Date.now().toString(36);
   expect((await program(root, ['useradd', '-m', cohost])).ok()).toBe(true);
-  expect((await root.post('/api/passwd', { data: { username: cohost, password } })).ok()).toBe(true);
+  expect((await api(root, 'passwd', { data: { username: cohost, password } })).ok()).toBe(true);
   const laptop = await device(browser, name, password), guest = await device(browser), helper = await device(browser, cohost, password);
   const device_ = `/dev/present/${stem}`;
   try {

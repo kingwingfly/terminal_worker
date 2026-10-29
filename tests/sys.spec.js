@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { program, rmrf } from './sys.js';
+import { api, program, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 let sequence = 0;
@@ -9,7 +9,7 @@ const address = name => `sys-${name}-${Date.now()}-${++sequence}`;
 // A process of user space: its session, and the calls it makes, a batch a request.
 async function session(username, password) {
   const context = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address(username || 'guest') } });
-  if (username) expect((await context.post('/api/login', { data: { username, password } })).ok()).toBe(true);
+  if (username) expect((await api(context, 'login', { data: { username, password } })).ok()).toBe(true);
   const batch = async (calls, options = {}) => {
     const response = await context.post('/api/sys', { data: { calls, ...options } });
     expect(response.status()).toBe(200);
@@ -25,7 +25,7 @@ const name = 'sysann' + Date.now().toString(36), password = 'sys-password-' + Da
 test.beforeAll(async () => {
   root = await session('root', rootPassword);
   expect((await program(root.context, ['useradd', '-m', name])).ok()).toBe(true);
-  expect((await root.context.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  expect((await api(root.context, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
   ann = await session(name, password);
   base = '/sys-' + Date.now().toString(36);
 });

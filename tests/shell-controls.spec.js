@@ -1,6 +1,6 @@
 import { test, expect, request } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { entry, program, put } from './sys.js';
+import { api, entry, program, put } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const password = 'shell-testing-password-621';
@@ -10,11 +10,11 @@ async function ok(response,status=200) { expect(response.status(),await response
 async function fixture() {
  const make=()=>request.newContext({baseURL:origin,extraHTTPHeaders:{Origin:origin,'CF-Connecting-IP':'shell-'+Date.now()+'-'+Math.random()}});
  const root=await make(), user=await make(), guest=await make();
- await ok(await root.post('/api/login',{data:{password:rootPassword}}));
+ await ok(await api(root, 'login',{data:{password:rootPassword}}));
  const name='shell'+Date.now().toString(36), home='/home/'+name;
  await ok(await command(root,['useradd','-m','-G','wheel',name]));
- await ok(await root.post('/api/passwd',{data:{username:name,password}}));
- await ok(await user.post('/api/login',{data:{username:name,password}}));
+ await ok(await api(root, 'passwd',{data:{username:name,password}}));
+ await ok(await api(user, 'login',{data:{username:name,password}}));
  return {root,user,guest,name,home,async cleanup(){
   await command(root,['userdel','-r',name]);await command(root,['groupdel',name]);
   for(const client of [root,user,guest])await client.dispose();
@@ -47,16 +47,16 @@ test('su restores typing focus; Ctrl+C clears drafts, completion and history; fo
 
 test('force skips only the minimum password length, preserving identity checks and session revocation',async()=>{
  const f=await fixture();try {
-  expect((await f.user.post('/api/passwd',{data:{password:'1',current_password:password}})).status()).toBe(400);
-  expect((await f.guest.post('/api/passwd',{data:{username:f.name,password:'1',force:true}})).status()).toBe(401);
-  expect((await f.user.post('/api/passwd',{data:{username:'root',password:'1',force:true}})).status()).toBe(403);
-  expect((await f.user.post('/api/passwd',{data:{password:'1',current_password:'wrong',force:true}})).status()).toBe(401);
-  for(const value of ['', 'x'.repeat(513)])expect((await f.user.post('/api/passwd',{data:{password:value,current_password:password,force:true}})).status()).toBe(400);
+  expect((await api(f.user, 'passwd',{data:{password:'1',current_password:password}})).status()).toBe(400);
+  expect((await api(f.guest, 'passwd',{data:{username:f.name,password:'1',force:true}})).status()).toBe(401);
+  expect((await api(f.user, 'passwd',{data:{username:'root',password:'1',force:true}})).status()).toBe(403);
+  expect((await api(f.user, 'passwd',{data:{password:'1',current_password:'wrong',force:true}})).status()).toBe(401);
+  for(const value of ['', 'x'.repeat(513)])expect((await api(f.user, 'passwd',{data:{password:value,current_password:password,force:true}})).status()).toBe(400);
   const cookie=(await f.user.storageState()).cookies.find(c=>c.name==='terminal_session').value;
-  await ok(await f.user.post('/api/passwd',{data:{password:'1',current_password:password,force:true}}));
-  expect((await(await f.guest.get('/api/session',{headers:{Cookie:'terminal_session='+cookie}})).json()).username).toBe('guest');
-  await ok(await f.guest.post('/api/login',{data:{username:f.name,password:'1'}}));
-  expect((await(await f.user.get('/api/session')).json()).username).toBe(f.name);
+  await ok(await api(f.user, 'passwd',{data:{password:'1',current_password:password,force:true}}));
+  expect((await(await api(f.guest, 'session',{headers:{Cookie:'terminal_session='+cookie}})).json()).username).toBe('guest');
+  await ok(await api(f.guest, 'login',{data:{username:f.name,password:'1'}}));
+  expect((await(await api(f.user, 'session')).json()).username).toBe(f.name);
  }finally{await f.cleanup();}
 });
 
@@ -81,9 +81,9 @@ test('touch creates readable empty files, preserves content and ACLs, validates 
   await ok(await command(f.user,['chmod','400',path]));await ok(await command(f.user,['touch',path]));
   // A directory's times, as GNU touch sets them.
   expect((await command(f.user,['touch',f.home])).status()).toBe(200);
-  await ok(await f.user.post('/api/sudo',{data:{password}}));await ok(await command(f.user,['touch',f.home+'/root-owned.txt'],{sudo:true}));
+  await ok(await api(f.user, 'sudo',{data:{password}}));await ok(await command(f.user,['touch',f.home+'/root-owned.txt'],{sudo:true}));
   expect((await entry(f.user, f.home+'/root-owned.txt')).owner).toBe('root');
-  expect((await(await f.user.get('/api/session')).json()).username).toBe(f.name);
+  expect((await(await api(f.user, 'session')).json()).username).toBe(f.name);
  }finally{await f.cleanup();}
 });
 

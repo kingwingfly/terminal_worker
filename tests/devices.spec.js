@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { mkdirp, program, put, rmrf } from './sys.js';
+import { api, mkdirp, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -11,7 +11,7 @@ const address = name => `devices-${name}-${Date.now()}-${++sequence}`;
 // A device: a browser context of its own, signed in through the API, showing the terminal.
 async function device(browser, username = 'root', password = rootPassword) {
   const context = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': address(username) } });
-  expect((await context.request.post('/api/login', { headers: { Origin: origin }, data: { username, password } })).ok()).toBe(true);
+  expect((await api(context.request, 'login', { headers: { Origin: origin }, data: { username, password } })).ok()).toBe(true);
   const page = await context.newPage(); await page.goto(origin + '/');
   await expect(page.locator('.lock')).toContainText(username);
   return { context, page };
@@ -31,7 +31,7 @@ async function upload(page, name, buffer) {
 
 test('two devices of one account never send one upload at once, and one stopping leaves the other going', async ({ browser }) => {
   const root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
-  expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
+  expect((await api(root, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
   const base = '/devices-' + Date.now().toString(36);
   const a = await device(browser), b = await device(browser);
   try {
@@ -62,11 +62,11 @@ test('two devices of one account never send one upload at once, and one stopping
 
 test('a page hears when its session ends elsewhere, and windows of one browser follow each other', async ({ browser }) => {
   const root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
-  expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
+  expect((await api(root, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
   const name = 'dev' + Date.now().toString(36), password = 'device-password-' + Date.now();
   const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
-  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
   const phone = await device(browser, name, password);
   // Two windows of one browser, as guest; one signs in, and the other follows at once.
   const desktop = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': address('desktop') } });
@@ -80,7 +80,7 @@ test('a page hears when its session ends elsewhere, and windows of one browser f
     await expect(transcript(second)).toContainText(`Account changed to ${name} in another window`);
     // Another device changes the password: every session of the account ends, and its pages
     // say so and show guest, before anything is typed there.
-    expect((await root.post('/api/passwd', { data: { username: name, password: password + '-new' } })).ok()).toBe(true);
+    expect((await api(root, 'passwd', { data: { username: name, password: password + '-new' } })).ok()).toBe(true);
     for (const page of [phone.page, first, second]) {
       await expect(page.locator('.lock')).toContainText('guest');
       await expect(transcript(page)).toContainText('Signed out: this session ended elsewhere');
@@ -93,7 +93,7 @@ test('a page hears when its session ends elsewhere, and windows of one browser f
 
 test('the file panel dims what the account may not open, and says why when clicked, with the terminal hidden', async ({ browser }) => {
   const root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
-  expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
+  expect((await api(root, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
   const base = '/panel-' + Date.now().toString(36);
   const command = args => program(root, args);
   const context = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': address('guest') } });

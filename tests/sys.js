@@ -5,10 +5,43 @@ const headers = { Origin: origin, 'Content-Type': 'application/json' };
 
 // `calls`, one batch, for the session of `request` (an APIRequestContext): each one's result,
 // `{ok}` or `{err: {errno, detail}}`.
-export async function sys(request, calls, options = {}) {
-  const response = await request.post(origin + '/api/sys', { headers, data: { calls, ...options } });
+// `extra`, request headers, as a test's own address (CF-Connecting-IP), which rate limits count.
+export async function sys(request, calls, options = {}, extra = {}) {
+  const response = await request.post(origin + '/api/sys', { headers: { ...headers, ...extra }, data: { calls, ...options } });
   if (!response.ok()) throw new Error(`/api/sys: ${response.status()} ${await response.text()}`);
   return (await response.json()).results;
+}
+
+// The account system calls, as a request answered them before they were calls: `name` (login,
+// logout, sudo, passwd, register, unregister, session) with `data`, answered with a status an
+// errno says (401 refused, 403 not permitted, 404, 409, 429 too many) and the call's value.
+export async function api(request, name, { headers: extra = {}, data = {} } = {}) {
+  const status = err => ({ EACCES: 401, EPERM: 403, ENOENT: 404, EEXIST: 409, EAGAIN: 429, ESTALE: 412 })[err.errno] ?? 400;
+  const answer = (code, body) => ({ status: () => code, ok: () => code < 300, json: async () => body, text: async () => JSON.stringify(body) });
+  const one = async (call, options = {}, made = 200) => {
+    // A request refused as a whole (from another site, say) is answered as it is.
+    const response = await request.post(origin + '/api/sys', { headers: { ...headers, ...extra }, data: { calls: [call], ...options } });
+    if (!response.ok()) return response;
+    const [result] = (await response.json()).results;
+    return 'ok' in result ? answer(made, result.ok ?? {}) : answer(status(result.err), { error: result.err.detail || result.err.errno, errno: result.err.errno });
+  };
+  switch (name) {
+    case 'login': return one({ login: { username: data.username ?? 'root', password: data.password ?? '' } }, { sudo: !!data.sudo });
+    case 'logout': return one('logout');
+    case 'sudo': return one({ sudo: { password: data.password ?? '', revoke: !!data.revoke } });
+    case 'passwd': return one({ passwd: { username: data.username ?? null, password: data.password ?? '', current_password: data.current_password ?? null, force: !!data.force } }, { sudo: !!data.sudo });
+    case 'register': return one({ useradd: { name: data.username, password: data.password ?? '', short_password: !!data.short_password, create_home: !!data.create_home } }, {}, 201);
+    case 'unregister': {
+      const creds = await call(request, 'getcreds');
+      return one({ userdel: { name: creds.user, remove: !!data.remove, password: data.password ?? '' } });
+    }
+    case 'session': {
+      const creds = await call(request, 'getcreds');
+      return answer(200, { username: creds.user, uid: creds.uid, authenticated: creds.signed_in, writable: creds.signed_in, home: creds.home,
+        group: creds.group, groups: creds.group_names, can_sudo: creds.can_sudo, sudo_active: creds.sudo_active });
+    }
+  }
+  throw new Error('no such account call: ' + name);
 }
 
 // A whole file written as a page writes one, through a descriptor (open, pwrite, close): `url`
@@ -144,8 +177,59 @@ async function tree(request, path, options) {
   for (const entry of listed.ok ?? []) below.push(...await tree(request, path.replace(/\/$/, '') + '/' + entry.name, options));
   return [path, ...below];
 }
+// The account programs, as user space makes them of their calls (crates/userland accounts.rs),
+// answered as a request is: the call's errno as a status, and what it said.
+async function accountProgram(request, args, sudo) {
+  const answer = (code, body) => ({ status: () => code, ok: () => code < 300, json: async () => body, text: async () => JSON.stringify(body) });
+  const [name, ...rest] = args;
+  const flags = {}, operands = [];
+  for (let i = 0; i < rest.length; i++) {
+    const arg = rest[i];
+    if (arg.startsWith('--')) flags[arg.slice(2)] = true;
+    else if (arg.startsWith('-') && arg.length > 1) {
+      for (const [j, flag] of [...arg.slice(1)].entries()) {
+        if ('dgGln'.includes(flag)) { flags[flag] = arg.slice(j + 2) || rest[++i]; break; }
+        flags[flag] = true;
+      }
+    } else operands.push(arg);
+  }
+  const options = { sudo };
+  const said = async op => {
+    const [result] = await sys(request, [op], options);
+    if ('ok' in result) return answer(200, { output: result.ok?.message ?? '' });
+    const code = { EACCES: 401, EPERM: 403, ENOENT: 404, EEXIST: 409, EAGAIN: 429 }[result.err.errno] ?? 400;
+    return answer(code === 401 && (await call(request, 'getcreds', options).catch(() => ({ signed_in: true }))).signed_in ? 403 : code, { error: result.err.detail || result.err.errno, errno: result.err.errno });
+  };
+  switch (name) {
+    case 'useradd': return said({ useradd: { name: operands[0], create_home: !!flags.m, home: flags.d ?? null, group: flags.g ?? null, groups: flags.G ?? null } });
+    case 'usermod': return said({ usermod: { name: operands[0], append: !!flags.a, groups: flags.G ?? null, group: flags.g ?? null, home: flags.d ?? null, move_home: !!flags.m, rename: flags.l ?? null, lock: !!flags.L, unlock: !!flags.U } });
+    case 'userdel': return said({ userdel: { name: operands[0], remove: !!flags.r } });
+    case 'groupadd': return said({ groupadd: { name: operands[0] } });
+    case 'groupdel': return said({ groupdel: { name: operands[0] } });
+    case 'groupmod': return said({ groupmod: { name: operands[0], new_name: flags.n } });
+  }
+  // whoami, id, users: of /etc/passwd and /etc/group, as the session (under sudo) is.
+  const [creds] = await sys(request, ['getcreds'], options);
+  if ('err' in creds) return answer(403, { error: creds.err.detail || creds.err.errno, errno: creds.err.errno });
+  const passwd = await idsOf(request, '/etc/passwd'), group = await idsOf(request, '/etc/group');
+  const groupName = gid => [...group.values()].find(fields => fields[2] === String(gid))?.[0] ?? String(gid);
+  if (name === 'whoami') return answer(200, { output: creds.ok.user });
+  if (name === 'users') {
+    if (creds.ok.uid !== 0) return answer(403, { error: 'Only root can list accounts' });
+    return answer(200, { output: [...passwd.values()].map(fields => `${fields[0]}\tuid=${fields[2]}\t${fields[5]}`).join('\n') });
+  }
+  if (name === 'id') {
+    const user = operands[0] ? passwd.get(operands[0]) : null;
+    if (operands[0] && !user) return answer(404, { error: 'User does not exist' });
+    const uid = user ? Number(user[2]) : creds.ok.uid, gid = user ? Number(user[3]) : creds.ok.gid;
+    const members = user ? [gid, ...[...group.values()].filter(fields => (fields[3] || '').split(',').includes(operands[0])).map(fields => Number(fields[2]))] : creds.ok.groups;
+    const ids = [...new Set(members)].sort((a, b) => a - b);
+    return answer(200, { output: `uid=${uid}(${user ? user[0] : creds.ok.user}) gid=${gid}(${groupName(gid)}) groups=${ids.map(id => `${id}(${groupName(id)})`).join(',')}` });
+  }
+  throw new Error('no such program here: ' + name);
+}
 export async function program(request, args, { cwd = '/', sudo = false, ...extra } = {}) {
-  if (!MOVED.has(args[0])) return request.post(origin + '/api/command', { headers: { ...headers, ...(extra.headers || {}) }, data: { args, cwd, sudo } });
+  if (!MOVED.has(args[0])) return accountProgram(request, args, sudo);
   const options = { sudo };
   const creds = await call(request, 'getcreds', options);
   const absolute = p => p === '~' ? creds.home : p.startsWith('~/') ? creds.home + p.slice(1) : p.startsWith('/') ? p : (cwd === '/' ? '' : cwd) + '/' + p;

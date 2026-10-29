@@ -5,9 +5,11 @@ const origin = `http://127.0.0.1:${port}`; // Deliberately local-only; never see
 const vars = await readFile('.dev.vars', 'utf8');
 const password = process.env.TERMINAL_PASSWORD || vars.match(/^ADMIN_PASSWORD=(.+)$/m)?.[1];
 if (!password) throw new Error('Run npm run setup first');
-const login = await fetch(origin + '/api/login', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) });
-if (!login.ok) throw new Error(`Local login failed: ${login.status} ${await login.text()}`);
-const cookie = login.headers.get('set-cookie').split(';')[0];
+// Sign in as root (the login system call), whose session cookie the calls below carry.
+const login = await fetch(origin + '/api/sys', { method: 'POST', headers: { Origin: origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ calls: [{ login: { username: 'root', password } }] }) });
+const [signed] = login.ok ? (await login.clone().json()).results : [{ err: { errno: login.status } }];
+if (!signed.ok) throw new Error(`Local login failed: ${signed.err?.detail || signed.err?.errno}`);
+const cookie = login.headers.getSetCookie().map(set => set.split(';')[0]).find(set => set.startsWith('terminal_session='));
 const headers = { Origin: origin, Cookie: cookie };
 // System calls, as a page makes them: each call's `{ok}` or `{err}`.
 async function sys(calls) {

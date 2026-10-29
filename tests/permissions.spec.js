@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { call, entry, errno, mkdirp, program, put, rmrf, sys } from './sys.js';
+import { api, call, entry, errno, mkdirp, program, put, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const password = 'testing-long-passphrase-8274';
@@ -10,7 +10,7 @@ let sequence = 0;
 async function client() { return playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'acl-test-' + Date.now() + '-' + (++sequence) } }); }
 async function command(client, args, extra = {}) { return program(client, args, extra); }
 async function ok(response, status = 200) { expect(response.status(), await response.text()).toBe(status); return response; }
-async function login(client, username, secret = password) { return ok(await client.post('/api/login', { data: { username, password: secret } })); }
+async function login(client, username, secret = password) { return ok(await api(client, 'login', { data: { username, password: secret } })); }
 async function setup() {
  const root = await client(), alice = await client(), bob = await client(), guest = await client();
  await login(root, 'root', rootPassword);
@@ -18,7 +18,7 @@ async function setup() {
  await ok(await command(root, ['groupadd', team]));
  for (const name of [a,b]) {
   await ok(await command(root, ['useradd', '-m', '-G', team, name]));
-  await ok(await root.post('/api/passwd', { data: { username: name, password } }));
+  await ok(await api(root, 'passwd', { data: { username: name, password } }));
  }
  await login(alice,a); await login(bob,b);
  return { root, alice, bob, guest, a, b, team, home: '/home/' + a, async cleanup() {
@@ -63,23 +63,23 @@ test('owner/group/other, traversal, ranges, revocation and root bypass are enfor
 test('sudo verifies the caller, stays per-command, revokes membership immediately; home moves and passwords invalidate old access', async () => {
  const f=await setup();const {root,alice,bob,guest,a,b,home}=f;
  try {
-  expect((await guest.post('/api/sudo',{data:{password:rootPassword}})).status()).toBe(401);
-  expect((await guest.post('/api/login',{data:{username:'root',sudo:true,password:rootPassword}})).status()).toBe(401);
-  expect((await alice.post('/api/login',{data:{username:'root',sudo:true,password:rootPassword}})).status()).toBe(403);
+  expect((await api(guest, 'sudo',{data:{password:rootPassword}})).status()).toBe(401);
+  expect((await api(guest, 'login',{data:{username:'root',sudo:true,password:rootPassword}})).status()).toBe(401);
+  expect((await api(alice, 'login',{data:{username:'root',sudo:true,password:rootPassword}})).status()).toBe(403);
   expect((await command(alice,['useradd','intruder'],{sudo:true})).status()).toBe(403);
-  expect((await alice.post('/api/sudo',{data:{password:rootPassword}})).status()).toBe(403);
+  expect((await api(alice, 'sudo',{data:{password:rootPassword}})).status()).toBe(403);
   await ok(await command(root,['usermod','-aG','wheel',a]));
   expect((await command(alice,['users'],{sudo:true})).status()).toBe(403);
-  expect((await alice.post('/api/sudo',{data:{password:'incorrect-password'}})).status()).toBe(401);
-  await ok(await alice.post('/api/sudo',{data:{password}}));
+  expect((await api(alice, 'sudo',{data:{password:'incorrect-password'}})).status()).toBe(401);
+  await ok(await api(alice, 'sudo',{data:{password}}));
   const originalCookie=(await alice.storageState()).cookies.find(c=>c.name==='terminal_session').value;
   await ok(await command(alice,['users'],{sudo:true}));
-  expect((await (await alice.get('/api/session')).json()).username).toBe(a);
+  expect((await (await api(alice, 'session')).json()).username).toBe(a);
   expect((await alice.storageState()).cookies.find(c=>c.name==='terminal_session').value).toBe(originalCookie);
   expect(await errno(alice, { getdents: { path: '/root' } })).toBe('EACCES');
-  await ok(await alice.post('/api/sudo',{data:{revoke:true}}));
+  await ok(await api(alice, 'sudo',{data:{revoke:true}}));
   expect((await command(alice,['users'],{sudo:true})).status()).toBe(403);
-  await ok(await alice.post('/api/sudo',{data:{password}}));
+  await ok(await api(alice, 'sudo',{data:{password}}));
   await ok(await command(root,['usermod','-G',f.team,a]));
   expect((await command(alice,['users'],{sudo:true})).status()).toBe(403);
   await ok(await put(alice, file(home+'/kept.txt'),{data:'preserve bytes'}),201);
@@ -89,17 +89,17 @@ test('sudo verifies the caller, stays per-command, revokes membership immediatel
   expect((await alice.get(file(home+'/kept.txt'))).status()).toBe(404);
   expect(await (await ok(await alice.get(file(next+'/kept.txt')))).text()).toBe('preserve bytes');
   const metadata=await entry(alice, next+'/kept.txt');expect(metadata.mode).toBe(0o600);expect(metadata.owner).toBe(a);
-  expect((await root.post('/api/command',{data:{args:['usermod','-d',next+'/inside','-m',a]}})).status()).toBe(400);
+  expect((await command(root,['usermod','-d',next+'/inside','-m',a])).status()).toBe(400);
   await ok(await command(root,['usermod','-L',a]));
   expect((await alice.get(file(next+'/kept.txt'))).status()).toBe(401);
-  expect((await guest.post('/api/login',{data:{username:a,password}})).status()).toBe(401);
+  expect((await api(guest, 'login',{data:{username:a,password}})).status()).toBe(401);
   await ok(await command(root,['usermod','-U',a]));await login(alice,a);
-  await ok(await root.post('/api/passwd',{data:{username:a,password:password+'new'}}));
+  await ok(await api(root, 'passwd',{data:{username:a,password:password+'new'}}));
   expect((await alice.get(file(next+'/kept.txt'))).status()).toBe(401);
-  expect((await guest.post('/api/login',{data:{username:a,password}})).status()).toBe(401);
+  expect((await api(guest, 'login',{data:{username:a,password}})).status()).toBe(401);
   await login(alice,a,password+'new');
   const oldCookie=(await alice.storageState()).cookies.find(c=>c.name==='terminal_session').value;
-  await ok(await alice.post('/api/logout'));
+  await ok(await api(alice, 'logout'));
   expect((await guest.get(file(next+'/kept.txt'),{headers:{Cookie:'terminal_session='+oldCookie}})).status()).toBe(401);
   // Failed account creation is atomic, including automatic private-group allocation.
   expect((await command(root,['useradd','-m','-d',next,b+'bad'])).status()).toBe(400);
@@ -251,20 +251,20 @@ test('sudo account switching checks live membership, replaces sessions and clear
  const f=await setup();const {root,alice,guest,a,b}=f;
  try {
   await ok(await command(root,['usermod','-aG','wheel',a]));
-  expect((await alice.post('/api/login',{data:{username:b,sudo:true}})).status()).toBe(403);
-  await ok(await alice.post('/api/sudo',{data:{password}}));
+  expect((await api(alice, 'login',{data:{username:b,sudo:true}})).status()).toBe(403);
+  await ok(await api(alice, 'sudo',{data:{password}}));
   await ok(await command(root,['usermod','-L',b]));
-  expect((await alice.post('/api/login',{data:{username:b,sudo:true}})).status()).toBeGreaterThanOrEqual(400);
-  expect((await (await alice.get('/api/session')).json()).username).toBe(a);
+  expect((await api(alice, 'login',{data:{username:b,sudo:true}})).status()).toBeGreaterThanOrEqual(400);
+  expect((await (await api(alice, 'session')).json()).username).toBe(a);
   await ok(await command(root,['usermod','-U',b]));
   const cookie=(await alice.storageState()).cookies.find(c=>c.name==='terminal_session').value;
-  await ok(await alice.post('/api/login',{data:{username:b,sudo:true}}));
-  const current=await (await alice.get('/api/session')).json();
+  await ok(await api(alice, 'login',{data:{username:b,sudo:true}}));
+  const current=await (await api(alice, 'session')).json();
   expect(current.username).toBe(b);expect(current.sudo_active).toBe(false);
-  expect((await (await guest.get('/api/session',{headers:{Cookie:'terminal_session='+cookie}})).json()).username).toBe('guest');
-  expect((await alice.post('/api/login',{data:{username:'root',sudo:true}})).status()).toBe(403);
-  await login(alice,a);await ok(await alice.post('/api/sudo',{data:{password}}));
+  expect((await (await api(guest, 'session',{headers:{Cookie:'terminal_session='+cookie}})).json()).username).toBe('guest');
+  expect((await api(alice, 'login',{data:{username:'root',sudo:true}})).status()).toBe(403);
+  await login(alice,a);await ok(await api(alice, 'sudo',{data:{password}}));
   await ok(await command(root,['usermod','-G',f.team,a]));
-  expect((await alice.post('/api/login',{data:{username:'root',sudo:true}})).status()).toBe(403);
+  expect((await api(alice, 'login',{data:{username:'root',sudo:true}})).status()).toBe(403);
  } finally {await f.cleanup();}
 });

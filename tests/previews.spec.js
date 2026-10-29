@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { crc32, gzipSync } from 'node:zlib';
-import { mkdirp, put, rmrf } from './sys.js';
+import { api, mkdirp, put, rmrf } from './sys.js';
 const origin=process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password=(await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const headers={Origin:origin,'CF-Connecting-IP':'preview-regression'};
@@ -38,7 +38,7 @@ function pdf(){
 }
 
 test('Rust previews: highlighted code, diagrams, maths, links within the filesystem, tables, archives, cards, diffs, SVG and slides',async({page,request})=>{
- const base='/previews-'+Date.now();await request.post('/api/login',{headers,data:{password}});await mkdirp(request, base);
+ const base='/previews-'+Date.now();await api(request, 'login',{headers,data:{password}});await mkdirp(request, base);
  try{
   const files={
    'doc.md':'# Previews\n\n[Other notes](other.md) and [the web](https://example.com).\n\n![pixel](img/pixel.png) ![logo](logo.svg)\n\n```rust\nfn main() {\n    println!("hi");\n}\n```\n\n```mermaid\nflowchart LR\n  A[Alice] --> B[Bob]\n```\n\nInline $a^2 + b^2 = c^2$.\n\n- [x] done\n',
@@ -119,7 +119,7 @@ test('Rust previews: highlighted code, diagrams, maths, links within the filesys
 });
 
 test('a link opens another file with a way back; slides, PDFs and text open where they were left; slide themes',async({page,request})=>{
- const base='/viewer-'+Date.now();await request.post('/api/login',{headers,data:{password}});await mkdirp(request, base);
+ const base='/viewer-'+Date.now();await api(request, 'login',{headers,data:{password}});await mkdirp(request, base);
  try{
   const files={'deck.slides.md':'# One\n\n[notes](notes.md)\n\n---\n\n# Two\n\n---\n\n# Three\n','notes.md':'# Notes\n\nReached by a link.\n','long.txt':'line\n'.repeat(400)};
   for(const [name,text] of Object.entries(files))expect((await put(request, file(base+'/'+name),{headers,data:Buffer.from(text)})).status()).toBe(201);
@@ -161,7 +161,7 @@ function expanding(size){
 }
 
 test('an archive is listed off the page, within what it may expand to; a worker that cannot start says so, and starts again',async({page,context,request})=>{
- const base='/preview-workers-'+Date.now();await request.post('/api/login',{headers,data:{password}});await mkdirp(request, base);
+ const base='/preview-workers-'+Date.now();await api(request, 'login',{headers,data:{password}});await mkdirp(request, base);
  try{
   expect((await put(request, file(base+'/expanded.tgz'),{headers,data:expanding(1_200_000_000)})).status()).toBe(201);
   expect((await put(request, file(base+'/one.pdf'),{headers,data:pdf()})).status()).toBe(201);

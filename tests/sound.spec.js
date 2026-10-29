@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { call, entry, errno, names, program, put, rmrf, sys } from './sys.js';
+import { api, call, entry, errno, names, program, put, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const vars = await readFile('.dev.vars', 'utf8');
 const rootPassword = vars.match(/^ADMIN_PASSWORD=(.+)$/m)[1];
@@ -30,7 +30,7 @@ async function device(browser, username, password, prepare = async () => {}) {
     const take = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
     navigator.mediaDevices.getUserMedia = async constraints => { const stream = await take(constraints); (window.microphones ??= []).push(stream); return stream; };
   });
-  if (username) expect((await context.request.post('/api/login', { headers: { Origin: origin }, data: { username, password } })).ok()).toBe(true);
+  if (username) expect((await api(context.request, 'login', { headers: { Origin: origin }, data: { username, password } })).ok()).toBe(true);
   const page = await context.newPage(); await page.goto(origin + '/');
   await expect(page.locator('.lock')).toContainText(username || 'guest');
   return { context, page };
@@ -39,10 +39,10 @@ async function device(browser, username, password, prepare = async () => {}) {
 let root, name, password, home;
 test.beforeAll(async () => {
   root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
-  expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
+  expect((await api(root, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
   name = 'voice' + Date.now().toString(36); password = 'sound-password-' + Date.now();
   expect((await program(root, ['useradd', '-m', name])).ok()).toBe(true);
-  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
   home = '/home/' + name;
 });
 test.afterAll(async () => { await program(root, ['userdel', '-r', name]); await root.dispose(); });

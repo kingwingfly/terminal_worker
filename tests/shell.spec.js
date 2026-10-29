@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { entry, listing, mkdirp, program, put, rmrf, sys } from './sys.js';
+import { api, entry, listing, mkdirp, program, put, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 // Each test signs in as its own client, so that it does not use up others' login rate limit.
 let headers;
@@ -13,7 +13,7 @@ test.beforeEach(async ({ request, page }) => {
   base = '/shell-' + Date.now().toString(36);
   headers = { Origin: origin, 'CF-Connecting-IP': 'shell-' + base };
   await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'shell-ui-' + base });
-  expect((await request.post('/api/login', { headers, data: { password } })).ok()).toBe(true);
+  expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
   for (const dir of ['', '/docs', '/docs/deep', '/.hidden']) await mkdirp(request, base + dir);
   const files = { 'a.md': 'alpha\nbeta\n', 'docs/b.md': 'one\ntwo\nthree\n', 'docs/deep/spéctrum notes.md': 'γ\n', 'docs/c.txt': 'TODO later\ndone\nTODO now\n', '.hidden/d.md': 'x\n', 'x.tmp': '', 'y.tmp': '' };
   for (const [name, text] of Object.entries(files)) expect((await put(request, file(base + '/' + name), { headers, data: text || ' ' })).status()).toBe(201);

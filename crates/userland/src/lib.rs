@@ -6,6 +6,7 @@
 //!
 //! The page runs them (crates/frontend), as the shell's commands; tests run them over the
 //! kernel in memory.
+mod accounts;
 mod copy;
 mod files;
 mod find;
@@ -24,6 +25,8 @@ pub use sys::Sys;
 pub const PROGRAMS: &[&str] = &[
     "ls", "stat", "mkdir", "rmdir", "rm", "mv", "cp", "ln", "readlink", "realpath", "touch",
     "chmod", "chown", "chgrp", "getfacl", "setfacl", "getfattr", "setfattr", "fd", "ps", "kill",
+    "whoami", "id", "groups", "users", "useradd", "usermod", "userdel", "groupadd", "groupmod",
+    "groupdel",
 ];
 
 /// Run the program `io.args[0]`, with what `io` gives it: its exit status, as a shell sees it;
@@ -52,6 +55,16 @@ pub async fn run(sys: &impl Sys, io: &mut Io<'_>) -> Option<i32> {
         "fd" => find::fd(sys, io).await,
         "ps" => procs::ps(sys, io).await,
         "kill" => procs::kill(sys, io).await,
+        "whoami" => accounts::whoami(sys, io).await,
+        "id" => accounts::id(sys, io).await,
+        "groups" => accounts::groups_program(sys, io).await,
+        "users" => accounts::users(sys, io).await,
+        "useradd" => accounts::useradd(sys, io).await,
+        "usermod" => accounts::usermod(sys, io).await,
+        "userdel" => accounts::userdel(sys, io).await,
+        "groupadd" => accounts::groupadd(sys, io).await,
+        "groupmod" => accounts::groupmod(sys, io).await,
+        "groupdel" => accounts::groupdel(sys, io).await,
         _ => return None,
     };
     Some(status)

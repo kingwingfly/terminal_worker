@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { mkdirp, program, put, rmrf } from './sys.js';
+import { api, mkdirp, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -8,7 +8,7 @@ let sequence = 0;
 // Another device, signed in as root through the API.
 async function device() {
   const client = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': 'sync-' + Date.now() + '-' + (++sequence) } });
-  expect((await client.post('/api/login', { data: { password } })).ok()).toBe(true);
+  expect((await api(client, 'login', { data: { password } })).ok()).toBe(true);
   return client;
 }
 
@@ -17,7 +17,7 @@ test('a page shows what other devices change as it happens, and hears nothing of
   try {
     await mkdirp(other, base);
     await context.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'sync-page-' + Date.now() });
-    expect((await context.request.post('/api/login', { headers: { Origin: origin }, data: { password } })).ok()).toBe(true);
+    expect((await api(context.request, 'login', { headers: { Origin: origin }, data: { password } })).ok()).toBe(true);
     await page.goto('/');
     const input = page.getByRole('combobox', { name: 'Terminal command' });
     await expect(page.locator('.busy')).toHaveText('↵');
@@ -57,7 +57,7 @@ test('removing a file another device is uploading stops that upload, as rm does 
   try {
     await mkdirp(other, base);
     await context.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'sync-uploader-' + Date.now() });
-    expect((await context.request.post('/api/login', { headers: { Origin: origin }, data: { password } })).ok()).toBe(true);
+    expect((await api(context.request, 'login', { headers: { Origin: origin }, data: { password } })).ok()).toBe(true);
     await page.goto('/');
     const input = page.getByRole('combobox', { name: 'Terminal command' });
     await expect(page.locator('.busy')).toHaveText('↵');

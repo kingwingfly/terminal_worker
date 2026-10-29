@@ -1,13 +1,13 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { mkdirp, put, rmrf } from './sys.js';
+import { api, mkdirp, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787', headers = { Origin: origin };
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const names = ['alpha.txt', 'alphabet.txt', 'z-alpha.txt', 'a_l_p_h_a.txt', 'GammaSpectrum.txt', 'γάμμα-spectrum.md', 'name "quote".txt'];
 let base;
 test.beforeEach(async ({ request, page }) => {
   base = '/completion-' + Date.now();
-  expect((await request.post('/api/login', { headers, data: { password } })).ok()).toBe(true);
+  expect((await api(request, 'login', { headers, data: { password } })).ok()).toBe(true);
   for (const path of [base + '/a-dir', base + '/b-dir']) await mkdirp(request, path);
   for (const name of [...names, 'a-dir/inside.txt']) expect((await put(request, '/api/file?path=' + encodeURIComponent(base + '/' + name), { headers, data: 'fixture' })).status()).toBe(201);
   await page.goto('/');

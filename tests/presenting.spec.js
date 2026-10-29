@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { mkdirp, names, program, put, rmrf, sys } from './sys.js';
+import { api, mkdirp, names, program, put, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -34,7 +34,7 @@ const status = page => page.locator('.slides-bar [role=status]');
 // A page of a browser of its own, signed in through the API, or a guest's.
 async function device(browser, username, password, prepare = async () => {}) {
   const context = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': address(username || 'guest') } });
-  if (username) expect((await context.request.post('/api/login', { headers: { Origin: origin }, data: { username, password } })).ok()).toBe(true);
+  if (username) expect((await api(context.request, 'login', { headers: { Origin: origin }, data: { username, password } })).ok()).toBe(true);
   const page = await context.newPage(); await prepare(page); await page.goto(origin + '/');
   await expect(page.locator('.lock')).toContainText(username || 'guest');
   return { context, page };
@@ -43,7 +43,7 @@ async function device(browser, username, password, prepare = async () => {}) {
 let root, base;
 test.beforeAll(async () => {
   root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
-  expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
+  expect((await api(root, 'login', { data: { password: rootPassword } })).ok()).toBe(true);
   base = '/presenting-' + Date.now().toString(36);
   await mkdirp(root, base);
   for (const [name, data] of [['deck.slides.md', deck], ['other.slides.md', '# Bee\n\n---\n\n# Bee two\n'], ['third.slides.md', '# Sea\n'], ['figure.svg', figure], ['pages.pdf', pdf()]]) expect((await put(root, file(base + '/' + name), { data })).status()).toBe(201);
@@ -171,7 +171,7 @@ test('the pages of one account signed in on other devices follow the slide prese
   const name = 'present' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
   const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
-  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
   const laptop = await device(browser, name, password), phone = await device(browser, name, password);
   const guest = await device(browser), other = await device(browser, 'root', rootPassword);
   try {
@@ -255,7 +255,7 @@ test('a page of the account opens a deck where the account showed it last, on an
   const name = 'where' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
   const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
-  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
   const laptop = await device(browser, name, password);
   let phone;
   try {
@@ -278,7 +278,7 @@ test('present makes /dev/present/NAME, which whoever may read the file follows, 
   const command = args => program(root, args);
   for (const user of [name, outsider]) {
     expect((await command(['useradd', '-m', user])).ok()).toBe(true);
-    expect((await root.post('/api/passwd', { data: { username: user, password } })).ok()).toBe(true);
+    expect((await api(root, 'passwd', { data: { username: user, password } })).ok()).toBe(true);
   }
   // Readable by the presenter and by guests, as their ACL says, and by nobody else.
   const stem = 'talk' + Date.now().toString(36), talk = `${base}/${stem}.slides.md`;
@@ -364,7 +364,7 @@ test('a page whose line dropped catches up, on its return, with the turns made m
   const name = 'line' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
   const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
-  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
   // The phone's line to the authority, which the test drops.
   let line;
   const laptop = await device(browser, name, password);
@@ -391,7 +391,7 @@ test('a presentation that comes to show another file takes its listeners with it
   const name = 'swap' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
   const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
-  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
   const laptop = await device(browser, name, password), guest = await device(browser);
   const stem = 'swap' + Date.now().toString(36);
   try {
@@ -419,7 +419,7 @@ test('a listener whose line was down when the presentation came to show another 
   const name = 'missed' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
   const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
-  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
   let line;
   const laptop = await device(browser, name, password);
   const guest = await device(browser, undefined, undefined, page => page.routeWebSocket(/\/api\/events$/, ws => { ws.connectToServer(); line = ws; }));
@@ -453,7 +453,7 @@ test('a replacement heard after the listener left the presentation does not take
   const name = 'left' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
   const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
-  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
   const laptop = await device(browser, name, password), guest = await device(browser);
   const stem = 'left' + Date.now().toString(36);
   try {
@@ -488,7 +488,7 @@ test('a page whose line was down when its presentation changed hands learns it o
   const name = 'hands' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
   const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
-  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
   let line;
   const presenter = await device(browser, name, password), guest = await device(browser);
   const listener = await device(browser, 'root', rootPassword, page => page.routeWebSocket(/\/api\/events$/, ws => { ws.connectToServer(); line = ws; }));
@@ -529,7 +529,7 @@ test('a failure heard for a replacement the listener has since gone past does no
   const name = 'stale' + Date.now().toString(36), password = 'presenting-password-' + Date.now();
   const command = args => program(root, args);
   expect((await command(['useradd', '-m', name])).ok()).toBe(true);
-  expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
+  expect((await api(root, 'passwd', { data: { username: name, password } })).ok()).toBe(true);
   // A deck the presenter may read and guests may not.
   const secret = `${base}/secret-${name}.slides.md`;
   expect((await put(root, file(secret), { data: '# Secret\n' })).status()).toBe(201);

@@ -18,9 +18,22 @@ pub async fn handle(
     state: &State,
     key: Option<String>,
 ) -> Result<Reply> {
+    let content = req.headers().get("Content-Length")?;
+    if content
+        .and_then(|length| length.parse::<u64>().ok())
+        .is_none_or(|length| length > BATCH_BYTES)
+    {
+        return Ok(Reply::error(
+            "A batch says its length, and is at most 4 MB",
+            400,
+        ));
+    }
     let Ok(batch) = req.json::<Batch>().await else {
         return Ok(Reply::error("Invalid system call batch", 400));
     };
+    let https = req.url()?.scheme() == "https";
+    // The session's cookie, as a login, logout or password change made it anew.
+    let mut cookie = None;
     if batch.calls.len() > BATCH_MAX {
         return Ok(Reply::error(
             &format!("A batch takes at most {BATCH_MAX} calls"),
@@ -32,6 +45,16 @@ pub async fn handle(
     let mut results = Vec::with_capacity(batch.calls.len());
     for call in batch.calls {
         let (key, guest) = (key.clone(), guest.clone());
+        // What takes a password (its KDF, and a rate limit) waits outside a transaction too,
+        // and may give the session a new cookie.
+        if let Some(asked) = passworded(&call, sudo) {
+            let reply = asked.run(req, env, state, key, https).await?;
+            if let Some(made) = &reply.cookie {
+                cookie = Some(made.clone());
+            }
+            results.push(returned(reply));
+            continue;
+        }
         // A driver's request that asks Realtime waits for the network outside a transaction.
         if let Call::Ioctl { fd, request, arg } = &call
             && crate::dev::networked(*request)
@@ -51,6 +74,7 @@ pub async fn handle(
             });
             continue;
         }
+        let logout = matches!(call, Call::Logout);
         // A process spawned, signalled or answered: its runner wakes.
         let wakes = match &call {
             Call::Kill { pid } | Call::Write { pid, .. } => Some(pid.clone()),
@@ -72,13 +96,112 @@ pub async fn handle(
             };
             (result, commit)
         })?;
+        if logout && matches!(result, Return::Ok(_)) {
+            cookie = Some(auth::cookie(https, "", 0));
+        }
         if let (Some(pid), Return::Ok(value)) = (wakes, &result) {
             let pid = value["pid"].as_str().map(str::to_string).unwrap_or(pid);
             crate::api::kick(env, &json!({ "job": pid })).await;
         }
         results.push(result);
     }
-    Ok(Reply::ok(json!(Results { results })))
+    let reply = Reply::ok(json!(Results { results }));
+    Ok(match cookie {
+        Some(cookie) => reply.cookie(cookie),
+        None => reply,
+    })
+}
+
+/// The most a batch's request may be.
+const BATCH_BYTES: u64 = 4 << 20;
+
+/// A call that takes a password, as the kernel's handlers of them take it (api.rs).
+enum Passworded {
+    Login(serde_json::Value),
+    Sudo(serde_json::Value),
+    Passwd(serde_json::Value),
+    Register(serde_json::Value),
+    Unregister(serde_json::Value),
+}
+fn passworded(call: &Call, sudo: bool) -> Option<Passworded> {
+    Some(match call {
+        // sudo -u, root's, and root's own switch need no password.
+        Call::Login { username, password } => Passworded::Login(
+            json!({ "username": username, "password": password, "sudo": sudo, "switch": true }),
+        ),
+        Call::Sudo { password, revoke } => {
+            Passworded::Sudo(json!({ "password": password, "revoke": revoke }))
+        }
+        Call::Passwd {
+            username,
+            password,
+            current_password,
+            force,
+        } => Passworded::Passwd(json!({
+            "username": username, "password": password,
+            "current_password": current_password.clone().unwrap_or_default(),
+            "sudo": sudo, "force": force,
+        })),
+        Call::Useradd {
+            name,
+            create_home,
+            password: Some(password),
+            short_password,
+            ..
+        } => Passworded::Register(json!({
+            "username": name, "password": password, "short_password": short_password,
+            "create_home": create_home,
+        })),
+        Call::Userdel {
+            remove,
+            password: Some(password),
+            ..
+        } => Passworded::Unregister(json!({ "password": password, "remove": remove })),
+        _ => return None,
+    })
+}
+impl Passworded {
+    async fn run(
+        self,
+        req: &Request,
+        env: &Env,
+        state: &State,
+        key: Option<String>,
+        https: bool,
+    ) -> Result<Reply> {
+        use crate::api;
+        match self {
+            Self::Login(body) => api::login(req, env, state, key, https, body).await,
+            Self::Sudo(body) => api::sudo(req, env, state, key, body).await,
+            Self::Passwd(body) => api::passwd(req, env, state, key, https, body).await,
+            Self::Register(body) => api::register(req, env, state, key, https, body).await,
+            Self::Unregister(body) => api::unregister(req, env, state, key, https, body).await,
+        }
+    }
+}
+
+/// A handler's reply, as a call's result: its value, or an errno its status says, with its
+/// words.
+fn returned(reply: Reply) -> Return {
+    if reply.status < 300 {
+        return Return::Ok(reply.body);
+    }
+    let errno = match reply.status {
+        401 => Errno::EACCES,
+        403 => Errno::EPERM,
+        404 => Errno::ENOENT,
+        409 => Errno::EEXIST,
+        412 => Errno::ESTALE,
+        413 => Errno::EFBIG,
+        429 => Errno::EAGAIN,
+        500.. => Errno::EIO,
+        _ => Errno::EINVAL,
+    };
+    let detail = reply.body["error"]
+        .as_str()
+        .unwrap_or(errno.text())
+        .to_string();
+    Return::Err(Error::because(errno, detail))
 }
 
 /// The process the session `key` runs as: its account, root under sudo if it may.
@@ -117,6 +240,18 @@ fn run(
             mode,
             rdev: Some(rdev),
         } => crate::dev::mknod(db, &process, &path, mode, &rdev).map(|()| serde_json::Value::Null),
+        Call::Logout => {
+            if let Some(key) = key {
+                db.delete_session(key);
+            }
+            Ok(json!({ "username": "guest", "home": "/" }))
+        }
+        call @ (Call::Useradd { .. }
+        | Call::Usermod { .. }
+        | Call::Userdel { .. }
+        | Call::Groupadd { .. }
+        | Call::Groupmod { .. }
+        | Call::Groupdel { .. }) => account(db, &process.cred, call),
         Call::Getcreds => Ok(json!(creds(db, key, &process.cred))),
         call @ (Call::Spawn { .. }
         | Call::Ps
@@ -395,4 +530,92 @@ async fn networked(
             Ok(json!({ "session": session }))
         }
     }
+}
+
+/// The account calls of root (or one under sudo), as their options say (commands/accounts.rs):
+/// what was done, said as the programs say it.
+fn account(
+    db: &mut Db,
+    who: &Identity,
+    call: Call,
+) -> std::result::Result<serde_json::Value, Error> {
+    use crate::commands::accounts;
+    use terminal_worker_core::cli::accounts as args;
+    let done = match call {
+        Call::Useradd {
+            name,
+            create_home,
+            home,
+            group,
+            groups,
+            short_password,
+            ..
+        } => accounts::useradd(
+            db,
+            who,
+            args::Useradd {
+                short_password,
+                create_home,
+                no_create_home: !create_home,
+                home,
+                group,
+                groups,
+                name,
+            },
+        ),
+        Call::Usermod {
+            name,
+            append,
+            groups,
+            group,
+            home,
+            move_home,
+            rename,
+            lock,
+            unlock,
+        } => accounts::usermod(
+            db,
+            who,
+            args::Usermod {
+                append,
+                groups,
+                group,
+                home,
+                move_home,
+                rename,
+                lock,
+                unlock,
+                user: name,
+            },
+        ),
+        Call::Userdel { name, remove, .. } => {
+            accounts::userdel(db, who, args::Userdel { remove, user: name })
+        }
+        Call::Groupadd { name } => accounts::groupadd(db, who, args::Groupadd { group: name }),
+        Call::Groupmod { name, new_name } => accounts::groupmod(
+            db,
+            who,
+            args::Groupmod {
+                new: new_name,
+                old: name,
+            },
+        ),
+        Call::Groupdel { name } => accounts::groupdel(db, who, args::Groupdel { group: name }),
+        _ => return Err(Errno::ENOSYS.into()),
+    };
+    done.map(|message| json!({ "message": message }))
+        .map_err(|why| {
+            let errno = if crate::commands::is_permission_error(&why)
+                || why.starts_with("Root permission")
+            {
+                Errno::EPERM
+            } else if why.contains("does not exist") {
+                Errno::ENOENT
+            } else if why.contains("already exists") {
+                Errno::EEXIST
+            } else {
+                Errno::EINVAL
+            };
+            Error::because(errno, why)
+        })
 }

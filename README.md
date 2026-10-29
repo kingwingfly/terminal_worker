@@ -144,7 +144,7 @@ Passwords use random salts, PBKDF2-SHA256 (100,000 iterations), and a server-sid
 
 ### Pipes
 
-`A | B` passes what A writes to B. Commands that read input are the text filters `cat`, `head`, `tail`, `grep` (Rust regular expressions, as with `grep -E`), `wc`, `sort`, and `uniq`, plus `xargs`, which runs a command with the items it reads (`-0`, `-d`, `-n`, `-I`, `-r`, `-t`, as in GNU xargs). Stages run one after another in the browser; the server runs file commands, many at a time for xargs and `fd -x`, each in its own transaction. Other shell operators (`&&`, `||`, `;`, `<`, `>`, `&`) are refused rather than taken literally; quote them to use them as text. Unquoted wildcards expand as in bash before a stage runs: `*`, `?` and `[...]` (`[a-z]`, `[!x]`) match names in each part of a path (`rm -rf *`, `cat docs/*.md`, `echo */`), sorted by byte order as `ls` sorts here (bash's order under `LC_ALL=C`: `B.md` before `a.md`), listed with the caller's permissions. Names starting with a dot match only a pattern starting with one; quoted or escaped wildcards are literal; a pattern that matches nothing stays as typed. Brace expansion (`{a,b}`) and `**` are not supported; `fd` fills that role. Quoting follows bash: single quotes keep everything as it is; within double quotes a backslash escapes only `$`, `` ` ``, `"`, `\` and a newline, and is kept before anything else (`grep "\d+"` searches for `\d+`); outside quotes it escapes any character.
+`A | B` passes what A writes to B. Commands that read input are the text filters `cat`, `head`, `tail`, `grep` (Rust regular expressions, as with `grep -E`), `wc`, `sort`, and `uniq`, plus `xargs`, which runs a command with the items it reads (`-0`, `-d`, `-n`, `-I`, `-r`, `-t`, as in GNU xargs). Stages run one after another in the browser, as programs of user space, each command's system calls in batches. Other shell operators (`&&`, `||`, `;`, `<`, `>`, `&`) are refused rather than taken literally; quote them to use them as text. Unquoted wildcards expand as in bash before a stage runs: `*`, `?` and `[...]` (`[a-z]`, `[!x]`) match names in each part of a path (`rm -rf *`, `cat docs/*.md`, `echo */`), sorted by byte order as `ls` sorts here (bash's order under `LC_ALL=C`: `B.md` before `a.md`), listed with the caller's permissions. Names starting with a dot match only a pattern starting with one; quoted or escaped wildcards are literal; a pattern that matches nothing stays as typed. Brace expansion (`{a,b}`) and `**` are not supported; `fd` fills that role. Quoting follows bash: single quotes keep everything as it is; within double quotes a backslash escapes only `$`, `` ` ``, `"`, `\` and a newline, and is kept before anything else (`grep "\d+"` searches for `\d+`); outside quotes it escapes any character.
 
 ```text
 fd -e md | xargs wc -l
@@ -184,9 +184,12 @@ Every page keeps a WebSocket to the authority (`GET /api/events`, accepted only 
 
 | API | Purpose |
 | --- | --- |
+| `GET /api/events` | The page's line (a WebSocket): what changed, what devices it follows do, and the drivers' news to it |
 | `POST /api/sys` `{calls, umask, sudo}` | System calls (owner's design, 2026-10-29: the page is user space): a batch of calls, each run on its own, in order, each answered with its value or its errno (`crates/abi`). The terminal's file programs (ls, rm, chmod, setfacl...) are made of these, in the page (`crates/userland`) |
 | `PUT /api/pwrite?fd=&index=` with optional `X-Chunk-SHA256` | pwrite(2): one chunk of the file a descriptor writes, streamed to R2; writing it again is harmless, other content is refused |
 | `GET /api/file?path=/dev/present/NAME` | Read a device (as `cat` does): its driver's state, as JSON. Presenting, following, asking to speak and live sound are system calls on devices: `mknod`, `open`, and their drivers' `ioctl`s (`crates/worker/src/dev`) |
+
+These are the whole API: the rest is system calls (`crates/abi`), the page being user space. Signing in and out, sudo's timestamp and passwords are calls too (`login`, `logout`, `sudo`, `passwd`), which give the session its cookie; so are accounts (`useradd`, `usermod`, `userdel`, `groupadd`, `groupmod`, `groupdel`: root's, or a signed-out useradd NAME's and an account's own userdel, with its password), whose policy is the kernel's, as setuid programs' is on Linux; `whoami`, `id`, `groups` and `users` read `/etc/passwd` and `/etc/group`, which the kernel writes as they are read.
 
 Text, code, diffs and Markdown can be searched in the viewer: the search button or Ctrl/Cmd+F opens a panel that takes a regular expression (Rust syntax, as `grep` takes) or plain text, with a match-case toggle; Enter and Shift+Enter (or F3) step through the matches, which are highlighted without changing the preview, and Esc closes the panel.
 
@@ -305,18 +308,36 @@ Upload a `.game` manifest and open it:
 
 The manifest can select only a build-time registered entry. Its read permissions protect the manifest, not the publicly served static game runtime. Game HTML/WASM is trusted site-maintainer code running in a same-origin iframe. The close protocol is `parent.postMessage('close-game', location.origin)`. An optional `window.signal.dispose()` may return a promise for releasing audio/resources; the terminal awaits it before removing the iframe.
 
+## Architecture: user space and system calls
+
+The page is user space and the API is the system calls (owner's design, 2026-10-29), as on Linux. The terminal's programs (`ls`, `rm`, `cp`, `chmod`, `useradd`, `ps`…) run in the browser (`crates/userland`), parse their options, print coreutils' messages, and do everything through system calls; whether anything may be done is the kernel's to say, call by call: the Worker and its Durable Object (`crates/kernel`, `crates/worker`). User space is never trusted. Calls go in batches (`POST /api/sys`), each run on its own, in its own transaction, answered with its value or its errno (glibc's words, `crates/abi`). File bytes go apart, as reads (`GET /api/file`) and `pwrite`s through descriptors (`PUT /api/pwrite`).
+
+| Group | Calls |
+| --- | --- |
+| Credentials | `getcreds`; `login`, `logout`, `sudo` (its five-minute timestamp), `passwd` |
+| Accounts | `useradd`, `usermod`, `userdel`, `groupadd`, `groupmod`, `groupdel` (root's; a signed-out `useradd` NAME, and an account's own `userdel`, with a password); `/etc/passwd` and `/etc/group` are generated as they are read |
+| Names | `stat`, `lstat`, `getdents`, `access`, `readlink`, `mkdir`, `mknod`, `rmdir`, `unlink`, `rename` (`noreplace`), `link`, `symlink`, `chmod`, `chown`, `utimens`, `getxattr`, `setxattr`, `listxattr`, `removexattr` (ACLs are `system.posix_acl_access` and `system.posix_acl_default`) |
+| Descriptors | `open` (`O_RDONLY`, `O_WRONLY`, `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`; a size, a SHA-256 to go on with an unfinished file, a version to replace only what was read), `close`, `lease`, `fds`, `ioctl` (`FICLONE`); `pwrite` and `pread` on the Worker |
+| Devices | `mknod` with a driver (`present`, `snd`), and the drivers' requests as `ioctl`s: `PRESENT_SHOW`, `PRESENT_ASK`, `PRESENT_ANSWER`, `PRESENT_SPEAK`, `SND_PUBLISH`, `SND_LISTEN`, `SND_ANSWER`; reading one gives its state |
+| Processes | `spawn` (zip, unzip, tar, faststart), `ps`, `kill`, `wait`, `write` (a process's standard input) |
+
+A session is a browser: a signed-in one's, or, signed out, the browser's own (the `terminal_guest` cookie). Descriptors are a session's, shared by its tabs as threads share a process's; a presenter lets a guest speak by passing one to that guest's session. The places where an account last showed a deck (`present` on the events socket) are the one extension with no Linux counterpart.
+
 ## Storage and project boundaries
 
 | Path | Responsibility |
 | --- | --- |
-| `crates/core` / `terminal-worker-core` | Every command's definition, parser, help and manual page (`cli/`, with clap); paths, pipelines, text filters, fd matching, completion, permission rules over a `Store`, HTTP Range |
+| `crates/abi` / `terminal-worker-abi` | The system calls: what each takes and gives back, and errno with glibc's words |
+| `crates/kernel` / `terminal-worker-kernel` | The file system's system calls, every check Linux's (namei, generic_permission with ACLs, sticky directories, protected links, xattrs), over a `Store`, tested in memory |
+| `crates/userland` / `terminal-worker-userland` | The programs of user space, each over `Sys` and nothing else, with GNU's messages |
+| `crates/core` / `terminal-worker-core` | Every command's definition, parser, help and manual page (`cli/`, with clap); paths, pipelines, text filters, fd matching, completion, ACLs, HTTP Range |
 | `crates/frontend` / `terminal-worker-ui` | Leptos CSR terminal: tabs (`lib.rs`), the shell and its pipelines (`shell.rs`), the commands that run in the page (`shell/commands.rs`), upload hashing (`uploads.rs`), file previews (`preview.rs`, `viewer.rs`), man's pages for app.js (`manual.rs`) |
 | `crates/preview` / `terminal-worker-preview` | Preview web workers: PDF pages (hayro), Mermaid diagrams (merman), highlighted code (arborium, four language groups) |
-| `crates/worker` / `terminal-worker` | The Worker streams file bytes (`files.rs`); the `TerminalAuthority` Durable Object decides and records (`api.rs`; the commands it runs, one `ServerCommand` each, in `commands/`) in SQLite tables (`db.rs`) |
+| `crates/worker` / `terminal-worker` | The kernel's host: the Worker streams file bytes (`files.rs`); the `TerminalAuthority` Durable Object serves the system calls (`sys.rs`), descriptors (`fds.rs`), devices (`dev/`), processes (`jobs.rs`) and accounts (`commands/accounts.rs`, api.rs), in SQLite tables (`db.rs`) |
 | `web/app.js` | Browser bridge, authentication dialogs, the preview dialog's shell and games, focus handling |
 | `web/upload.mjs` | Chunked, resumable uploads |
 | `web/record.mjs`, `web/sound.mjs` | Recording the microphone into a growing file; live sound through Realtime |
-| `crates/worker/src/devices.rs`, `sound.rs` | /dev: presentations and live sound, and the authority's side of Realtime |
+| `crates/worker/src/dev` | /dev's drivers: presentations (`present.rs`) and live sound (`snd.rs`, `realtime.rs`) |
 | `crates/jobs` / `terminal-worker-jobs` | The job container's HTTP server: zip and tar, read and written deterministically, and MP4 faststart |
 | `containers/jobs/Dockerfile` | Its image: a static binary, built from the workspace |
 | `crates/worker/src/runner.rs`, `jobs.rs` | Jobs: the `JobRunner` Durable Object, and the authority's side of them |

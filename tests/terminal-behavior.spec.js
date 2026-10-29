@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { entry, errno, mkdirp, put, rmrf } from './sys.js';
+import { api, entry, errno, mkdirp, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const headers = { Origin: origin };
@@ -40,7 +40,7 @@ test('removal is the kernel\'s to allow, from this site only; removing a tree le
   const base = '/rm-api-' + Date.now(), target = base + '/directory', sibling = base + '/Directory-kept';
   // A guest may not; nor a request from elsewhere; rmdir and unlink each take what they take.
   expect(await errno(request, { rmdir: { path: '/media' } })).toBe('EACCES');
-  await request.post('/api/login', { headers, data: { password } });
+  await api(request, 'login', { headers, data: { password } });
   try {
     for (const dir of [target + '/nested', sibling]) {
       await mkdirp(request, dir);
