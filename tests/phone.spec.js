@@ -90,10 +90,12 @@ test('long names keep one line and scroll; titles keep the file name; either pan
   const [title, text] = await page.locator('#viewer-title').evaluate(e => [e.getBoundingClientRect(), e.firstElementChild.getBoundingClientRect()].map(r => [r.left, r.right]));
   expect(text[1]).toBeLessThanOrEqual(title[1] + 1); expect(text[0]).toBeLessThan(title[0]);
   expect(await page.locator('.viewer-bar').evaluate(e => e.scrollWidth <= e.clientWidth)).toBe(true);
-  // The download button shows too, small, within the bar.
+  // The download button shows too, small, within the bar, framed as the bar's other buttons are.
   await expect(page.getByRole('link', { name: 'Download' })).toBeVisible();
   const [bar, link] = await page.evaluate(() => [document.querySelector('.viewer-bar'), document.getElementById('download')].map(e => e.getBoundingClientRect().right));
   expect(link).toBeLessThanOrEqual(bar);
+  const frame = element => page.locator(element).evaluate(e => { const style = getComputedStyle(e); return [style.borderTopStyle, style.borderTopWidth, Math.round(e.getBoundingClientRect().height)]; });
+  expect(await frame('#download')).toEqual(await frame('#close-viewer'));
   // Escape closes the dialog, and the page takes the key, which Safari would also take to leave
   // a full-screen window.
   await page.evaluate(() => window.addEventListener('keydown', e => { window.escapeTaken = e.defaultPrevented; }));

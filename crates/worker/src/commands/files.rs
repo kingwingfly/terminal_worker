@@ -168,7 +168,13 @@ fn remove_one(ctx: &mut Context, path: &str, rm: &args::Rm) -> Result<bool, Stri
             _ => {}
         }
     }
+    // A device stops (devices::remove); a directory removed ends those below it.
+    if let Some(stopped) = crate::devices::remove(ctx.db, ctx.who, path) {
+        stopped?;
+        return Ok(true);
+    }
     ctx.db.remove(ctx.who, path, rm.recursive)?;
+    crate::devices::removed(ctx.db, path);
     Ok(true)
 }
 

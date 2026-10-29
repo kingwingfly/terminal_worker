@@ -6,6 +6,7 @@
     "build": "node scripts/build.mjs",
     "build:web": "node scripts/build.mjs --web-only",
     "dev": "node scripts/dev.mjs --ip 127.0.0.1 --port 8787",
+    "deploy": "node scripts/deploy.mjs",
     "setup": "node scripts/setup.mjs",
     "seed": "node scripts/seed.mjs",
     "test": "node --test tests/*.test.mjs && cargo test -p terminal-worker-core",

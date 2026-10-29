@@ -105,6 +105,11 @@ function listen() {
     // This page's session ended elsewhere, not by its own sign in or out: it is a guest's now.
     if (message.session === 'ended') { if (!changingSession) void identityChanged('ended'); return; }
     if (message.present) { presented(message.present); return; }
+    // A live sound, or a listener's voice, started in a presentation this page follows or
+    // presents; listeners asking to speak, and the answers to this page's ask.
+    if (message.sound) { soundStarted(message.sound); return; }
+    if (message.asking) { asksChanged(message.asking); return; }
+    if (message.asked || message.granted || message.denied) { answered(message); return; }
     // A device followed shows something else now: followed again, if it still may be.
     if (message.device?.replaced) { followAgain(message.device.name, true, true); return; }
     // What a device followed is, as the authority says on following it: one replaced while this
@@ -114,10 +119,14 @@ function listen() {
       followAgain(name, following?.device === name && following.version !== version, hearing?.device === name && hearing.version !== version);
       return;
     }
-    // The presentation followed ended, or may not be followed.
+    // The presentation followed ended, or may not be followed; a sound heard ended; or a device
+    // of this page's account ended, which its bar shows, or this page sends (rm /dev/snd/NAME).
     if (message.device) {
-      if (following?.device === message.device.name) following.ended = true;
-      if (hearing?.device === message.device.name) stopHearing();
+      const { name, version } = message.device;
+      if (following?.device === name) following.ended = true;
+      if (hearing?.device === name) stopHearing();
+      if (voices.has(name)) stopVoice(name);
+      if (message.device.ended) deviceEnded(name, version);
       window.dispatchEvent(new CustomEvent('terminal:device', { detail: message.device }));
       return;
     }
@@ -160,8 +169,9 @@ let following = null;
 // Each attend, and each unfollow, starts anew: an answer for an older one is not applied, as the
 // page has left the presentation, or gone to another, meanwhile.
 let followings = 0;
-// The devices this page follows, which the authority tells it the end of.
-const followed = () => [following?.device, hearing?.device].filter(Boolean);
+// The devices this page follows, which the authority tells it the end of: a presentation, its
+// sound and voices, and the voice this page sends.
+const followed = () => [following?.device, hearing?.device, ...voices.keys(), speaking?.device].filter(Boolean);
 const follows = () => say({ follow: followed() });
 async function attend(device) {
   const turn = ++followings;
@@ -170,15 +180,23 @@ async function attend(device) {
   try { info = await (await api('/api/device?path=' + encodeURIComponent(device))).json(); }
   catch (error) { if (turn === followings) throw error; return; }
   if (turn !== followings) return;
+  if (following?.device !== info.device) declined = null;
   following = info; follows();
-  // Slides and sound together: the presenter's live sound of the same name, if any.
-  if (info.sound && hearing?.device !== info.sound) hear(info.sound).catch(error => console.warn('No live sound', error));
+  // Slides and sound together: the presenter's live sound, and the listeners speaking.
+  if (info.sound && hearing?.device !== info.sound && declined !== info.device) hear(info.sound).catch(error => console.warn('No live sound', error));
+  for (const voice of info.voices ?? []) if (voice.ask !== bar.asking?.id) void hearVoice(voice);
   // Shown as the presenter shows it, from where they are.
   if (info.kind === 'pdf') setPlace(info.path, { present: true, ...(info.place ? { page: info.place[0] } : {}) });
   else setPlace(info.path, { slides: true, ...(info.place ? { slide: info.place } : {}) });
   return open(info.path, info.kind, false, true);
 }
-function unfollow() { followings++; if (!following) return; following = null; follows(); }
+function unfollow() {
+  followings++;
+  if (!following) return;
+  // Leaving the presentation withdraws an ask to speak, and ends the voice sent.
+  if (bar.asking) { if (bar.asking.state === 'asking') say({ ask: null }); void stopSpeaking(); }
+  following = null; follows();
+}
 // Follow the device `name` again, as it shows something else now: the presentation followed, the
 // sound heard, or both; if that may no longer be, the page says so.
 function followAgain(name, presentation, sound) {
@@ -384,16 +402,20 @@ function cancelUploads() { if (!uploading) return false; uploading.abort(); retu
 // when it may (sound.mjs); `progress` hears how it goes. Ctrl+C in its tab stops it
 // (stopRecording), which saves what was recorded. Settles with what was saved.
 let recording = null;
-async function recordSound(path, name, acl, progress) {
+async function recordSound(path, name, acl, told) {
   if (recording) throw new Error('This page is recording already; stop it with Ctrl+C in its tab');
   const controller = recording = new AbortController();
+  // The bar shows it too (viewer.rs LiveControls), and stops it.
+  bar.sound = { device: null, version: null, recording: path, since: Date.now(), progress: '' }; barChanged();
+  const progress = text => { if (bar.sound) { bar.sound.progress = text; barChanged(); } told(text); };
+  const sending = sent => { live = sent; if (bar.sound) Object.assign(bar.sound, { device: sent.device, version: sent.version }); barChanged(); };
   let microphone, live = null, liveNote = '', speaking = Promise.resolve();
   try {
     try { microphone = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }); }
     catch (error) { throw new Error('No microphone: ' + error.message); }
     // Live only, kept nowhere: until Ctrl+C, or the microphone ends.
     if (!path) {
-      live = await speak(null, name, microphone, acl);
+      sending(await speak(null, name, microphone, acl));
       const started = performance.now(), track = microphone.getAudioTracks()[0];
       const seconds = () => (performance.now() - started) / 1000;
       const say = () => progress(`● live as ${live.device} · ${clock(seconds())}`);
@@ -404,11 +426,11 @@ async function recordSound(path, name, acl, progress) {
     }
     const saved = await record(path, microphone, { acl, signal: controller.signal, progress: text => progress(text + liveNote),
       // Live once the file is there, which its device links to; a recording all the same if not.
-      begun: () => { speaking = speak(path, name, microphone).then(sent => { live = sent; liveNote = ` · live as ${sent.device}`; }, error => { liveNote = ` · not live: ${error.message}`; }); } });
+      begun: () => { speaking = speak(path, name, microphone).then(sent => { sending(sent); liveNote = ` · live as ${sent.device}`; }, error => { liveNote = ` · not live: ${error.message}`; }); } });
     await speaking;
     return { ...saved, device: live?.device ?? null, note: liveNote + (saved.stopped ? ` · ${saved.stopped}` : '') };
   } finally {
-    recording = null;
+    recording = null; bar.sound = null; barChanged();
     microphone?.getTracks().forEach(track => track.stop());
     // A recording that failed may still be connecting its live sound, which ends with it.
     await speaking;
@@ -418,38 +440,242 @@ async function recordSound(path, name, acl, progress) {
 }
 function stopRecording() { if (!recording) return false; recording.abort(); return true; }
 // What this page hears live (/dev/snd/NAME), in a small player of its own, which goes on playing
-// whatever the viewer shows; one sound at a time.
+// whatever the viewer shows: a sound, and the voices of the listeners let speak in the
+// presentation it follows (owner's request, 2026-10-28), each in an audio element of its own.
 let hearing = null;
+// The sound the player shows, heard or connecting.
+let tuned = null;
 // Which hear() is the latest: one stopped, or replaced by another, while it connects is let go.
 let hearings = 0;
-async function hear(device) {
-  stopHearing();
+// The voices heard, by device: who speaks, and what stops it.
+const voices = new Map();
+// The presentation whose sound this page's reader stopped, which its sound starting again does
+// not bring back.
+let declined = null;
+let muted = false;
+// A sound whose connection failed, once made, is heard again after these waits, while it may be.
+const AGAIN = [1000, 2000, 5000, 10000, 20000];
+async function hear(device, again = 0) {
+  stopHearing(again > 0);
   const turn = ++hearings;
+  tuned = device;
   // The sound plays from outside the player and the viewer, so that moving them never stops it.
-  const player = $('listening'), audio = Object.assign(document.createElement('audio'), { id: 'listening-audio', autoplay: true, hidden: true });
+  const player = $('listening'), audio = Object.assign(document.createElement('audio'), { id: 'listening-audio', autoplay: true, hidden: true, muted });
   document.body.append(audio);
-  player.hidden = false; player.dataset.state = 'connecting'; $('listening-mute').textContent = 'Mute';
-  $('listening-name').textContent = device;
+  player.dataset.state = 'connecting'; showPlayer();
   // A sound, or a failure, for a hear the page has left since says nothing.
   let heard;
-  try { heard = await hearLive(device, audio); }
-  catch (error) { if (turn !== hearings) { audio.remove(); return; } stopHearing(); throw error; }
+  const lost = () => { if (turn === hearings) hearAgain(device, 0); };
+  try { heard = await hearLive(device, audio, lost); }
+  catch (error) {
+    if (turn !== hearings) { audio.remove(); return; }
+    // Heard again, it is tried again, unless it is gone or may not be heard.
+    if (again && again < AGAIN.length && !(error.status >= 400 && error.status < 500)) { audio.remove(); hearAgain(device, again); return; }
+    stopHearing(); throw error;
+  }
   if (turn !== hearings) { heard.stop(); audio.remove(); return; }
   hearing = { device, stop: heard.stop, version: heard.version }; player.dataset.state = 'live'; follows();
   // A browser that wants a tap to play sound shows Listen.
   try { await audio.play(); } catch { if (turn === hearings) player.dataset.state = 'paused'; }
 }
-function stopHearing() {
-  hearings++;
-  hearing?.stop(); hearing = null; follows();
-  $('listening-audio')?.remove();
-  const player = $('listening'); player.hidden = true; delete player.dataset.state;
+function hearAgain(device, again) {
+  if (again >= AGAIN.length) { stopHearing(); return; }
+  const turn = hearings;
+  $('listening').dataset.state = 'connecting';
+  setTimeout(() => { if (turn === hearings) hear(device, again + 1).catch(error => console.warn('The sound could not be heard again', error)); }, AGAIN[again]);
 }
-$('listening-play').onclick = () => { $('listening-audio')?.play().then(() => { $('listening').dataset.state = 'live'; }, () => {}); };
-$('listening-mute').onclick = () => { const audio = $('listening-audio'); if (!audio) return; audio.muted = !audio.muted; $('listening-mute').textContent = audio.muted ? 'Unmute' : 'Mute'; };
-$('listening-stop').onclick = stopHearing;
-// The player goes where it can be used: in the viewer while it is open, as the page around a
-// modal dialog takes no clicks, and full screen with it. The sound plays from outside both.
+// Stop the sound; `keep`: to hear it again at once, the player as it is.
+function stopHearing(keep = false) {
+  hearings++;
+  hearing?.stop(); hearing = null;
+  $('listening-audio')?.remove();
+  if (keep) return;
+  tuned = null; follows(); showPlayer();
+}
+async function hearVoice(voice, again = 0) {
+  if (voices.has(voice.device) && !again) return;
+  stopVoice(voice.device, true);
+  const audio = Object.assign(document.createElement('audio'), { className: 'voice-audio', autoplay: true, hidden: true, muted });
+  document.body.append(audio);
+  const heard = { ...voice, audio, stop: () => {} };
+  voices.set(voice.device, heard); showPlayer();
+  const lost = () => { if (voices.get(voice.device) === heard && again < AGAIN.length) setTimeout(() => { if (voices.get(voice.device) === heard) void hearVoice(voice, again + 1); }, AGAIN[again]); };
+  try {
+    const sound = await hearLive(voice.device, audio, lost);
+    if (voices.get(voice.device) !== heard) { sound.stop(); return; }
+    heard.stop = sound.stop; follows();
+    if (!$('listening').dataset.state || $('listening').dataset.state === 'connecting' && !tuned) $('listening').dataset.state = 'live';
+    await audio.play().catch(() => { $('listening').dataset.state = 'paused'; });
+  } catch (error) {
+    if (voices.get(voice.device) === heard) stopVoice(voice.device);
+    console.warn('No voice', error);
+  }
+}
+function stopVoice(device, quietly = false) {
+  const heard = voices.get(device);
+  if (!heard) return;
+  voices.delete(device); heard.stop(); heard.audio.remove();
+  if (!quietly) { follows(); showPlayer(); }
+}
+// The player shows the sound and the voices heard, while there are any.
+function showPlayer() {
+  const player = $('listening'), names = [tuned, ...[...voices.values()].map(voice => `${voice.speaker} speaking`)].filter(Boolean);
+  player.hidden = !names.length;
+  if (!names.length) delete player.dataset.state;
+  else if (!player.dataset.state) player.dataset.state = 'connecting';
+  $('listening-name').textContent = names.join(' · ');
+}
+const audios = () => [$('listening-audio'), ...[...voices.values()].map(voice => voice.audio)].filter(Boolean);
+$('listening-play').onclick = () => { Promise.all(audios().map(audio => audio.play())).then(() => { $('listening').dataset.state = 'live'; }, () => {}); };
+$('listening-mute').onclick = () => { muted = !muted; for (const audio of audios()) audio.muted = muted; $('listening-mute').textContent = muted ? 'Unmute' : 'Mute'; };
+// Stopped by its reader, the presentation's sound does not come back by itself.
+$('listening-stop').onclick = () => { declined = following?.device ?? null; for (const device of [...voices.keys()]) stopVoice(device); stopHearing(); };
+
+// The bar of the deck or PDF the viewer shows (viewer.rs LiveControls; owner's request,
+// 2026-10-28): what this account presents of it, the sound this page sends, the listeners asking
+// to speak in its presentations and speaking; and, following another's presentation, this
+// page's ask to speak. It hears of each change (terminal:bar).
+const bar = { path: null, user: null, presented: [], asks: [], voices: [], sound: null, asking: null, note: '' };
+// The asks this page allowed, whose voices it hears.
+const allowed = new Set();
+let barTurns = 0, noteTimer;
+function barChanged() {
+  const presented = bar.presented.map(presentation => presentation.device), sound = bar.sound;
+  const detail = { path: bar.path, user: bar.user, presented, note: bar.note, asking: bar.asking && { state: bar.asking.state, error: bar.asking.error ?? null },
+    asks: bar.asks.filter(ask => presented.includes(ask.presentation)), voices: bar.voices.filter(voice => presented.includes(voice.presentation)),
+    sound: sound && { device: sound.device, recording: sound.recording, since: sound.since, progress: sound.progress } };
+  window.dispatchEvent(new CustomEvent('terminal:bar', { detail }));
+}
+// Say `note` in the bar a while: what failed, or what was saved.
+function barNote(note) { bar.note = note; barChanged(); clearTimeout(noteTimer); noteTimer = setTimeout(() => { bar.note = ''; barChanged(); }, 8000); }
+// The bar now shows the file at `path`: what this account presents of it, as the authority says.
+async function barOf(path) {
+  const turn = ++barTurns;
+  Object.assign(bar, { path, presented: [], asks: [], voices: [], note: '' });
+  barChanged();
+  try {
+    const presented = await (await api('/api/present?path=' + encodeURIComponent(path))).json();
+    if (turn !== barTurns) return;
+    Object.assign(bar, { user: presented.user, presented: presented.devices, asks: presented.asks, voices: presented.voices });
+  } catch (error) { if (turn === barTurns) bar.note = error.message; }
+  barChanged();
+}
+const deviceName = device => device.slice(device.lastIndexOf('/') + 1);
+// Present the file to others, as /dev/present/NAME, or stop presenting it.
+async function togglePresenting(path) {
+  try {
+    if (bar.presented.length) {
+      for (const { device } of bar.presented) await api('/api/present?name=' + encodeURIComponent(deviceName(device)), { method: 'DELETE' });
+      bar.presented = [];
+    } else {
+      const made = await (await api('/api/present?path=' + encodeURIComponent(path), { method: 'POST' })).json();
+      bar.presented = [{ device: made.device }];
+    }
+    barChanged();
+  } catch (error) { barNote(error.message); }
+}
+// Send the microphone live, as stream does, the account's name its device's; `keep`: recorded
+// too, beside the file shown, as NAME-DATE-TIME.weba. Live already, it stops.
+function goLive(path, keep) {
+  if (stopRecording()) return;
+  const slash = path.lastIndexOf('/'), file = path.slice(slash + 1);
+  const stem = file.replace(/\.slides\.md$/i, '').replace(/\.[^.]*$/, '') || file;
+  const now = new Date(), two = number => String(number).padStart(2, '0');
+  const stamp = `${now.getFullYear()}${two(now.getMonth() + 1)}${two(now.getDate())}-${two(now.getHours())}${two(now.getMinutes())}`;
+  const destination = keep ? `${path.slice(0, slash)}/${stem}-${stamp}.weba` : null;
+  recordSound(destination, null, null, () => {}).then(
+    saved => { if (destination) barNote(`Saved ${destination} · ${clock(saved.seconds ?? 0)}`); },
+    error => barNote(error.message));
+}
+// The account's device `name` ended: presented no more, or a sound this page sends stops, as
+// rm /dev/snd/NAME stops stream (owner's request, 2026-10-28), unless it is another of that name.
+function deviceEnded(name, version) {
+  if (bar.sound?.device === name && (!version || bar.sound.version === version)) stopRecording();
+  if (bar.asking?.presentation === name || speaking?.device === name) void stopSpeaking();
+  bar.presented = bar.presented.filter(presentation => presentation.device !== name);
+  bar.voices = bar.voices.filter(voice => voice.device !== name);
+  barChanged();
+}
+// A live sound started: the presentation followed has its sound, unless its reader stopped it;
+// a voice, which the presentation's listeners hear, and the presenter's page that allowed it.
+function soundStarted(sound) {
+  if ('speaker' in sound) {
+    if (bar.presented.some(presentation => presentation.device === sound.presentation)) {
+      bar.voices = [...bar.voices.filter(voice => voice.device !== sound.device), sound]; barChanged();
+      if (allowed.has(sound.ask)) void hearVoice(sound);
+    } else if (following?.device === sound.presentation && sound.ask !== bar.asking?.id) void hearVoice(sound);
+    return;
+  }
+  if (following?.device === sound.presentation && !hearing && !tuned && declined !== following.device) hear(sound.device).catch(error => console.warn('No live sound', error));
+}
+// Listeners asking to speak in this account's presentations, or no longer.
+function asksChanged(asking) {
+  bar.asks = bar.asks.filter(ask => ask.id !== asking.id);
+  if (!asking.gone && !asking.error) bar.asks.push(asking);
+  if (asking.error) barNote(asking.error);
+  barChanged();
+  // Full screen, the bars show, to be seen by a presenter mid-talk.
+  if (fullscreen()) showChrome();
+}
+// Ask to speak in the presentation followed; asking, withdraw; speaking, stop.
+function askToSpeak() {
+  const presentation = following?.device;
+  if (!presentation) return;
+  if (bar.asking?.state === 'asking') { say({ ask: null }); bar.asking = null; }
+  else if (bar.asking && ['connecting', 'speaking'].includes(bar.asking.state)) { void stopSpeaking(); return; }
+  else { bar.asking = { presentation, state: 'asking' }; say({ ask: presentation }); }
+  barChanged();
+}
+// The presenter answers an ask to speak: allowed, everyone following hears them.
+function answerAsk(id, allow) {
+  if (allow) allowed.add(id);
+  say(allow ? { allow: id } : { dismiss: id });
+  bar.asks = bar.asks.filter(ask => ask.id !== id); barChanged();
+}
+// End a listener's voice, as its presenter.
+async function endVoice(device) {
+  try { await api('/api/sound?name=' + encodeURIComponent(deviceName(device)), { method: 'DELETE' }); }
+  catch (error) { barNote(error.message); }
+}
+// What the presenter said to this page's ask: noted, allowed (with the token to speak with), or
+// not now.
+function answered({ asked, granted, denied }) {
+  const answer = asked ?? granted ?? denied;
+  if (bar.asking?.presentation !== answer.presentation) return;
+  if (asked?.error) bar.asking = { ...bar.asking, state: 'error', error: asked.error };
+  else if (asked) bar.asking.id = asked.id;
+  else if (granted) { void startSpeaking(granted.token); return; }
+  else { bar.asking = { ...bar.asking, state: 'denied' }; setTimeout(() => { if (bar.asking?.state === 'denied') { bar.asking = null; barChanged(); } }, 5000); }
+  barChanged();
+  if (fullscreen()) showChrome();
+}
+// The voice this page sends, allowed: what it is, what ends it, and the microphone.
+let speaking = null;
+async function startSpeaking(grant) {
+  bar.asking = { ...bar.asking, state: 'connecting' }; barChanged();
+  let microphone;
+  try {
+    microphone = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const sent = await speak(null, null, microphone, null, grant);
+    // Withdrawn meanwhile.
+    if (bar.asking?.state !== 'connecting') { microphone.getTracks().forEach(track => track.stop()); await sent.end(); return; }
+    speaking = { ...sent, microphone };
+    bar.asking = { ...bar.asking, state: 'speaking' }; follows();
+    microphone.getAudioTracks()[0].addEventListener('ended', () => void stopSpeaking(), { once: true });
+  } catch (error) {
+    microphone?.getTracks().forEach(track => track.stop());
+    bar.asking = bar.asking && { ...bar.asking, state: 'error', error: error.message };
+  }
+  barChanged();
+}
+async function stopSpeaking() {
+  const sent = speaking; speaking = null;
+  bar.asking = null; barChanged();
+  if (!sent) return;
+  follows();
+  sent.microphone.getTracks().forEach(track => track.stop());
+  await sent.end();
+}
 function placePlayer() { ($('viewer').open ? $('viewer-surface') : document.body).append($('listening')); }
 // Open the file chooser now, while the tap or the key that asked for it lets a page open one:
 // phones refuse once a request has been awaited. Settles with the files chosen; none if closed.
@@ -572,14 +798,14 @@ $('fullscreen').onclick = async () => {
 };
 // Full screen, the preview's bars float over the content, hidden until the pointer moves, as a
 // video player's controls are; they stay while the pointer, or the keyboard's focus, is on one
-// (a button clicked keeps the focus, but not :focus-visible).
+// (a button clicked keeps the focus, but not :focus-visible), and while a listener asks to speak.
 const bars = ':is(.viewer-bar, .preview-bar, .slides-bar, .pdf-toolbar)';
 let chromeTimer;
 function showChrome() {
   const surface = $('viewer-surface');
   surface.classList.add('chrome'); clearTimeout(chromeTimer);
   chromeTimer = setTimeout(() => {
-    if (surface.querySelector(`${bars}:hover, ${bars}:has(:focus-visible)`)) showChrome();
+    if (surface.querySelector(`${bars}:hover, ${bars}:has(:focus-visible), .live-hands.asked`)) showChrome();
     else surface.classList.remove('chrome');
   }, 2000);
 }
@@ -670,7 +896,7 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, present, presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, attending: path => following?.path === path ? following : null, unlock, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
+window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, present, presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]')) return;

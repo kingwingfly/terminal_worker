@@ -16,24 +16,39 @@ test.beforeEach(async ({ request, page }) => {
 });
 test.afterEach(async ({ request }) => { await request.delete('/api/file?recursive=true&path=' + encodeURIComponent(base), { headers }); });
 
-test('cycles the original fuzzy matches both ways, browses files on an empty line, and preserves stdout', async ({ page }) => {
+test('lists the fuzzy matches first, to narrow them by typing, cycles them both ways, browses files on an empty line, and preserves stdout', async ({ page }) => {
   const input = page.getByRole('combobox', { name: 'Terminal command' }), options = page.getByRole('option');
   const transcript = await page.locator('.transcript').innerText();
-  await input.fill('open alp'); await input.press('Tab'); await expect(input).toHaveValue('open "alpha.txt"');
-  await expect(options).toHaveCount(4);
+  // The first Tab only lists them, so that more may be typed (owner's request, 2026-10-28).
+  await input.fill('open alp'); await input.press('Tab');
+  await expect(options).toHaveCount(4); await expect(input).toHaveValue('open alp');
+  await expect(page.locator('.completion-hint')).toHaveText('4 matches · type to narrow · Tab pick · Esc close');
+  await expect(page.locator('[role=option][aria-selected=true]')).toHaveCount(0);
+  await expect(input).not.toHaveAttribute('aria-activedescendant');
+  // Typed on, the line narrows them: one alone completes at once.
+  await input.press('End'); await input.pressSequentially('b'); await expect(options).toHaveCount(0);
+  await input.press('Tab'); await expect(input).toHaveValue('open "alphabet.txt"');
+  // From the list, Tab picks the first, Shift+Tab the last.
+  await input.fill('open alp'); await input.press('Tab'); await expect(options).toHaveCount(4);
+  await input.press('Shift+Tab'); await expect(input).toHaveValue('open "a_l_p_h_a.txt"');
+  await input.press('Escape'); await expect(input).toHaveValue('open alp');
+  await input.press('Tab'); await expect(options).toHaveCount(4);
+  await input.press('Tab'); await expect(input).toHaveValue('open "alpha.txt"');
+  await expect(page.locator('.completion-hint')).toHaveText('1 / 4 · Tab next · Shift+Tab previous · → accept · Esc cancel');
   await input.press('Tab'); await expect(input).toHaveValue('open "alphabet.txt"');
   await input.press('Shift+Tab'); await expect(input).toHaveValue('open "alpha.txt"');
   await input.press('Shift+Tab'); await expect(input).toHaveValue('open "a_l_p_h_a.txt"');
   await input.press('Tab'); await expect(input).toHaveValue('open "alpha.txt"');
   await input.press('Escape'); await expect(input).toHaveValue('open alp'); await expect(options).toHaveCount(0);
-  await input.fill(''); await input.press('Tab'); await expect(input).toHaveValue('cd "a-dir/"');
-  await expect(options).toHaveCount(names.length + 2);
+  await input.fill(''); await input.press('Tab'); await expect(options).toHaveCount(names.length + 2);
+  await input.press('Tab'); await expect(input).toHaveValue('cd "a-dir/"');
   for (let i = 0; i < names.length + 2; i++) await input.press('Tab');
   await expect(input).toHaveValue('cd "a-dir/"');
   await options.filter({ hasText: 'GammaSpectrum.txt' }).click(); await expect(input).toHaveValue('open "GammaSpectrum.txt"');
   await expect(options).toHaveCount(0);
   expect(await page.locator('.transcript').innerText()).toBe(transcript);
   await input.fill('cd '); await input.press('Tab'); await expect(options).toHaveCount(2);
+  await input.press('Tab'); await expect(input).toHaveValue('cd "a-dir/"');
   await input.press('Tab'); await expect(input).toHaveValue('cd "b-dir/"');
   await input.fill('open '); await input.press('Tab'); await expect(options).toHaveCount(names.length + 2);
 });
@@ -50,7 +65,8 @@ test('matches case-insensitive subsequences and quoted Unicode paths, then desce
   await input.pressSequentially('in'); await input.press('Tab'); await expect(input).toHaveValue('open "a-dir/inside.txt"');
   await input.fill('rm -r -- b-d'); await input.press('Tab'); await expect(input).toHaveValue('rm -r -- "b-dir/"');
   await input.fill('zzzzzzzz'); await input.press('Tab'); await expect(page.locator('.completion-hint')).toHaveText('No matches'); await expect(input).toHaveValue('zzzzzzzz');
-  await input.fill('op'); await input.press('Tab'); await expect(input).toHaveValue('open '); await input.press('ArrowRight');
+  await input.fill('op'); await input.press('Tab'); await expect(page.getByRole('option').first()).toContainText('open');
+  await input.press('Tab'); await expect(input).toHaveValue('open '); await input.press('ArrowRight');
   await input.press('Tab'); await expect(page.getByRole('option')).toHaveCount(names.length + 2);
 });
 
@@ -58,8 +74,9 @@ test('queues fast Tab presses and discards late listings after editing', async (
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   let requests = 0;
   await page.route('**/api/ls?*', async route => { requests++; await new Promise(resolve => setTimeout(resolve, 500)); await route.continue(); });
+  // The first lists them; each one after picks the next.
   await input.fill('open alp'); await input.press('Tab'); await input.press('Tab'); await input.press('Tab');
-  await expect(input).toHaveValue('open "z-alpha.txt"'); expect(requests).toBe(1);
+  await expect(input).toHaveValue('open "alphabet.txt"'); expect(requests).toBe(1);
   await input.fill('open a-dir/in');
   const response = page.waitForResponse(r => r.url().includes('/api/ls?'));
   await input.press('Tab'); await input.fill('pwd'); await response;

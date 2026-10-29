@@ -24,13 +24,14 @@ function connected(pc) {
 }
 
 /** Send `microphone` live, as /dev/snd/NAME: of the recording at `path`, or, with no path, kept
- * nowhere, a file of its own made with the ACL entries `acl` (stream -m). Settles with the device
- * and what ends it. While it goes, the page says so (/api/sound/hold), or it ends
- * (devices::SOUND_IDLE). */
-export async function speak(path, name, microphone, acl = null) {
+ * nowhere, a file of its own made with the ACL entries `acl` (stream -m); or, with `grant`, as a
+ * listener's voice, which a presenter let them send (devices::allow). Settles with the device,
+ * what it is (its version) and what ends it. While it goes, the page says so
+ * (/api/sound/hold), or it ends (devices::SOUND_IDLE). */
+export async function speak(path, name, microphone, acl = null, grant = null) {
   const pc = new RTCPeerConnection({ iceServers: ICE, bundlePolicy: 'max-bundle' });
   let published = null, holding = null;
-  const device = () => 'name=' + encodeURIComponent(published.device) + '&version=' + encodeURIComponent(published.version ?? '');
+  const device = () => 'name=' + encodeURIComponent(published.device) + '&version=' + encodeURIComponent(published.version ?? '') + (grant ? '&grant=' + encodeURIComponent(grant) : '');
   // Ends the device this page made, while it is still that one: another page of the account may
   // have taken its name over since (devices::stop, by version).
   const end = async () => {
@@ -45,6 +46,7 @@ export async function speak(path, name, microphone, acl = null) {
     if (path) query.set('path', path);
     if (name) query.set('name', name);
     if (acl) query.set('acl', acl);
+    if (grant) query.set('grant', grant);
     published = await post('/api/sound?' + query, { sdp: pc.localDescription.sdp, mid: transceiver.mid });
     await pc.setRemoteDescription({ type: 'answer', sdp: published.sdp });
     await connected(pc);
@@ -53,7 +55,7 @@ export async function speak(path, name, microphone, acl = null) {
     holding = setInterval(() => {
       fetch('/api/sound/hold?' + device(), { method: 'POST' }).then(json).catch(error => { if ([401, 403, 404].includes(error.status)) clearInterval(holding); });
     }, HOLD);
-    return { device: published.device, end };
+    return { device: published.device, version: published.version, end };
   } catch (error) {
     // A sound that never connected is no device for listeners to find.
     await end();
@@ -62,8 +64,9 @@ export async function speak(path, name, microphone, acl = null) {
 }
 
 /** Hear the sound /dev/snd/NAME live in `audio`; settles with what stops it, and what the device
- * is (its version), to know whether it is replaced while the page's line is down. */
-export async function listen(device, audio) {
+ * is (its version), to know whether it is replaced while the page's line is down. `lost` hears
+ * if the connection fails once made (a network that changed, say), to hear it again. */
+export async function listen(device, audio, lost = () => {}) {
   const pc = new RTCPeerConnection({ iceServers: ICE, bundlePolicy: 'max-bundle' });
   try {
     pc.ontrack = event => { audio.srcObject = new MediaStream([event.track]); };
@@ -72,6 +75,7 @@ export async function listen(device, audio) {
     await pc.setLocalDescription(await pc.createAnswer());
     await post('/api/sound/answer?session=' + encodeURIComponent(offered.session), { sdp: pc.localDescription.sdp }, 'PUT');
     await connected(pc);
+    pc.addEventListener('connectionstatechange', () => { if (pc.connectionState === 'failed') lost(); });
     return { stop: () => { pc.close(); audio.srcObject = null; }, version: offered.version };
   } catch (error) { pc.close(); throw error; }
 }

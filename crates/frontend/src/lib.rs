@@ -227,10 +227,13 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
         }>{move || shell.lines.get().into_iter().map(render_line).collect_view()}</div>
         <Show when=move || shell.completion.get().is_some() || !shell.completion_status.get().is_empty()>
             <div class="completion-pager">
-                <p class="completion-hint" role="status">{move || shell.completion.get().map(|s| format!("{} / {} · Tab next · Shift+Tab previous · → accept · Esc cancel", s.selected+1, s.candidates.len())).unwrap_or_else(|| shell.completion_status.get())}</p>
+                <p class="completion-hint" role="status">{move || shell.completion.get().map(|s| match s.selected {
+                    Some(index) => format!("{} / {} · Tab next · Shift+Tab previous · → accept · Esc cancel", index + 1, s.candidates.len()),
+                    None => format!("{} matches · type to narrow · Tab pick · Esc close", s.candidates.len()),
+                }).unwrap_or_else(|| shell.completion_status.get())}</p>
                 <div id=move || current().then_some("completions") class="completion-options" role="listbox" aria-label="Completions">
                     {move || shell.completion.get().map(|s| s.candidates.into_iter().enumerate().map(|(index, candidate)| {
-                        view! { <button type="button" role="option" tabindex="-1" id=format!("completion-{id}-{index}") aria-selected=move || shell.completion.with(|s| s.as_ref().is_some_and(|s| s.selected == index)).to_string()
+                        view! { <button type="button" role="option" tabindex="-1" id=format!("completion-{id}-{index}") aria-selected=move || shell.completion.with(|s| s.as_ref().is_some_and(|s| s.selected == Some(index))).to_string()
                             on:mousedown=move |e| e.prevent_default()
                             on:click=move |_| { shell.select_completion(index); shell.accept_completion(); }>
                             <span>{candidate.label}</span><small>{candidate.kind}</small>
@@ -244,7 +247,7 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
             <input id=move || current().then_some("command") class="command-input" aria-label="Terminal command" autocomplete="off" spellcheck="false" autocapitalize="off" enterkeyhint="go" prop:value=move || shell.input.get()
                 role="combobox" aria-autocomplete="list" aria-controls=move || current().then_some("completions")
                 aria-expanded=move || shell.completion.get().is_some().to_string()
-                aria-activedescendant=move || shell.completion.get().map(|s| format!("completion-{id}-{}", s.selected))
+                aria-activedescendant=move || shell.completion.get().and_then(|s| s.selected).map(|index| format!("completion-{id}-{index}"))
                 on:input=move |e| { shell.reset_completion(); shell.input.set(event_target_value(&e)); }
                 on:keydown=move |e| {
                     if e.is_composing() { return; }
@@ -256,7 +259,7 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
                     match e.key().as_str() {
                         "Tab" => { e.prevent_default(); shell.complete(e.shift_key()); },
                         "Escape" => { e.prevent_default(); shell.cancel_completion(); },
-                        "ArrowRight" if shell.completion.get_untracked().is_some() => { e.prevent_default(); shell.accept_completion(); },
+                        "ArrowRight" if shell.completion.get_untracked().is_some_and(|s| s.selected.is_some()) => { e.prevent_default(); shell.accept_completion(); },
                         "ArrowUp" | "ArrowDown" if shell.completion.get_untracked().is_some() => { e.prevent_default(); shell.complete(e.key() == "ArrowUp"); },
                         "ArrowUp" | "ArrowDown" => { e.prevent_default(); shell.recall(e.key() == "ArrowUp"); },
                         _ => {},

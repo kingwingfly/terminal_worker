@@ -246,8 +246,16 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             acl!(db.mkdir(&who, &real, true), &who);
             Reply::ok(json!({"path":path}))
         }),
-        // Presentations (devices.rs): start one of the file at `path`, as `name`; stop one; and
-        // what one at `path` (/dev/present/NAME) shows, to follow it.
+        // Presentations (devices.rs): what the account presents of the file at `path`, for the
+        // bar of its pages showing it; start one of it, as `name`; stop one; and what one at
+        // `path` (/dev/present/NAME) shows, to follow it.
+        (Method::Get, "/api/present") => {
+            let asks = crate::store::asks(state);
+            run(state, move |db| {
+                let who = auth::identity(db, key.as_deref());
+                Reply::ok(devices::presented(db, &who, &path, &asks))
+            })
+        }
         (Method::Post, "/api/present") => {
             let name = param("name");
             run(state, move |db| {
@@ -260,32 +268,47 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let name = param("name");
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
-                Reply::ok(acl!(devices::stop(db, &who, PRESENT, &name, None), &who))
+                Reply::ok(acl!(
+                    devices::stop(db, &who, PRESENT, &name, None, None),
+                    &who
+                ))
             })
         }
-        // Live sound (sound.rs): send it, as the recording at `path` is made; stop it; hear the
-        // device at `path` (/dev/snd/NAME); answer what Realtime offered, to hear it.
+        // Live sound (sound.rs): send it, as the recording at `path` is made, or a listener's
+        // voice, as its presenter let them (`grant`); stop it; hear the device at `path`
+        // (/dev/snd/NAME); answer what Realtime offered, to hear it.
         (Method::Post, "/api/sound") => {
             let name = Some(param("name")).filter(|name| !name.is_empty());
             let entries = Some(param("acl")).filter(|entries| !entries.is_empty());
+            let grant = Some(param("grant")).filter(|grant| !grant.is_empty());
             // Of a recording, or kept nowhere.
             let recording = (!param("path").is_empty()).then_some(path);
-            sound::speak(req, env, state, key, recording, name, entries).await
+            let sent = sound::Sent {
+                path: recording,
+                name,
+                entries,
+                grant,
+            };
+            sound::speak(req, env, state, key, sent).await
         }
         // The page sending a live sound still does: it lasts (devices::SOUND_IDLE).
         (Method::Post, "/api/sound/hold") => {
             let (name, version) = (param("name"), param("version"));
+            let grant = Some(param("grant")).filter(|grant| !grant.is_empty());
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
-                Reply::ok(acl!(devices::keep(db, &who, &name, &version), &who))
+                let kept = devices::keep(db, &who, &name, &version, grant.as_deref());
+                Reply::ok(acl!(kept, &who))
             })
         }
         (Method::Delete, "/api/sound") => {
             let name = param("name");
             let version = Some(param("version")).filter(|version| !version.is_empty());
+            let grant = Some(param("grant")).filter(|grant| !grant.is_empty());
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
-                let stopped = devices::stop(db, &who, SOUND, &name, version.as_deref());
+                let stopped =
+                    devices::stop(db, &who, SOUND, &name, version.as_deref(), grant.as_deref());
                 Reply::ok(acl!(stopped, &who))
             })
         }
@@ -305,7 +328,13 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                     return Reply::error("Cannot remove the root directory", 403);
                 }
                 let real = real!(db, &who, &path, false);
+                // A device stops (devices::remove); a directory removed ends those below it.
+                if let Some(stopped) = devices::remove(db, &who, &real) {
+                    acl!(stopped, &who);
+                    return Reply::ok(json!({"path":path}));
+                }
                 acl!(db.remove(&who, &real, recursive), &who);
+                devices::removed(db, &real);
                 Reply::ok(json!({"path":path}))
             })
         }

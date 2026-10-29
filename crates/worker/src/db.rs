@@ -34,7 +34,7 @@ const ROLLBACK: &str = "rollback";
 /// The version of the tables below, which local state made by an older one does not have.
 pub const SCHEMA_VERSION: &str = "3";
 
-const SCHEMA: [&str; 22] = [
+const SCHEMA: [&str; 23] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
@@ -74,6 +74,10 @@ const SCHEMA: [&str; 22] = [
     // What /dev holds (devices.rs): presentations others follow, whose they are, and the file
     // presented; `media`, what a live sound has to be heard by.
     "CREATE TABLE IF NOT EXISTS devices(name TEXT PRIMARY KEY, owner INTEGER NOT NULL, path TEXT NOT NULL, media TEXT, started INTEGER NOT NULL)",
+    // A listener a presenter let speak (devices::allow): by the token its page was given, in
+    // which presentation, as whom, for which ask, and the voice it sends, once it does. A
+    // table of its own, made where it is missing.
+    "CREATE TABLE IF NOT EXISTS grants(token TEXT PRIMARY KEY, presentation TEXT NOT NULL, speaker TEXT NOT NULL, ask TEXT NOT NULL, device TEXT)",
 ];
 
 thread_local! {
@@ -87,12 +91,26 @@ thread_local! {
     static CHANGED: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
     /// Whether a transaction ended sessions, which the pages holding them hear of.
     static ENDED: Cell<bool> = const { Cell::new(false) };
-    /// The devices the running transaction removed, or replaced (true) with one of the same name
-    /// that shows something else, ...
-    static REMOVING: RefCell<Vec<(String, bool)>> = const { RefCell::new(Vec::new()) };
-    /// ... and those committed transactions removed or replaced, which the pages following them
-    /// hear of.
-    static REMOVED: RefCell<Vec<(String, bool)>> = const { RefCell::new(Vec::new()) };
+    /// The devices the running transaction removed, or replaced with one of the same name that
+    /// shows something else, ...
+    static REMOVING: RefCell<Vec<Removed>> = const { RefCell::new(Vec::new()) };
+    /// ... and those committed transactions removed or replaced, which the pages following them,
+    /// and their account's, hear of.
+    static REMOVED: RefCell<Vec<Removed>> = const { RefCell::new(Vec::new()) };
+    /// The live sounds the running transaction started, ...
+    static STARTING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// ... and those committed transactions started, which the pages following a presentation
+    /// of their account hear of, to hear them (owner's request, 2026-10-28).
+    static STARTED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A device removed, or replaced (`replaced`), as it was: whose, and which (devices::version).
+#[derive(Clone, Debug)]
+pub struct Removed {
+    pub name: String,
+    pub replaced: bool,
+    pub owner: u32,
+    pub version: String,
 }
 
 /// The directories whose listings committed transactions changed since this was last asked.
@@ -105,9 +123,14 @@ pub fn take_ended() -> bool {
     ENDED.replace(false)
 }
 
-/// The devices committed transactions removed, or replaced (true), since this was last asked.
-pub fn take_removed() -> Vec<(String, bool)> {
+/// The devices committed transactions removed, or replaced, since this was last asked.
+pub fn take_removed() -> Vec<Removed> {
     REMOVED.take()
+}
+
+/// The live sounds committed transactions started since this was last asked.
+pub fn take_started() -> Vec<String> {
+    STARTED.take()
 }
 
 /// Whether the alarm should run soon, clearing the request.
@@ -179,17 +202,20 @@ pub fn transact<T: 'static>(
         FAILED.with(|f| f.borrow_mut().take());
         CHANGING.take();
         REMOVING.take();
+        STARTING.take();
         let mut db = Db { sql: sql.clone() };
         let (value, commit) = work(&mut db);
         *slot.borrow_mut() = Some(value);
         let changing = CHANGING.take();
         let removing = REMOVING.take();
+        let starting = STARTING.take();
         match FAILED.with(|f| f.borrow_mut().take()) {
             Some(error) => JsValue::from_str(&error),
             None if !commit => JsValue::from_str(ROLLBACK),
             None => {
                 CHANGED.with(|changed| changed.borrow_mut().extend(changing));
                 REMOVED.with(|removed| removed.borrow_mut().extend(removing));
+                STARTED.with(|started| started.borrow_mut().extend(starting));
                 JsValue::UNDEFINED
             }
         }
@@ -340,6 +366,15 @@ pub struct Device {
     pub owner: u32,
     pub path: String,
     pub media: Option<String>,
+}
+/// A listener let speak in a presentation (devices::allow).
+#[derive(Clone, Debug, Deserialize)]
+pub struct Grant {
+    pub token: String,
+    pub presentation: String,
+    pub speaker: String,
+    pub ask: String,
+    pub device: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct Chunk {
@@ -837,18 +872,43 @@ impl Db {
         )
         .pop()
     }
-    /// The devices of `owner` presenting the file at `path`.
+    /// The devices of `owner` presenting the file at `path`, or sending it live; not the voices
+    /// of listeners speaking in its presentations, which link to it too.
     pub fn presenting(&self, owner: u32, path: &str) -> Vec<Device> {
         self.rows::<Device>(
-            "SELECT name, owner, path, media FROM devices WHERE owner = ? AND path = ?",
+            "SELECT name, owner, path, media FROM devices WHERE owner = ? AND path = ? AND json_extract(media, '$.for') IS NULL",
             vec![int(owner), text(path)],
         )
     }
-    /// The names of `owner`'s live sounds.
+    /// The names of `owner`'s live sounds, not the voices of listeners it let speak.
     pub fn sounds_of(&self, owner: u32) -> Vec<String> {
+        self.sounds_by(owner)
+            .into_iter()
+            .map(|device| device.name)
+            .collect()
+    }
+    /// `owner`'s live sounds, not the voices of listeners it let speak, the latest first.
+    pub fn sounds_by(&self, owner: u32) -> Vec<Device> {
         self.rows::<Device>(
-            "SELECT name, owner, path, media FROM devices WHERE owner = ? AND media IS NOT NULL",
+            "SELECT name, owner, path, media FROM devices WHERE owner = ? AND media IS NOT NULL AND json_extract(media, '$.for') IS NULL ORDER BY started DESC, name",
             vec![int(owner)],
+        )
+    }
+    /// The voices of listeners let speak in the presentation `presentation`, the first first.
+    pub fn voices_for(&self, presentation: &str) -> Vec<Device> {
+        self.rows::<Device>(
+            "SELECT name, owner, path, media FROM devices WHERE json_extract(media, '$.for') = ? ORDER BY started, name",
+            vec![text(presentation)],
+        )
+    }
+    /// The devices below the directory `directory`.
+    pub fn devices_under(&self, directory: &str) -> Vec<String> {
+        self.rows::<Device>(
+            "SELECT name, owner, path, media FROM devices WHERE substr(name, 1, ?) = ?",
+            vec![
+                int(directory.len() as u32 + 1),
+                text(&format!("{directory}/")),
+            ],
         )
         .into_iter()
         .map(|device| device.name)
@@ -878,13 +938,59 @@ impl Db {
     }
     /// Remove the device `name`, whose followers hear so once this commits.
     pub fn delete_device(&mut self, name: &str) {
+        self.removing(name, false);
         self.run("DELETE FROM devices WHERE name = ?", vec![text(name)]);
-        REMOVING.with(|removing| removing.borrow_mut().push((name.to_string(), false)));
     }
     /// Note that the device `name` now shows something else, which its followers hear once this
     /// commits, to follow it again, if they still may.
     pub fn replaced_device(&mut self, name: &str) {
-        REMOVING.with(|removing| removing.borrow_mut().push((name.to_string(), true)));
+        self.removing(name, true);
+    }
+    fn removing(&self, name: &str, replaced: bool) {
+        let Some(device) = self.device(name) else {
+            return;
+        };
+        let removed = Removed {
+            name: name.to_string(),
+            replaced,
+            owner: device.owner,
+            version: crate::devices::version(&device),
+        };
+        REMOVING.with(|removing| removing.borrow_mut().push(removed));
+    }
+    /// Note that the live sound `name` started, which the pages following a presentation of its
+    /// account hear once this commits.
+    pub fn started_sound(&mut self, name: &str) {
+        STARTING.with(|starting| starting.borrow_mut().push(name.to_string()));
+    }
+    pub fn grant(&self, token: &str) -> Option<Grant> {
+        self.rows::<Grant>(
+            "SELECT token, presentation, speaker, ask, device FROM grants WHERE token = ?",
+            vec![text(token)],
+        )
+        .pop()
+    }
+    pub fn set_grant(&mut self, grant: &Grant) {
+        self.run(
+            "INSERT OR REPLACE INTO grants(token, presentation, speaker, ask, device) VALUES(?, ?, ?, ?, ?)",
+            vec![
+                text(&grant.token),
+                text(&grant.presentation),
+                text(&grant.speaker),
+                text(&grant.ask),
+                grant.device.as_deref().map_or(SqlStorageValue::Null, text),
+            ],
+        );
+    }
+    pub fn delete_grant(&mut self, token: &str) {
+        self.run("DELETE FROM grants WHERE token = ?", vec![text(token)]);
+    }
+    /// Forget the grants of the presentation, or the voice, `name`, which ended.
+    pub fn delete_grants_of(&mut self, name: &str) {
+        self.run(
+            "DELETE FROM grants WHERE presentation = ? OR device = ?",
+            vec![text(name), text(name)],
+        );
     }
     pub fn set_expiry(&mut self, kind: &str, id: &str, due: u64) {
         self.run(

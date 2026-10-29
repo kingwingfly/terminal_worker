@@ -116,7 +116,7 @@ test('live sound: /dev/snd/NAME is heard by whoever may read the recording, and 
     expect((await root.put(file(deck), { data: '# One\n\n---\n\n# Two\n' })).status()).toBe(201);
     for (const args of [['chmod', '755', home], ['chmod', '644', deck]]) expect((await root.post('/api/command', { data: { args, cwd: '/' } })).ok()).toBe(true);
     await run(speaker.page, 'cd ~');
-    await run(speaker.page, 'stream lecture.weba');
+    await run(speaker.page, 'stream -n lecture lecture.weba');
     await expect(transcript(speaker.page)).toContainText('live as /dev/snd/lecture', { timeout: 20_000 });
     // A guest hears it, as the recording, made with the umask, may be read by others.
     await run(guest.page, 'open /dev/snd/lecture');
@@ -250,9 +250,6 @@ test('stream -n NAME is live only: /dev/snd/NAME is a file of its own, whose per
   const listed = async () => ((await (await root.get('/api/ls?path=' + encodeURIComponent('/dev/snd'))).json()).entries || []).map(entry => entry.name);
   const other = await speaker.context.newPage(); await other.goto(origin + '/');
   try {
-    // Nothing named, nothing to stream.
-    await run(speaker.page, 'stream');
-    await expect(transcript(speaker.page)).toContainText('stream: missing --name NAME');
     await run(speaker.page, `stream -n ${open}`);
     await expect(transcript(speaker.page)).toContainText(new RegExp(`● live as /dev/snd/${open} · \\d\\d:\\d\\d`), { timeout: 20_000 });
     // The speaker's, made as a file is: others may read it, and so hear it.

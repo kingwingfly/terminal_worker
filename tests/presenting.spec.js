@@ -112,6 +112,27 @@ test('slides go in order, by number and from an overview; images enlarge; the sp
   await page.getByRole('button', { name: 'Smaller notes' }).click();
 });
 
+test('the overview lays its thumbnails out in rows, none over another, wide and on a phone', async ({ page }) => {
+  const path = `${base}/many.slides.md`;
+  expect((await root.put(file(path), { data: Array.from({ length: 30 }, (_, i) => `# Slide ${i + 1}`).join('\n\n---\n\n') })).status()).toBe(201);
+  await page.goto('/');
+  await run(page, `open ${path}`);
+  await expect(shown(page).locator('h1')).toHaveText('Slide 1');
+  for (const size of [{ width: 1440, height: 1000 }, { width: 390, height: 844 }]) {
+    await page.setViewportSize(size);
+    await page.keyboard.press('o');
+    const thumbs = page.locator('.slides-overview .slides-thumb');
+    await expect(thumbs).toHaveCount(30);
+    const boxes = await thumbs.evaluateAll(all => all.map(e => { const r = e.getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; }));
+    const over = boxes.flatMap((a, i) => boxes.slice(i + 1).filter(b => a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]));
+    expect(over).toEqual([]);
+    // Each as wide as a slide is: 16 by 9.
+    expect(Math.abs(boxes[0][3] - boxes[0][2] * 9 / 16)).toBeLessThan(2);
+    await page.keyboard.press('Escape'); await expect(thumbs).toHaveCount(0);
+  }
+  await root.delete(file(path));
+});
+
 test('S opens the speaker view in a window of its own, and the two windows follow each other', async ({ page }) => {
   await page.goto('/');
   await run(page, `open ${base}/deck.slides.md`);
@@ -182,7 +203,13 @@ test('a PDF presented shows one page at a time, filling the view, turned as slid
   await run(page, `open ${base}/pages.pdf`);
   const pdfStatus = p => p.locator('.pdf-toolbar [role=status]');
   await expect(pdfStatus(page)).toHaveText('1 / 3');
+  // The toolbar's buttons are of one size, and the mode's stays where it is as the mode changes.
+  const sizes = await page.locator('.pdf-toolbar button:visible').evaluateAll(all => [...new Set(all.map(e => Math.round(e.getBoundingClientRect().height)))]);
+  expect(sizes).toHaveLength(1);
+  const mode = page.locator('.pdf-present-button'), at = await mode.boundingBox();
   await page.getByRole('button', { name: 'Present one page at a time' }).click();
+  await expect(mode).toHaveAttribute('aria-pressed', 'true');
+  expect(await mode.boundingBox()).toEqual(at);
   const presented = page.locator('.pdf-present canvas');
   await expect(presented).toBeVisible(); await expect(page.locator('.pdf-stage')).toBeHidden();
   await expect(page.getByRole('button', { name: 'Zoom in' })).toBeHidden();
@@ -210,6 +237,17 @@ test('a PDF presented shows one page at a time, filling the view, turned as slid
   await page.getByRole('button', { name: 'Scroll the pages' }).click();
   await expect(page.locator('.pdf-stage')).toBeVisible(); await expect(page.locator('.pdf-present')).toBeHidden();
   await expect(page.getByRole('button', { name: 'Zoom in' })).toBeVisible();
+  expect(await mode.boundingBox()).toEqual(at);
+  // Full screen, scrolling too, the toolbar floats at the bottom, under no other bar.
+  await page.getByRole('button', { name: 'Fullscreen', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => document.fullscreenElement?.id)).toBe('viewer-surface');
+  await page.mouse.move(300, 300); await page.mouse.move(310, 310);
+  const [bar, tools, height] = await page.evaluate(() => [document.querySelector('.viewer-bar').getBoundingClientRect().bottom, document.querySelector('.pdf-toolbar').getBoundingClientRect(), innerHeight]);
+  expect(Math.abs(tools.bottom - height)).toBeLessThan(2); expect(tools.top).toBeGreaterThan(bar);
+  const zoom = await page.getByRole('button', { name: 'Zoom in' }).boundingBox();
+  expect(await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.getAttribute('aria-label'), [zoom.x + zoom.width / 2, zoom.y + zoom.height / 2])).toBe('Zoom in');
+  await page.evaluate(() => document.exitFullscreen());
+  await expect.poll(() => page.evaluate(() => document.fullscreenElement === null)).toBe(true);
 });
 
 test('a page of the account opens a deck where the account showed it last, on any device', async ({ browser }) => {

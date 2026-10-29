@@ -81,7 +81,9 @@ pub struct CompletionSession {
     pub original: String,
     pub cwd: String,
     pub candidates: Vec<Candidate>,
-    pub selected: usize,
+    /// The candidate in the line, if one is: the first Tab only lists them, so that more may be
+    /// typed to narrow them down (owner's request, 2026-10-28), unless there is only one.
+    pub selected: Option<usize>,
 }
 
 /// Who is signed in, which every tab shares, since it is one session.
@@ -1212,8 +1214,9 @@ impl Shell {
     }
     pub fn select_completion(self, index: usize) {
         if let Some(mut session) = self.completion.get_untracked() {
-            session.selected = index % session.candidates.len();
-            let value = session.candidates[session.selected].value.clone();
+            let index = index % session.candidates.len();
+            session.selected = Some(index);
+            let value = session.candidates[index].value.clone();
             self.input.set(value.clone());
             self.completion.set(Some(session));
             completion_focus(&value, false);
@@ -1221,10 +1224,9 @@ impl Shell {
     }
     pub fn accept_completion(self) {
         let inside_quote = self.completion.with_untracked(|s| {
-            s.as_ref().is_some_and(|s| {
-                let c = &s.candidates[s.selected];
-                c.descend && c.kind != "command"
-            })
+            s.as_ref()
+                .and_then(|s| s.selected.map(|index| &s.candidates[index]))
+                .is_some_and(|c| c.descend && c.kind != "command")
         });
         let value = self.input.get_untracked();
         self.reset_completion();
@@ -1243,17 +1245,25 @@ impl Shell {
             return;
         }
         self.completion_status.set(String::new());
-        let selected = self
-            .completion_offset
-            .get_untracked()
-            .rem_euclid(candidates.len() as i64) as usize;
+        // One completes at once; of several, the Tabs pressed while they were listed pick one.
+        let len = candidates.len() as i64;
+        let selected = match self.completion_offset.get_untracked() {
+            _ if len == 1 => Some(0),
+            0 => None,
+            ahead if ahead > 0 => Some((ahead - 1).rem_euclid(len) as usize),
+            back => Some(back.rem_euclid(len) as usize),
+        };
+        let shown = original.clone();
         self.completion.set(Some(CompletionSession {
             original,
             cwd,
             candidates,
-            selected,
+            selected: None,
         }));
-        self.select_completion(selected);
+        match selected {
+            Some(index) => self.select_completion(index),
+            None => completion_focus(&shown, false),
+        }
     }
     pub fn complete(self, backwards: bool) {
         if self.busy.get_untracked() {
@@ -1269,17 +1279,23 @@ impl Shell {
         let cwd = self.cwd.get_untracked();
         if let Some(session) = self.completion.get_untracked()
             && session.cwd == cwd
-            && session.candidates[session.selected].value == input
+            && session.selected.map_or(&session.original, |index| &session.candidates[index].value)
+                == &input
             // A sole command/directory can continue into its arguments/children.
             && (session.candidates.len() != 1 || !session.candidates[0].descend)
         {
-            let index = (session.selected as i64 + step).rem_euclid(session.candidates.len() as i64)
-                as usize;
-            self.select_completion(index);
+            // From the list alone, Tab picks the first, Shift+Tab the last.
+            let len = session.candidates.len() as i64;
+            let index = match session.selected {
+                Some(index) => (index as i64 + step).rem_euclid(len),
+                None if backwards => len - 1,
+                None => 0,
+            };
+            self.select_completion(index as usize);
             return;
         }
         self.reset_completion();
-        self.completion_offset.set(if backwards { -1 } else { 0 });
+        self.completion_offset.set(0);
         let epoch = self.completion_epoch.get_untracked();
         match completion::query(&input) {
             Query::Commands(candidates) => self.finish_completion(input, cwd, candidates),

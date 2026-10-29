@@ -29,20 +29,29 @@ test('R2 API enforces auth, same-origin writes, no-overwrite and byte ranges', a
   expect((await request.put('/api/file?path=' + name + '/x.txt', { headers: { Origin: origin }, data: 'x' })).status()).toBe(401);
 });
 
+// Tab completes a sole match at once; of several, the first Tab lists them, and the next picks
+// the best, whatever else earlier runs left to match.
+async function complete(input, text, expected) {
+  await input.fill(text); await input.press('Tab');
+  await expect(input.page().getByRole('option').first()).toBeVisible();
+  if (await input.inputValue() !== expected) await input.press('Tab');
+  await expect(input).toHaveValue(expected);
+}
+
 test('terminal, password modal, upload, sanitized Markdown, slides and media', async ({ page }) => {
   const errors = []; page.on('pageerror', e => errors.push(e.message));
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Your files, right here.' })).toBeVisible();
   await expect(page.locator('.loading')).toHaveCount(0);
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await input.fill('he'); await input.press('Tab'); await expect(input).toHaveValue('help ');
+  await input.fill('hel'); await input.press('Tab'); await expect(input).toHaveValue('help ');
   await run(page, 'open welcome.md'); await expect(page.locator('#viewer .markdown h1')).toContainText('R2 Terminal');
   await page.getByRole('button', { name: 'Close preview' }).click();
   await run(page, 'open dem'); await expect(page.locator('.transcript')).toContainText('File or directory does not exist');
   // Every command completes the paths its definition takes: faststart's file, unzip -d's directory.
-  await input.fill('faststart dem'); await input.press('Tab'); await expect(input).toHaveValue('faststart "demo.slides.md"');
-  await input.fill('unzip -d med'); await input.press('Tab'); await expect(input).toHaveValue('unzip -d "media/"');
-  await input.fill('open dem'); await input.press('Tab'); await expect(input).toHaveValue('open "demo.slides.md"');
+  await complete(input, 'faststart dem', 'faststart "demo.slides.md"');
+  await complete(input, 'unzip -d med', 'unzip -d "media/"');
+  await complete(input, 'open dem', 'open "demo.slides.md"');
   await input.press('Enter'); await expect(page.locator('.slides-current .slide:visible')).toBeVisible();
   await page.keyboard.press('ArrowRight'); await expect(page.locator('.slides-current .slide:visible')).toContainText('One filesystem');
   await page.getByRole('button', { name: 'Close preview' }).click();
@@ -52,7 +61,7 @@ test('terminal, password modal, upload, sanitized Markdown, slides and media', a
   await expect(page.locator('.busy')).toHaveText('↵');
   await run(page, 'mkdir ' + folder);
   await expect(page.locator('.transcript')).toContainText('Created /' + folder);
-  await input.fill('cd ' + folder.slice(0, -1)); await input.press('Tab'); await expect(input).toHaveValue('cd "' + folder + '/"'); await input.press('Enter'); await expect(page.locator('.directory-bar')).toContainText(folder);
+  await complete(input, 'cd ' + folder.slice(0, -1), 'cd "' + folder + '/"'); await input.press('Enter'); await expect(page.locator('.directory-bar')).toContainText(folder);
   const chooserPromise = page.waitForEvent('filechooser'); await page.getByRole('button', { name: '↑ Upload files' }).click();
   await (await chooserPromise).setFiles({ name: 'Safe preview.md', mimeType: 'text/markdown', buffer: Buffer.from('# Rendered safely\n\n<img src="missing" onerror="window.xss=true">\n<script>window.xss=true</script>\n[bad](javascript:alert(1))') });
   await expect(page.locator('.filename').filter({ hasText: 'Safe preview.md' })).toBeVisible();

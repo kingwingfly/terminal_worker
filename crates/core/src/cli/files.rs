@@ -104,10 +104,13 @@ impl Manual for Open {
 /// `open /dev/present/NAME`, guests too: each sees the slide shown here as it turns, until they
 /// turn elsewhere themselves, which pauses following until they follow again. Your own windows
 /// and devices turn it, as remotes, and open it where it is. Presenting again under the same
-/// name takes over your presentation of it.
+/// name takes over your presentation of it. Its followers hear your live sound (stream) with it,
+/// and may ask to speak: once you allow them, everyone following hears them too.
 ///
-/// It lasts until present --stop NAME, or 12 hours after its last turn. Guests cannot present:
-/// guest is everyone signed out, who could all turn the slides.
+/// It lasts until present --stop NAME, rm /dev/present/NAME, or 12 hours after its last turn.
+/// The bar of the slides or PDF shown has buttons for it too: Present, Go live, and, following,
+/// Ask to speak. Guests cannot present: guest is everyone signed out, who could all turn the
+/// slides.
 #[derive(Parser, Debug)]
 #[command(name = "present")]
 pub struct Present {
@@ -131,16 +134,18 @@ impl Manual for Present {
             "follows it, from anywhere FILE may be read",
         ),
         ("present --stop talk", "ends it"),
+        ("rm /dev/present/talk", "ends it too"),
     ];
-    const SEE: &'static [&'static str] = &["open"];
+    const SEE: &'static [&'static str] = &["open", "stream"];
 }
 
 /// send the microphone live, and record it into a file
 ///
-/// Signed in, the sound is live as /dev/snd/NAME: whoever may hear it does with
-/// open /dev/snd/NAME, guests too, and whoever follows a presentation of the same name,
-/// /dev/present/NAME, hears it with the slides. Ctrl+C stops it. Live sound needs the site's
-/// Cloudflare Realtime app.
+/// Signed in, the sound is live as /dev/snd/NAME, your account's name unless -n names it:
+/// whoever may hear it does with open /dev/snd/NAME, guests too, and whoever follows a
+/// presentation of yours hears it with the slides (the sound of the presentation's name, if you
+/// send one, or else your latest). Ctrl+C, or rm /dev/snd/NAME, stops it. Live sound needs the
+/// site's Cloudflare Realtime app.
 ///
 /// With FILE, the sound is also recorded into it, a new file: Opus in WebM (.weba or .webm),
 /// which every browser records. FILE grows as you speak, and may be read meanwhile; when stopped,
@@ -155,14 +160,8 @@ impl Manual for Present {
 #[derive(Parser, Debug)]
 #[command(name = "stream")]
 pub struct Stream {
-    /// the live sound's name, /dev/snd/NAME; with FILE, by default, FILE's name without its
-    /// extension
-    #[arg(
-        short = 'n',
-        long = "name",
-        value_name = "NAME",
-        required_unless_present = "file"
-    )]
+    /// the live sound's name, /dev/snd/NAME; by default, your account's name
+    #[arg(short = 'n', long = "name", value_name = "NAME")]
     pub name: Option<String>,
     /// ACL entries, as setfacl -m takes them, for FILE, or /dev/snd/NAME without it
     #[arg(short = 'm', long = "modify", value_name = "ENTRIES")]
@@ -174,13 +173,15 @@ impl Manual for Stream {
     const SECTION: Section = Section::Files;
     const NEEDS: &'static str = "a microphone; live, an account of your own; with FILE, w and x on its directory. Hearing it, r on FILE, or on /dev/snd/NAME without FILE.";
     const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("stream", "live as /dev/snd/USER, your account's name"),
         (
             "stream talk.weba",
-            "records into talk.weba, live as /dev/snd/talk",
+            "records into talk.weba, live as /dev/snd/USER",
         ),
         ("stream -n talk", "live as /dev/snd/talk, kept nowhere"),
         ("stream -n talk -m o::-,g:lab:r", "only group lab hears it"),
         ("open /dev/snd/talk", "hears it"),
+        ("rm /dev/snd/talk", "stops it"),
     ];
     const SEE: &'static [&'static str] = &["present", "open"];
 }
