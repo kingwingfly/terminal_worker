@@ -100,12 +100,14 @@ impl Manual for Open {
 /// present slides or a PDF for others to follow
 ///
 /// Shows FILE, slides (*.slides.md, or Markdown) or a PDF presented a page at a time, and makes
-/// /dev/present/NAME, a link to it. Whoever may read FILE follows the presentation with
-/// `open /dev/present/NAME`, guests too: each sees the slide shown here as it turns, until they
-/// turn elsewhere themselves, which pauses following until they follow again. Your own windows
-/// and devices turn it, as remotes, and open it where it is. Presenting again under the same
-/// name takes over your presentation of it. Its followers hear your live sound (stream) with it,
-/// and may ask to speak: once you allow them, everyone following hears them too.
+/// /dev/present/NAME, a character device, yours, with FILE's mode and ACL. Whoever may read it
+/// follows the presentation with `open /dev/present/NAME`, guests too: each sees the slide shown
+/// here as it turns, until they turn elsewhere themselves, which pauses following until they
+/// follow again. Whoever may write it turns it too: your own windows and devices, as remotes,
+/// and a co-host you let (setfacl -m u:NAME:rw /dev/present/NAME). chmod and setfacl on it say
+/// who may do what; cat tells what it shows. Presenting again under the same name takes over
+/// your presentation of it. Its followers hear your live sound (stream) with it, and may ask to
+/// speak: once you allow them, everyone following hears them too.
 ///
 /// It lasts until present --stop NAME, rm /dev/present/NAME, or 12 hours after its last turn.
 /// The bar of the slides or PDF shown has buttons for it too: Present, Go live, and, following,
@@ -150,13 +152,13 @@ impl Manual for Present {
 /// With FILE, the sound is also recorded into it, a new file: Opus in WebM (.weba or .webm),
 /// which every browser records. FILE grows as you speak, and may be read meanwhile; when stopped,
 /// it is complete, and a recording whose page goes away keeps what arrived. Those who may read
-/// FILE may hear the sound. Without the Realtime app, stream only records.
+/// FILE may read the recording. Without the Realtime app, stream only records.
 ///
-/// Without FILE, nothing is kept: /dev/snd/NAME is a file of its own, yours, and those who may
-/// read it may hear the sound.
+/// /dev/snd/NAME is a character device, yours, made as a file is (the umask): those who may
+/// read it may hear the sound. Without FILE, nothing is kept.
 ///
-/// -m gives entries as setfacl -m takes them to what decides who may hear, FILE or
-/// /dev/snd/NAME, as it is made: -m o::- lets no one else hear, -m u:ada:r,o::- only ada.
+/// -m gives entries as setfacl -m takes them to FILE and /dev/snd/NAME, as they are made: -m
+/// o::- lets no one else hear, -m u:ada:r,o::- only ada.
 #[derive(Parser, Debug)]
 #[command(name = "stream")]
 pub struct Stream {
@@ -204,7 +206,7 @@ pub struct Vim {
 impl Manual for Vim {
     const SECTION: Section = Section::Files;
     const NEEDS: &'static str =
-        "r to open; w to save, else the file opens read-only. The server checks every save.";
+        "r to open; w to save, else the file opens read-only. The kernel checks every save.";
     const EXAMPLES: &'static [(&'static str, &'static str)] =
         &[("vim notes.md", "edit, or create on save")];
     const SEE: &'static [&'static str] = &["open", "touch"];

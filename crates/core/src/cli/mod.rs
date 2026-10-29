@@ -1,7 +1,7 @@
 //! Every command's definition: what it takes, as clap parses it, and its manual. A command is a
 //! clap `Parser` whose doc comments are its summary, description and options, and whose
 //! [`Manual`] adds what it needs, examples and related commands. [`DEFINITIONS`] registers them
-//! all; the server and the terminal each run them from a registry of their own, and `-h`, `man`
+//! all; user space's programs (crates/userland) and the terminal run them, and `-h`, `man`
 //! and `help` are made from these definitions alone, so that what a page says is what parsing
 //! accepts.
 
