@@ -23,12 +23,19 @@ pub async fn handle(req: &mut Request, state: &State, key: Option<String>) -> Re
         ));
     }
     let (sudo, umask) = (batch.sudo, batch.umask & 0o777);
+    let guest = auth::guest_key(req);
     let mut results = Vec::with_capacity(batch.calls.len());
     for call in batch.calls {
-        let key = key.clone();
+        let (key, guest) = (key.clone(), guest.clone());
         let result = transact(state, move |db| {
-            let result = run(db, key.as_deref(), sudo, umask, call);
-            let commit = result.is_ok();
+            // A descriptor call stands as it ends, failed or not: a close that fails closes.
+            let descriptors = matches!(
+                call,
+                Call::Open { .. } | Call::Close { .. } | Call::Lease { .. } | Call::Ioctl { .. }
+            );
+            let sid = auth::sid(db, key.as_deref(), guest.as_deref());
+            let result = run(db, key.as_deref(), sid.as_deref(), sudo, umask, call);
+            let commit = result.is_ok() || descriptors;
             let result = match result {
                 Ok(value) => Return::Ok(value),
                 Err(error) => Return::Err(error),
@@ -40,10 +47,12 @@ pub async fn handle(req: &mut Request, state: &State, key: Option<String>) -> Re
     Ok(Reply::ok(json!(Results { results })))
 }
 
-/// The call `call`, as the session `key`'s process, under sudo if `sudo`.
+/// The call `call`, as the session `key`'s process (`sid`, signed in or not), under sudo if
+/// `sudo`.
 fn run(
     db: &mut Db,
     key: Option<&str>,
+    sid: Option<&str>,
     sudo: bool,
     umask: u16,
     call: Call,
@@ -57,9 +66,15 @@ fn run(
         };
         Error::because(errno, why)
     })?;
+    let process = Process { cred, umask };
     match call {
-        Call::Getcreds => Ok(json!(creds(db, key, &cred))),
-        call => kernel::call(db, &Process { cred, umask }, call),
+        Call::Getcreds => Ok(json!(creds(db, key, &process.cred))),
+        call @ (Call::Open { .. }
+        | Call::Close { .. }
+        | Call::Lease { .. }
+        | Call::Fds
+        | Call::Ioctl { .. }) => crate::fds::call(db, sid, &process, call),
+        call => kernel::call(db, &process, call),
     }
 }
 

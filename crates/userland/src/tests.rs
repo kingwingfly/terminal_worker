@@ -1,19 +1,90 @@
 //! The programs, run over the kernel in memory: what they print and how they fail.
 use crate::{Io, Sys, View, run};
-use abi::{Call, Error};
-use kernel::{Process, call};
-use serde_json::Value;
+use abi::{Call, Closed, Errno, Error, FICLONE, O_ACCMODE, Opened};
+use kernel::{Fs, Opening, Process, call};
+use serde_json::{Value, json};
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::{Pin, pin};
 use std::task::{Context, Poll, Waker};
 use terminal_worker_core::permissions::*;
 
-/// A process over the kernel in memory, as an account.
+/// A process over the kernel in memory, as an account, with descriptors as the host keeps
+/// them: here, of whole files, whose content is an id that copies share.
 struct Mem {
     fs: RefCell<MemStore>,
     cred: RefCell<Identity>,
+    fds: RefCell<BTreeMap<u32, MemFd>>,
+}
+struct MemFd {
+    path: String,
+    file: Option<String>,
+    size: u64,
+    write: bool,
+    created: bool,
+}
+impl Mem {
+    fn descriptor(&self, process: &Process, call: Call) -> Result<Value, Error> {
+        let mut fs = self.fs.borrow_mut();
+        let mut fds = self.fds.borrow_mut();
+        match call {
+            Call::Open {
+                path, flags, mode, ..
+            } => {
+                let fd = (3..).find(|n| !fds.contains_key(n)).expect("a free fd");
+                let write = flags & O_ACCMODE != 0;
+                let opened = match kernel::open(&*fs, process, &path, flags, mode)? {
+                    Opening::Existing { path, node } => MemFd {
+                        path,
+                        file: node.file,
+                        size: node.size,
+                        write,
+                        created: false,
+                    },
+                    Opening::New { path, mut node } => {
+                        node.file = Some(fs.empty(process.cred.id, &path));
+                        fs.set_node(&path, &node);
+                        MemFd {
+                            path,
+                            file: node.file,
+                            size: 0,
+                            write,
+                            created: true,
+                        }
+                    }
+                };
+                let created = opened.created;
+                fds.insert(fd, opened);
+                Ok(json!(Opened {
+                    fd,
+                    created,
+                    ..Opened::default()
+                }))
+            }
+            Call::Ioctl {
+                fd,
+                request: FICLONE,
+                arg,
+            } => {
+                let source = fds.get(&(arg as u32)).ok_or(Errno::EBADF)?;
+                let (file, size) = (source.file.clone(), source.size);
+                let target = fds.get(&fd).filter(|f| f.write).ok_or(Errno::EBADF)?;
+                let node = fs.node(&target.path).ok_or(Errno::ENOENT)?;
+                fs.set_node(&target.path, &Node { file, size, ..node });
+                Ok(Value::Null)
+            }
+            Call::Close { fd } => {
+                let closed = fds.remove(&fd).ok_or(Errno::EBADF)?;
+                Ok(json!(Closed {
+                    path: closed.path,
+                    created: closed.created,
+                    ..Closed::default()
+                }))
+            }
+            _ => Err(Errno::ENOSYS.into()),
+        }
+    }
 }
 impl Sys for Mem {
     async fn batch(&self, calls: Vec<Call>) -> Vec<Result<Value, Error>> {
@@ -23,7 +94,12 @@ impl Sys for Mem {
         };
         calls
             .into_iter()
-            .map(|c| call(&mut *self.fs.borrow_mut(), &process, c))
+            .map(|c| match c {
+                Call::Open { .. } | Call::Ioctl { .. } | Call::Close { .. } => {
+                    self.descriptor(&process, c)
+                }
+                c => call(&mut *self.fs.borrow_mut(), &process, c),
+            })
             .collect()
     }
     async fn read(&self, path: &str) -> Result<Vec<u8>, Error> {
@@ -88,6 +164,7 @@ fn mem() -> Mem {
     Mem {
         fs: RefCell::new(fs),
         cred: RefCell::new(Identity::root()),
+        fds: RefCell::new(BTreeMap::new()),
     }
 }
 impl Mem {
@@ -319,5 +396,129 @@ fn fd_finds_below_its_roots_and_stat_says_what_a_file_is() {
     assert_eq!(
         sh(&mem, "/f", "stat nope").err,
         ["stat: cannot statx 'nope': No such file or directory"]
+    );
+}
+
+/// The content id of the file at `path`.
+fn content(mem: &Mem, path: &str) -> Option<String> {
+    mem.fs.borrow().node(path).and_then(|node| node.file)
+}
+
+#[test]
+fn cp_shares_content_copies_trees_and_says_what_it_will_not() {
+    let mem = mem();
+    sh(&mem, "/", "mkdir -p /w/src/deep");
+    sh(&mem, "/w", "touch src/a src/deep/b");
+    {
+        let mut fs = mem.fs.borrow_mut();
+        let node = fs.node("/w/src/a").unwrap();
+        fs.set_node(
+            "/w/src/a",
+            &Node {
+                file: Some("alpha".into()),
+                size: 5,
+                mode: (node.mode & !0o777) | 0o600,
+                ..node
+            },
+        );
+    }
+    // A copy shares its source's content; its mode is the source's, less the umask.
+    assert_eq!(sh(&mem, "/w", "cp src/a copy").status, 0);
+    assert_eq!(content(&mem, "/w/copy").as_deref(), Some("alpha"));
+    assert_eq!(mem.fs.borrow().node("/w/copy").unwrap().mode & 0o777, 0o600);
+    assert_eq!(
+        sh(&mem, "/w", "cp src dir").err,
+        ["cp: -r not specified; omitting directory 'src'"]
+    );
+    // A tree, a level at a time, said in the order it is walked.
+    assert_eq!(
+        sh(&mem, "/w", "cp -rv src tree").out,
+        "'src' -> 'tree'\n'src/a' -> 'tree/a'\n'src/deep' -> 'tree/deep'\n'src/deep/b' -> 'tree/deep/b'\n"
+    );
+    assert_eq!(content(&mem, "/w/tree/a").as_deref(), Some("alpha"));
+    assert_eq!(
+        sh(&mem, "/w", "cp -r src src/deep").err,
+        ["cp: cannot copy a directory, 'src', into itself, 'src/deep/src'"]
+    );
+    assert_eq!(
+        sh(&mem, "/w", "cp src/a src/a").err,
+        ["cp: 'src/a' and 'src/a' are the same file"]
+    );
+    // -i asks of the name as given; no leaves what is there.
+    sh(&mem, "/w", "touch other");
+    assert_eq!(sh(&mem, "/w", "cp -i src/a other").status, 0);
+    assert_ne!(content(&mem, "/w/other").as_deref(), Some("alpha"));
+    // Links are copied as links with -r, and followed when named without it.
+    sh(&mem, "/w", "ln -s a src/l");
+    sh(&mem, "/w", "cp -r src again");
+    assert_eq!(sh(&mem, "/w", "readlink again/l").out, "a\n");
+    sh(&mem, "/w", "cp src/l followed");
+    assert_eq!(content(&mem, "/w/followed").as_deref(), Some("alpha"));
+    // -a keeps a file's names one file, and a link's target as written; -L follows links.
+    sh(&mem, "/w", "ln src/a src/deep/a-too");
+    assert_eq!(sh(&mem, "/w", "cp -a src kept").err, Vec::<String>::new());
+    let ino = |path: &str| mem.fs.borrow().node(path).unwrap().ino;
+    assert_eq!(ino("/w/kept/a"), ino("/w/kept/deep/a-too"));
+    assert_ne!(ino("/w/kept/a"), ino("/w/src/a"));
+    assert_eq!(
+        sh(&mem, "/w", "readlink kept/l").out,
+        "a
+"
+    );
+    sh(&mem, "/w", "cp -rL src deref");
+    assert_eq!(content(&mem, "/w/deref/l").as_deref(), Some("alpha"));
+    // A file is written through a link to one, not through one leading nowhere.
+    sh(&mem, "/w", "touch target");
+    sh(&mem, "/w", "ln -s target via");
+    sh(&mem, "/w", "cp src/a via");
+    assert_eq!(content(&mem, "/w/target").as_deref(), Some("alpha"));
+    sh(&mem, "/w", "ln -s nowhere dangling");
+    assert_eq!(
+        sh(&mem, "/w", "cp src/a dangling").err,
+        ["cp: not writing through dangling symlink 'dangling'"]
+    );
+    // A file still uploading is copied once whole, and nothing of a tree holding one before.
+    mem.fs.borrow_mut().incomplete.insert("alpha".into());
+    assert_eq!(
+        sh(&mem, "/w", "cp -r src late").err,
+        ["cp: cannot copy 'src/a': still uploading; copy it once it completes"]
+    );
+    assert!(mem.fs.borrow().node("/w/late").is_none());
+    mem.fs.borrow_mut().incomplete.clear();
+    // -p keeps the owner only for root; -f replaces a file that cannot be written.
+    sh(&mem, "/w", "chown 1000 src/deep/b");
+    sh(&mem, "/w", "cp -p src/deep/b owned");
+    assert_eq!(mem.fs.borrow().node("/w/owned").unwrap().owner, 1000);
+    sh(&mem, "/w", "chmod 777 /w");
+    mem.as_user(1001);
+    sh(&mem, "/w", "cp -p src/deep/b bobs");
+    assert_eq!(mem.fs.borrow().node("/w/bobs").unwrap().owner, 1001);
+    mem.as_user(1000);
+    sh(&mem, "/w", "touch /w/locked");
+    sh(&mem, "/w", "chmod 444 /w/locked");
+    assert_eq!(
+        sh(&mem, "/w", "cp src/deep/b locked").err,
+        ["cp: cannot create regular file 'locked': Permission denied"]
+    );
+    assert_eq!(
+        sh(&mem, "/w", "cp -f src/deep/b locked").err,
+        Vec::<String>::new()
+    );
+    assert_eq!(content(&mem, "/w/locked"), content(&mem, "/w/src/deep/b"));
+    sh(&mem, "/w", "chmod 755 /w");
+    mem.as_user(0);
+    sh(&mem, "/w", "chmod 755 /w");
+    // Where the account may not write, nothing is made.
+    mem.as_user(1000);
+    assert_eq!(
+        sh(&mem, "/w", "cp src/deep/b x").err,
+        ["cp: cannot create regular file 'x': Permission denied"]
+    );
+    assert_eq!(
+        sh(&mem, "/w", "cp src/deep/b /nowhere/x /w").err,
+        [
+            "cp: cannot create regular file '/w/b': Permission denied",
+            "cp: cannot stat '/nowhere/x': No such file or directory"
+        ]
     );
 }

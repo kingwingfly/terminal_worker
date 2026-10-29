@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { mkdirp, program, rmrf } from './sys.js';
+import { mkdirp, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -42,7 +42,7 @@ test('two devices of one account never send one upload at once, and one stopping
     // A's chunks wait until B has tried, so that A is still sending however long B takes to hash
     // the file; B chooses the same file meanwhile, and is told to wait.
     let release; const released = new Promise(resolve => { release = resolve; });
-    await a.page.route('**/api/uploads/chunk?**', async route => { await released; await route.continue().catch(() => {}); });
+    await a.page.route('**/api/pwrite?**', async route => { await released; await route.continue().catch(() => {}); });
     await upload(a.page, 'data.bin', bytes);
     await expect(transcript(a.page)).toContainText(/data\.bin · \d+%/, { timeout: 30_000 });
     await upload(b.page, 'data.bin', bytes);
@@ -100,8 +100,8 @@ test('the file panel dims what the account may not open, and says why when click
   const page = await context.newPage();
   try {
     for (const dir of ['', '/locked', '/open']) await mkdirp(root, base + dir);
-    expect((await root.put(file(base + '/secret.txt'), { data: 'no' })).status()).toBe(201);
-    expect((await root.put(file(base + '/notes.txt'), { data: 'yes' })).status()).toBe(201);
+    expect((await put(root, file(base + '/secret.txt'), { data: 'no' })).status()).toBe(201);
+    expect((await put(root, file(base + '/notes.txt'), { data: 'yes' })).status()).toBe(201);
     for (const args of [['chmod', '700', base + '/locked'], ['chmod', '600', base + '/secret.txt'], ['ln', '-s', base + '/nowhere', base + '/dangling']]) expect((await command(args)).ok()).toBe(true);
     await page.goto(origin + '/');
     await run(page, 'cd ' + base);

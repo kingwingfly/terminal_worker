@@ -14,7 +14,7 @@ import { cpp } from '@codemirror/lang-cpp';
 import { yaml } from '@codemirror/legacy-modes/mode/yaml';
 import { toml } from '@codemirror/legacy-modes/mode/toml';
 import { shell } from '@codemirror/legacy-modes/mode/shell';
-import { sys } from './http.mjs';
+import { O_CREAT, O_EXCL, O_TRUNC, O_WRONLY, call, pwrite, sys } from './http.mjs';
 const $ = id => document.getElementById(id);
 const theme = EditorView.theme({
  '&': { color: '#d0dbd3', backgroundColor: '#101614', height: '100%', fontSize: '20px' },
@@ -67,10 +67,13 @@ export async function edit(path,{api,fileUrl,unlock,changed}) {
   try{
    const parent=path.slice(0,path.lastIndexOf('/'))||'/';
    if(!await unlock(parent))throw new Error('Save canceled');
-   const headers={'Content-Type':'text/plain;charset=utf-8'};
-   if(state.existing)headers['If-Match']=state.etag;else headers['If-None-Match']='*';
-   const response=await api(fileUrl(path)+(state.existing?'&overwrite=true':''),{method:'PUT',headers,body:bytes});
-   const result=await response.json();state.etag=result.etag;state.existing=true;
+   // Through a descriptor: a new file, or the one read replaced, if it is still the one read.
+   let opened;
+   try{opened=await call('open',state.existing?{path,flags:O_WRONLY|O_TRUNC,size:bytes.length,version:state.etag}:{path,flags:O_WRONLY|O_CREAT|O_EXCL,mode:0o666,size:bytes.length});}
+   catch(error){throw new Error({ESTALE:'File changed in another session; reopen it or download your draft to avoid overwriting changes',EEXIST:'File was created by another session; reopen it',ENOENT:'File was deleted or moved; save it as a new file'}[error.errno]||error.message);}
+   try{if(bytes.length)await pwrite(opened.fd,0,bytes);}
+   catch(error){await sys([{close:{fd:opened.fd}}]);if(opened.created)await sys([{unlink:{path}}]);throw error;}
+   const result=await call('close',{fd:opened.fd});state.etag=result.version;state.existing=true;
    // Edits may continue while the save request is in flight.
    state.dirty=state.view.state.doc.toString()!==text;
    status.textContent=state.dirty?'Submitted content saved; newer edits remain unsaved.':'Saved';discard.hidden=true;changed();

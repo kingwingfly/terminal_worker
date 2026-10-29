@@ -9,15 +9,29 @@ const login = await fetch(origin + '/api/login', { method: 'POST', headers: { Or
 if (!login.ok) throw new Error(`Local login failed: ${login.status} ${await login.text()}`);
 const cookie = login.headers.get('set-cookie').split(';')[0];
 const headers = { Origin: origin, Cookie: cookie };
+// System calls, as a page makes them: each call's `{ok}` or `{err}`.
+async function sys(calls) {
+  const response = await fetch(origin + '/api/sys', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ calls }) });
+  if (!response.ok) throw new Error(`/api/sys: ${response.status} ${await response.text()}`);
+  return (await response.json()).results;
+}
+// A new file, through a descriptor: open, one pwrite, close. One there already is kept.
 async function upload(path, body) {
-  const response = await fetch(origin + '/api/file?path=' + encodeURIComponent(path), { method: 'PUT', headers, body });
-  if (!response.ok && response.status !== 409) throw new Error(`${path}: ${response.status} ${await response.text()}`);
-  console.log(`${response.status === 409 ? 'Keeping existing' : 'Wrote'} ${path}`);
+  const [opened] = await sys([{ open: { path, flags: 0o1 | 0o100 | 0o200, mode: 0o644, size: body.length } }]);
+  if (opened.err?.errno === 'EEXIST') return console.log(`Keeping existing ${path}`);
+  if (opened.err) throw new Error(`${path}: ${opened.err.detail || opened.err.errno}`);
+  const fd = opened.ok.fd;
+  if (body.length) {
+    const written = await fetch(`${origin}/api/pwrite?fd=${fd}&index=0`, { method: 'PUT', headers, body });
+    if (!written.ok) throw new Error(`${path}: ${written.status} ${await written.text()}`);
+  }
+  const [closed] = await sys([{ close: { fd } }]);
+  if (closed.err) throw new Error(`${path}: ${closed.err.detail || closed.err.errno}`);
+  console.log(`Wrote ${path}`);
 }
 for (const name of await readdir('seed')) await upload('/' + name, await readFile('seed/' + name));
-// mkdir(2), as a system call; one that is there already is fine.
-const made = await fetch(origin + '/api/sys', { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ calls: [{ mkdir: { path: '/media', mode: 0o755 } }] }) });
-const [result] = made.ok ? (await made.json()).results : [{ err: { errno: await made.text() } }];
+// mkdir(2); one that is there already is fine.
+const [result] = await sys([{ mkdir: { path: '/media', mode: 0o755 } }]);
 if (result.err && result.err.errno !== 'EEXIST') throw new Error(`mkdir /media: ${result.err.detail || result.err.errno}`);
 // A generated, quiet two-second sine wave; no external media or network dependencies.
 const sampleRate = 22050, count = sampleRate * 2, wav = Buffer.alloc(44 + count * 2);

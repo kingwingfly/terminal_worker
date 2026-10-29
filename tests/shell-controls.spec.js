@@ -1,6 +1,6 @@
 import { test, expect, request } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { entry, program } from './sys.js';
+import { entry, program, put } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const password = 'shell-testing-password-621';
@@ -67,7 +67,7 @@ test('touch creates readable empty files, preserves content and ACLs, validates 
   const empty=await ok(await f.user.get(file(path)));expect(await empty.text()).toBe('');
   expect((await f.user.head(file(path))).headers()['content-length']).toBe('0');
   const stat=await entry(f.user, path);expect(stat.owner).toBe(f.name);expect(stat.mode).toBe(0o644);
-  await ok(await f.user.put(file(path)+'&overwrite=true',{data:'preserve this'}));
+  await ok(await put(f.user, file(path)+'&overwrite=true',{data:'preserve this'}));
   await ok(await command(f.user,['chmod','600',path]));
   const before=await(await f.user.get(file(path))).text();const etag=(await f.user.head(file(path))).headers().etag;
   await ok(await command(f.user,['touch',path]));expect(await(await f.user.get(file(path))).text()).toBe(before);expect((await f.user.head(file(path))).headers().etag).toBe(etag);

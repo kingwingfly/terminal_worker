@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { mkdirp, names, program, rmrf } from './sys.js';
+import { mkdirp, names, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -46,7 +46,7 @@ test.beforeAll(async () => {
   expect((await root.post('/api/login', { data: { password: rootPassword } })).ok()).toBe(true);
   base = '/presenting-' + Date.now().toString(36);
   await mkdirp(root, base);
-  for (const [name, data] of [['deck.slides.md', deck], ['other.slides.md', '# Bee\n\n---\n\n# Bee two\n'], ['third.slides.md', '# Sea\n'], ['figure.svg', figure], ['pages.pdf', pdf()]]) expect((await root.put(file(base + '/' + name), { data })).status()).toBe(201);
+  for (const [name, data] of [['deck.slides.md', deck], ['other.slides.md', '# Bee\n\n---\n\n# Bee two\n'], ['third.slides.md', '# Sea\n'], ['figure.svg', figure], ['pages.pdf', pdf()]]) expect((await put(root, file(base + '/' + name), { data })).status()).toBe(201);
 });
 test.afterAll(async () => { await rmrf(root, base); await root.dispose(); });
 
@@ -115,7 +115,7 @@ test('slides go in order, by number and from an overview; images enlarge; the sp
 
 test('the overview lays its thumbnails out in rows, none over another, wide and on a phone', async ({ page }) => {
   const path = `${base}/many.slides.md`;
-  expect((await root.put(file(path), { data: Array.from({ length: 30 }, (_, i) => `# Slide ${i + 1}`).join('\n\n---\n\n') })).status()).toBe(201);
+  expect((await put(root, file(path), { data: Array.from({ length: 30 }, (_, i) => `# Slide ${i + 1}`).join('\n\n---\n\n') })).status()).toBe(201);
   await page.goto('/');
   await run(page, `open ${path}`);
   await expect(shown(page).locator('h1')).toHaveText('Slide 1');
@@ -282,7 +282,7 @@ test('present makes /dev/present/NAME, which whoever may read the file follows, 
   }
   // Readable by the presenter and by guests, as their ACL says, and by nobody else.
   const stem = 'talk' + Date.now().toString(36), talk = `${base}/${stem}.slides.md`;
-  expect((await root.put(file(talk), { data: deck })).status()).toBe(201);
+  expect((await put(root, file(talk), { data: deck })).status()).toBe(201);
   for (const args of [['chmod', '600', talk], ['setfacl', '-m', `u:${name}:r,u:guest:r`, talk], ['setfacl', '-m', `u:${name}:r,u:guest:r`, base + '/pages.pdf']]) expect((await command(args)).ok()).toBe(true);
   const laptop = await device(browser, name, password), phone = await device(browser, name, password);
   const guest = await device(browser), other = await device(browser, outsider, password);
@@ -532,7 +532,7 @@ test('a failure heard for a replacement the listener has since gone past does no
   expect((await root.post('/api/passwd', { data: { username: name, password } })).ok()).toBe(true);
   // A deck the presenter may read and guests may not.
   const secret = `${base}/secret-${name}.slides.md`;
-  expect((await root.put(file(secret), { data: '# Secret\n' })).status()).toBe(201);
+  expect((await put(root, file(secret), { data: '# Secret\n' })).status()).toBe(201);
   for (const args of [['chmod', '600', secret], ['setfacl', '-m', `u:${name}:r`, secret]]) expect((await command(args)).ok()).toBe(true);
   const laptop = await device(browser, name, password), guest = await device(browser);
   const stem = 'stale' + Date.now().toString(36);

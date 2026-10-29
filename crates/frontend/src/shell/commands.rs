@@ -13,7 +13,7 @@ use terminal_worker_core::text;
 use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 
-use super::{LogLine, Output, Shell, asks, js_message};
+use super::{LogLine, Output, Shell, js_message};
 use crate::{
     choose_files, endpoint, enterable, listing, open_file, record_sound, request, set_directory,
     stat, upload_files,
@@ -47,7 +47,6 @@ pub static COMMANDS: &[&dyn TerminalCommand] = &[
     &Xargs,
     &Fd,
     &Jobs,
-    &Asking("cp"),
     &Asking("sudo"),
     &Cd,
     &Pwd,
@@ -180,8 +179,8 @@ impl TerminalCommand for Jobs {
     }
 }
 
-/// cp, and sudo: with -i, the tab asks about each file the server says exists; otherwise the
-/// server does all. sudo of a program of user space runs it as root.
+/// sudo: of a program of user space, it runs as root; of one of the server's, the server runs
+/// it as root.
 struct Asking(&'static str);
 impl TerminalCommand for Asking {
     fn name(&self) -> &'static str {
@@ -199,11 +198,7 @@ impl TerminalCommand for Asking {
             if program.is_some_and(|name| userland::PROGRAMS.contains(&name.as_str())) {
                 return shell.sudo_program(args[1..].to_vec(), stdin, piped).await;
             }
-            if asks(&args) {
-                shell.interactive(&args).await
-            } else {
-                shell.manage(&args, piped).await
-            }
+            shell.manage(&args, piped).await
         }
         .boxed_local()
     }

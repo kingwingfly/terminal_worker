@@ -11,6 +11,38 @@ export async function sys(request, calls, options = {}) {
   return (await response.json()).results;
 }
 
+// A whole file written as a page writes one, through a descriptor (open, pwrite, close): `url`
+// names it as a read does (/api/file?path=P, &overwrite=true to replace one), and an If-Match
+// header is the version it must still be. Answered as a request is: 201 made, 200 replaced;
+// 409 there already, 403 refused (401 to a guest), 404, 412 changed meanwhile; the errno in
+// the body.
+export async function put(request, url, { data = '', headers: given = {} } = {}) {
+  const query = new URL(url, origin).searchParams;
+  const path = query.get('path'), overwrite = query.get('overwrite') === 'true';
+  const bytes = Buffer.from(data);
+  const version = given['If-Match'];
+  const flags = 0o1 | 0o100 | (overwrite ? 0o1000 : 0o200);
+  const [opened] = await sys(request, [{ open: { path, flags, mode: 0o666, size: bytes.length, ...(version ? { version } : {}) } }]);
+  if (opened.err) return refusal(request, opened.err);
+  const { fd, created, chunk_size: chunk = 8 * 1024 * 1024 } = opened.ok;
+  for (let index = 0; index * chunk < bytes.length; index++) {
+    const written = await request.put(`${origin}/api/pwrite?fd=${fd}&index=${index}`, { headers: { Origin: origin, 'Content-Type': 'application/octet-stream' }, data: bytes.subarray(index * chunk, (index + 1) * chunk) });
+    if (!written.ok()) {
+      await sys(request, [{ close: { fd } }, ...(created ? [{ unlink: { path } }] : [])]);
+      return written;
+    }
+  }
+  const [closed] = await sys(request, [{ close: { fd } }]);
+  if (closed.err) return refusal(request, closed.err);
+  return answer(closed.ok.created ? 201 : 200, { path: closed.ok.path, size: closed.ok.size, etag: closed.ok.version });
+}
+const answer = (code, body) => ({ status: () => code, ok: () => code < 300, json: async () => body, text: async () => JSON.stringify(body) });
+async function refusal(request, err) {
+  let code = { ENOENT: 404, EEXIST: 409, EISDIR: 409, EBUSY: 409, EBADF: 409, ESTALE: 412, EFBIG: 413 }[err.errno] ?? 400;
+  if (err.errno === 'EACCES' || err.errno === 'EPERM') code = (await call(request, 'getcreds')).signed_in ? 403 : 401;
+  return answer(code, { error: err.detail || err.errno, errno: err.errno });
+}
+
 // One call: its errno, or null if it was done.
 export async function errno(request, call, options) {
   const [result] = await sys(request, [call], options);

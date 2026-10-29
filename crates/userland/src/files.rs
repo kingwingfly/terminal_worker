@@ -531,7 +531,7 @@ async fn destination(sys: &impl Sys, io: &Io<'_>, dest: &str) -> (String, bool) 
 }
 
 /// Whether the terminal's answer to `question` is yes.
-async fn yes(io: &Io<'_>, question: String) -> bool {
+pub(crate) async fn yes(io: &Io<'_>, question: String) -> bool {
     (io.ask)(question)
         .await
         .is_some_and(|answer| answer.trim_start().starts_with(['y', 'Y']))
@@ -733,7 +733,7 @@ pub async fn ln(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
 
 /// How much of a path must exist, for readlink -f, -e and -m, and realpath.
 #[derive(Clone, Copy, PartialEq)]
-enum Existing {
+pub(crate) enum Existing {
     /// All but its last part (-f, realpath's default).
     Above,
     /// All (-e).
@@ -744,7 +744,11 @@ enum Existing {
 
 /// `path` (absolute) with every link followed, `.` and `..` gone, as canonicalize_file_name
 /// makes it: a part at a time, each looked up, as `existing` says must be there.
-async fn canonical(sys: &impl Sys, path: &str, existing: Existing) -> Result<String, Error> {
+pub(crate) async fn canonical(
+    sys: &impl Sys,
+    path: &str,
+    existing: Existing,
+) -> Result<String, Error> {
     let mut todo: std::collections::VecDeque<String> = path
         .split('/')
         .filter(|part| !part.is_empty())

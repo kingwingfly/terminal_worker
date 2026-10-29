@@ -238,6 +238,65 @@ pub const XATTR_REPLACE: u8 = 2;
 pub const ACL_ACCESS: &str = "system.posix_acl_access";
 pub const ACL_DEFAULT: &str = "system.posix_acl_default";
 
+/// open(2)'s flags, with Linux's values. Content here is written whole, in chunks a writer may
+/// send in any order (`pwrite` on the Worker, a chunk at an index), and shows once complete:
+/// so an existing file is written only to be replaced (`O_TRUNC`), and appending (`O_APPEND`)
+/// grows a new file from its end, a chunk at a time, readable as it grows (a recording).
+pub const O_RDONLY: u32 = 0;
+pub const O_WRONLY: u32 = 1;
+pub const O_RDWR: u32 = 2;
+pub const O_ACCMODE: u32 = 3;
+pub const O_CREAT: u32 = 0o100;
+pub const O_EXCL: u32 = 0o200;
+pub const O_TRUNC: u32 = 0o1000;
+pub const O_APPEND: u32 = 0o2000;
+/// ioctl(2)'s FICLONE, as Linux numbers it: the file the descriptor writes takes the content of
+/// the one `arg` reads, shared, nothing copied (what `cp` does).
+pub const FICLONE: u32 = 0x4004_9409;
+
+/// What open(2) gave: the descriptor, and what a writer needs to write the file in chunks:
+/// their size, those already there (an unfinished file it goes on with), and whether the
+/// file is new.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Opened {
+    pub fd: u32,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub chunk_size: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub committed: Vec<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumed: bool,
+}
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+/// What close(2) of a descriptor that wrote gave: where the file is, its size and version.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Closed {
+    pub path: String,
+    pub size: u64,
+    /// Its version, which an editor gives `open` to replace only what it read.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created: bool,
+}
+/// A descriptor its session has open, as /proc/self/fd lists them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Fd {
+    pub fd: u32,
+    pub path: String,
+    pub flags: u32,
+    pub size: u64,
+    /// What has arrived of a file it writes.
+    pub received: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created: bool,
+}
+
 /// A system call. Paths are absolute, as user space makes them from its working directory;
 /// the kernel resolves them, `..` and links included, as Linux does.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -341,6 +400,45 @@ pub enum Call {
         #[serde(default)]
         nofollow: bool,
     },
+    /// A descriptor of the file at `path`, for this session (each browser is one): to read, or,
+    /// for writing, `size` bytes (none for `O_APPEND`, which grows). A writer naming an
+    /// unfinished file of its own account with the same `size` and `sha256` goes on with it,
+    /// once no other descriptor has written it lately (`lease`). `version`, given to replace a
+    /// file, must be the one it has (ESTALE otherwise), as an editor's save needs.
+    Open {
+        path: String,
+        flags: u32,
+        #[serde(default = "creation_mode")]
+        mode: u16,
+        #[serde(default)]
+        size: Option<u64>,
+        #[serde(default)]
+        sha256: Option<String>,
+        #[serde(default)]
+        version: Option<String>,
+    },
+    /// Let go of a descriptor. One that wrote completes its file, if every chunk is there; if
+    /// not, the descriptor goes all the same, with EIO, and the file waits, unfinished, for a
+    /// writer to go on with it. A recording is complete with what arrived.
+    Close {
+        fd: u32,
+    },
+    /// Keep a descriptor: one not kept for a while may be taken over by another writer (see
+    /// `open`), and, after longer, closed.
+    Lease {
+        fd: u32,
+    },
+    /// The session's descriptors.
+    Fds,
+    Ioctl {
+        fd: u32,
+        request: u32,
+        #[serde(default)]
+        arg: u64,
+    },
+}
+fn creation_mode() -> u16 {
+    0o666
 }
 
 /// The process a batch of calls runs for, and the calls.

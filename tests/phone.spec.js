@@ -1,6 +1,6 @@
 import { test, expect, devices } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { mkdirp, rmrf } from './sys.js';
+import { mkdirp, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const { defaultBrowserType, ...pixel } = devices['Pixel 7'];
@@ -75,7 +75,7 @@ test('keys a phone lacks are buttons, and Upload opens the chooser at once, befo
 
 test('long names keep one line and scroll; titles keep the file name; either pane hides; Escape closes only the dialog', async ({ page, context }) => {
   const headers = { Origin: origin }, long = 'a-very-long-file-name-that-does-not-fit-on-a-phone-screen-at-all.txt';
-  expect((await context.request.put('/api/file?path=' + encodeURIComponent(base + '/' + long), { headers, data: 'long\n' })).status()).toBe(201);
+  expect((await put(context.request, '/api/file?path=' + encodeURIComponent(base + '/' + long), { headers, data: 'long\n' })).status()).toBe(201);
   await page.goto('/');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await expect(page.locator('.busy')).toHaveText('↵');

@@ -1,5 +1,5 @@
 use super::*;
-use abi::{ACL_ACCESS, ACL_DEFAULT, XATTR_CREATE};
+use abi::{ACL_ACCESS, ACL_DEFAULT, O_TRUNC, O_WRONLY, XATTR_CREATE};
 use std::collections::BTreeSet;
 use terminal_worker_core::acl::Entries;
 
@@ -199,6 +199,47 @@ fn rmdir_and_unlink_take_one_name_as_linux_does() {
     unlink(&mut fs, &ann, "/tmp/full/f").unwrap();
     rmdir(&mut fs, &ann, "/tmp/full").unwrap();
     assert_eq!(errno(stat(&fs, &ann, "/tmp/full", true)), Errno::ENOENT);
+}
+
+#[test]
+fn open_follows_a_link_to_what_it_names_and_checks_as_linux_does() {
+    let mut fs = fs();
+    let (ann, bob) = (process(&user(1000, &[])), process(&user(1001, &[])));
+    dir(&mut fs, "/d", 1000, 0o755);
+    file(&mut fs, "/d/r", 0, 0o644);
+    symlink(&mut fs, &Identity::root(), "/d/new", "/d/dangling").unwrap();
+    assert!(matches!(
+        open(&fs, &ann, "/d/r", O_RDONLY, 0),
+        Ok(Opening::Existing { .. })
+    ));
+    assert_eq!(
+        errno(open(&fs, &ann, "/d/r", O_WRONLY | O_TRUNC, 0)),
+        Errno::EACCES
+    );
+    let excl = O_WRONLY | O_CREAT | O_EXCL;
+    assert_eq!(errno(open(&fs, &ann, "/d/r", excl, 0o666)), Errno::EEXIST);
+    assert_eq!(errno(open(&fs, &ann, "/d", O_RDONLY, 0)), Errno::EISDIR);
+    assert_eq!(
+        errno(open(&fs, &ann, "/d/none", O_WRONLY, 0)),
+        Errno::ENOENT
+    );
+    // A link leading nowhere makes what it names, unless O_EXCL, which takes it as there.
+    let Ok(Opening::New { path, node }) = open(&fs, &ann, "/d/dangling", O_WRONLY | O_CREAT, 0o666)
+    else {
+        panic!("a dangling link makes its target");
+    };
+    assert_eq!(
+        (path.as_str(), node.owner, node.mode & 0o777),
+        ("/d/new", 1000, 0o644)
+    );
+    assert_eq!(
+        errno(open(&fs, &ann, "/d/dangling", excl, 0o666)),
+        Errno::EEXIST
+    );
+    assert_eq!(
+        errno(open(&fs, &bob, "/d/x", O_WRONLY | O_CREAT, 0o666)),
+        Errno::EACCES
+    );
 }
 
 #[test]

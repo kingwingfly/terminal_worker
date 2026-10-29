@@ -4,7 +4,6 @@
 
 pub(crate) mod accounts;
 mod archives;
-mod files;
 
 use crate::db::Db;
 use serde::Deserialize;
@@ -84,14 +83,6 @@ fn show_id(c: &Db, who: &Identity) -> String {
     )
 }
 
-/// `name` in the directory `dir`.
-pub fn joined(dir: &str, name: &str) -> String {
-    if dir == "/" {
-        format!("/{name}")
-    } else {
-        format!("{dir}/{name}")
-    }
-}
 /// `value`, a path typed in `command`, from its working directory, `~` its home, physically: a
 /// link on the way, and at its end, followed, as most commands take a path (stat(2)).
 pub fn command_path(
@@ -161,33 +152,8 @@ pub struct Context<'a> {
     /// The whole reply, for a command that answers more than text, as a job does.
     pub reply: Option<Value>,
 }
-impl Context<'_> {
-    /// `value` as a path, a link at its end followed (stat(2)).
-    pub fn path(&self, value: &str) -> Result<String, String> {
-        command_path(self.db, self.who, self.command, value)
-    }
-    /// `value` as a name, a link at its end itself (lstat(2)).
-    pub fn entry(&self, value: &str) -> Result<String, String> {
-        entry_path(self.db, self.who, self.command, value)
-    }
-    /// Note how one of several things went: what failed is reported, and the rest kept.
-    pub fn each<T>(&mut self, result: Result<T, String>) -> Option<T> {
-        match result {
-            Ok(value) => {
-                self.succeeded = true;
-                Some(value)
-            }
-            Err(e) => {
-                self.errors.push(e);
-                None
-            }
-        }
-    }
-}
-
 /// Every command the server runs.
 pub static COMMANDS: &[&dyn ServerCommand] = &[
-    &files::Cp,
     &accounts::Whoami,
     &accounts::Id,
     &accounts::Groups,

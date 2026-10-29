@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { entry, listing, mkdirp, program, rmrf, sys } from './sys.js';
+import { entry, listing, mkdirp, program, put, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 // Each test signs in as its own client, so that it does not use up others' login rate limit.
 let headers;
@@ -16,7 +16,7 @@ test.beforeEach(async ({ request, page }) => {
   expect((await request.post('/api/login', { headers, data: { password } })).ok()).toBe(true);
   for (const dir of ['', '/docs', '/docs/deep', '/.hidden']) await mkdirp(request, base + dir);
   const files = { 'a.md': 'alpha\nbeta\n', 'docs/b.md': 'one\ntwo\nthree\n', 'docs/deep/spéctrum notes.md': 'γ\n', 'docs/c.txt': 'TODO later\ndone\nTODO now\n', '.hidden/d.md': 'x\n', 'x.tmp': '', 'y.tmp': '' };
-  for (const [name, text] of Object.entries(files)) expect((await request.put(file(base + '/' + name), { headers, data: text || ' ' })).status()).toBe(201);
+  for (const [name, text] of Object.entries(files)) expect((await put(request, file(base + '/' + name), { headers, data: text || ' ' })).status()).toBe(201);
 });
 test.afterEach(async ({ request }) => { await rmrf(request, base); });
 
@@ -31,8 +31,14 @@ async function terminal(page) {
 }
 async function run(page, text) {
   const input = page.getByRole('combobox', { name: 'Terminal command' });
-  await expect(page.locator('#command').locator('xpath=ancestor::form').locator('.busy')).toHaveText('↵');
+  const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
+  await expect(busy).toHaveText('↵');
   await input.fill(text); await input.press('Enter');
+}
+// Run `text` to its end, for what is read of it next.
+async function done(page, text) {
+  await run(page, text);
+  await expect(page.locator('#command').locator('xpath=ancestor::form').locator('.busy')).toHaveText('↵');
 }
 const last = page => page.locator('.terminal-panel:not([hidden]) .transcript pre').last();
 async function output(page, text) { await run(page, text); await expect(page.locator('#command').locator('xpath=ancestor::form').locator('.busy')).toHaveText('↵'); return (await last(page).textContent()).trim(); }
@@ -123,7 +129,7 @@ test('wildcard suffixes use search permission and quoted bracket characters stay
   expect(await output(page, 'echo d*/*.md')).toBe('d*/*.md');
   expect(await output(page, 'echo docs/../a*')).toBe('docs/../a.md');
   // A [ that closes no set is a name, which search permission finds.
-  expect((await request.put(file(base + '/docs/x['), { headers, data: ' ' })).status()).toBe(201);
+  expect((await put(request, file(base + '/docs/x['), { headers, data: ' ' })).status()).toBe(201);
   expect(await output(page, 'echo d*/x[')).toBe('docs/x[');
   expect((await command(request, ['chmod', '700', base + '/docs'])).ok()).toBe(true);
   expect(await output(page, 'echo d*/b.md')).toBe('d*/b.md');
@@ -134,15 +140,15 @@ test('wildcard suffixes use search permission and quoted bracket characters stay
 
 test('mv and cp follow Linux defaults, ask with -i, share content, and refuse what rename would', async ({ page, request }) => {
   await terminal(page);
-  await run(page, 'cp -r docs copy'); await run(page, 'mv a.md docs/');
+  await done(page, 'cp -r docs copy'); await done(page, 'mv a.md docs/');
   expect(await output(page, 'fd -t f -e md | sort')).toBe('copy/b.md\ncopy/deep/spéctrum notes.md\ndocs/a.md\ndocs/b.md\ndocs/deep/spéctrum notes.md');
   // Removing the original keeps the copy's content.
-  await run(page, 'rm -r docs/deep');
+  await done(page, 'rm -r docs/deep');
   expect(await (await request.get(file(base + '/copy/deep/spéctrum notes.md'))).text()).toBe('γ\n');
   // An existing file is replaced, unless -n; -i asks.
-  await run(page, 'cp docs/b.md copy/deep/spéctrum\\ notes.md');
+  await done(page, 'cp docs/b.md copy/deep/spéctrum\\ notes.md');
   expect(await (await request.get(file(base + '/copy/deep/spéctrum notes.md'))).text()).toBe('one\ntwo\nthree\n');
-  await run(page, 'mv -n docs/a.md copy/b.md');
+  await done(page, 'mv -n docs/a.md copy/b.md');
   expect(await (await request.get(file(base + '/copy/b.md'))).text()).toBe('one\ntwo\nthree\n');
   await run(page, 'mv -i docs/a.md copy/b.md');
   await expect(last(page)).toContainText("mv: overwrite 'copy/b.md'?");
@@ -175,7 +181,7 @@ test('mv and cp follow Linux defaults, ask with -i, share content, and refuse wh
 });
 
 test('tabs run at once with their own directory and history, and Ctrl+C stops a tab between steps', async ({ page, request }) => {
-  for (let i = 0; i < 60; i++) expect((await request.put(file(`${base}/docs/n${i}.dat`), { headers, data: String(i) })).status()).toBe(201);
+  for (let i = 0; i < 60; i++) expect((await put(request, file(`${base}/docs/n${i}.dat`), { headers, data: String(i) })).status()).toBe(201);
   const input = await terminal(page);
   await run(page, 'pwd');
   // A second tab starts where the first is, then goes its own way.
@@ -213,8 +219,8 @@ test('cp and mv -i ask as well under sudo, xargs and fd -x, about each file they
   const transcript = page.locator('.terminal-panel:not([hidden]) .transcript');
   const answer = async text => { await expect(busy).toHaveText('Answer ↵'); await page.locator('#command').fill(text); await page.locator('#command').press('Enter'); };
   const read = async path => (await request.get(file(base + '/' + path), { headers })).text();
-  // cp, still the server's, asks of the path; mv, user space's, as GNU's does, of the name given.
-  const asked = path => `overwrite '${base}/${path}'? (y/n)`;
+  // cp and mv ask, as GNU's do, of the name given.
+  const asked = path => `overwrite '${path}'?`;
   // xargs and fd -x run each cp -i on its own, which asks: no keeps the file, yes replaces it.
   await run(page, 'echo a.md | xargs -I {} cp -i {} docs/b.md');
   await expect(transcript).toContainText('cp: ' + asked('docs/b.md'));
@@ -231,8 +237,8 @@ test('cp and mv -i ask as well under sudo, xargs and fd -x, about each file they
   expect(await read('docs/b.md')).toBe('alpha\nbeta\n');
   // cp -ri asks about each file below that exists, and copies the others.
   await run(page, 'cp -r docs copy'); await expect(busy).toHaveText('↵');
-  expect((await request.put(file(base + '/docs/deep/spéctrum notes.md') + '&overwrite=true', { headers, data: 'δ\n' })).ok()).toBe(true);
-  expect((await request.put(file(base + '/docs/deep/new.md'), { headers, data: 'new\n' })).status()).toBe(201);
+  expect((await put(request, file(base + '/docs/deep/spéctrum notes.md') + '&overwrite=true', { headers, data: 'δ\n' })).ok()).toBe(true);
+  expect((await put(request, file(base + '/docs/deep/new.md'), { headers, data: 'new\n' })).status()).toBe(201);
   await run(page, 'cp -ri docs/deep copy');
   await expect(transcript).toContainText('cp: ' + asked('copy/deep/spéctrum notes.md'));
   await answer('y'); await expect(busy).toHaveText('↵');

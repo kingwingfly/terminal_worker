@@ -1,12 +1,12 @@
 //! The authority's requests: each decides and writes in one synchronous transaction, after any
 //! awaiting (reading the body, hashing a password) is done. It never touches file bytes; the
 //! Worker asks it whether it may, and tells it what it wrote.
-use crate::db::{Db, File, etag, transact};
+use crate::db::{Db, File, transact};
 use crate::{auth, commands, devices, jobs, sound};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use terminal_worker_core::devices::{PRESENT, SOUND};
-use terminal_worker_core::{CHUNK_SIZE, MAX_FILE, MAX_UPLOAD, mime, permissions::*, resolve};
+use terminal_worker_core::{CHUNK_SIZE, MAX_FILE, mime, permissions::*, resolve};
 use worker::*;
 
 /// How long an upload may go without a new chunk before it is cancelled, in seconds.
@@ -18,12 +18,9 @@ pub const RECORDING_CHUNK: u64 = 256 * 1024;
 /// The most a recording may be: as many chunks as one read can take, with room for what else it
 /// asks (240 MiB, about eight hours at 64 kbit/s).
 pub const RECORDING_MAX: u64 = RECORDING_CHUNK * 960;
-/// How long a recording's page may go unheard (chunks, its hold) before the recording is
+/// How long a recording's page may go unheard (chunks, its lease) before the recording is
 /// completed with what arrived, in seconds.
 pub const RECORDING_IDLE: u64 = 10 * 60;
-/// What a recording that reached the most it may be is told: it takes no more.
-const RECORDING_FULL: &str =
-    "The recording reached the most a recording may be (240 MB, about eight hours)";
 
 pub struct Reply {
     pub status: u16,
@@ -72,6 +69,21 @@ impl Reply {
 }
 
 /// An error reply whose status follows the message: guests are asked to sign in.
+/// A failed system call as HTTP: its errno and words, with a status that says as much.
+pub fn errno_reply(error: &abi::Error) -> Reply {
+    use abi::Errno::*;
+    let status = match error.errno {
+        EACCES | EPERM => 403,
+        ENOENT => 404,
+        EBADF | EBUSY | EEXIST => 409,
+        ESTALE => 412,
+        EFBIG => 413,
+        _ => 400,
+    };
+    let mut reply = Reply::error(&error.to_string(), status);
+    reply.body["errno"] = json!(error.errno);
+    reply
+}
 pub fn denied(message: &str, who: &Identity) -> Reply {
     let status = if commands::is_permission_error(message) {
         if who.id == GUEST { 401 } else { 403 }
@@ -312,341 +324,52 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 "readable": db.readable(&file),
             }))
         }),
-        (Method::Post, "/internal/upload/begin") => {
-            #[derive(Deserialize)]
-            struct Begin {
-                size: u64,
-                chunk_size: u64,
-                #[serde(default)]
-                overwrite: bool,
-                if_match: Option<String>,
-                if_none_match: Option<String>,
-            }
-            let Ok(begin) = req.json::<Begin>().await else {
-                return Ok(Reply::error("Invalid upload request", 400));
-            };
+        // pwrite(2) through a descriptor, as the Worker streams its bytes to R2 (files.rs):
+        // where the chunk goes, then that it is there.
+        (Method::Get, "/internal/pwrite") => {
+            let fd = param("fd").parse::<u32>().unwrap_or(u32::MAX);
+            let index = param("index").parse::<u64>().unwrap_or(u64::MAX);
+            let length = param("length").parse::<u64>().unwrap_or(0);
+            let guest = auth::guest_key(req);
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
-                begin_upload(
-                    db,
-                    &who,
-                    &path,
-                    Begun {
-                        size: begin.size,
-                        chunk_size: begin.chunk_size,
-                        limit: MAX_UPLOAD,
-                        sha256: None,
-                        overwrite: begin.overwrite,
-                        if_match: begin.if_match,
-                        if_none_match: begin.if_none_match,
-                        mode: None,
-                        hold: false,
-                    },
-                )
+                let sid = auth::sid(db, key.as_deref(), guest.as_deref()).unwrap_or_default();
+                match crate::fds::pwrite(db, &sid, &who, fd, index, length) {
+                    Ok((key, mime)) => Reply::ok(json!({"key": key, "mime": mime})),
+                    Err(error) => errno_reply(&error).keep(),
+                }
             })
         }
-        (Method::Post, "/api/uploads") => {
+        (Method::Post, "/internal/pwrite/commit") => {
             #[derive(Deserialize)]
-            struct Start {
-                /// What it will be; a recording has none yet.
-                size: Option<u64>,
+            struct Written {
+                fd: u32,
+                index: u64,
+                key: String,
                 sha256: Option<String>,
-                #[serde(default)]
-                overwrite: bool,
-                if_match: Option<String>,
-                /// A recording (`stream`): a new file of no size yet, which grows.
-                #[serde(default)]
-                record: bool,
-                /// A recording's ACL entries, as setfacl -m takes them (stream -m).
-                #[serde(default)]
-                acl: Option<String>,
+                length: u64,
             }
-            if !body_size(req, 4096) {
-                return Ok(Reply::error("Invalid upload request", 400));
-            }
-            let Ok(start) = req.json::<Start>().await.map_err(|_| ()).and_then(|start| {
-                if start.record || start.size.is_some() {
-                    Ok(start)
-                } else {
-                    Err(())
-                }
-            }) else {
-                return Ok(Reply::error("Invalid upload request", 400));
+            let Ok(chunk) = req.json::<Written>().await else {
+                return Ok(Reply::error("Invalid write", 400));
             };
-            if start
-                .sha256
-                .as_ref()
-                .is_some_and(|h| h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()))
-            {
-                return Ok(Reply::error(
-                    "The SHA-256 must be 64 hexadecimal digits",
-                    400,
-                ));
-            }
-            if start.record && !matches!(mime(&path), "audio/webm" | "video/webm") {
-                return Ok(Reply::error(
-                    "A recording is Opus in WebM: name it NAME.weba",
-                    400,
-                ));
-            }
+            let guest = auth::guest_key(req);
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
-                let reply = begin_upload(
+                let sid = auth::sid(db, key.as_deref(), guest.as_deref()).unwrap_or_default();
+                let written = crate::fds::written(
                     db,
+                    &sid,
                     &who,
-                    &path,
-                    Begun {
-                        size: start.size.filter(|_| !start.record).unwrap_or(0),
-                        chunk_size: if start.record {
-                            RECORDING_CHUNK
-                        } else {
-                            CHUNK_SIZE
-                        },
-                        limit: MAX_FILE,
-                        sha256: start.sha256.filter(|_| !start.record),
-                        overwrite: start.overwrite && !start.record,
-                        if_match: start.if_match,
-                        if_none_match: None,
-                        mode: None,
-                        hold: true,
-                    },
+                    chunk.fd,
+                    chunk.index,
+                    &chunk.key,
+                    chunk.sha256.as_deref(),
+                    chunk.length,
                 );
-                if start.record
-                    && reply.status < 400
-                    && let Some(id) = reply.body["id"].as_str().map(str::to_string)
-                {
-                    db.record_file(&id);
-                    db.set_expiry("upload", &id, auth::now() + RECORDING_IDLE);
-                    // Who may hear it, as it is made (stream -m), or it is not made.
-                    if let (Some(entries), Some(made)) = (&start.acl, db.showing(&id).pop())
-                        && let Err(message) = devices::grant(db, &who, &made, entries)
-                    {
-                        return denied(&message, &who);
-                    }
+                match written {
+                    Ok(value) => Reply::ok(value),
+                    Err(error) => errno_reply(&error).keep(),
                 }
-                reply
-            })
-        }
-        // The page sending an upload is still there: it keeps its hold.
-        (Method::Post, "/api/uploads/hold") => {
-            let id = param("id");
-            let hold = param("hold");
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                let Some(file) = db.file(&id).filter(|f| !f.complete()) else {
-                    return Reply::error("Upload was cancelled or has expired", 409);
-                };
-                if file.uploader != who.id {
-                    return denied(
-                        "Permission denied: this upload belongs to another account",
-                        &who,
-                    );
-                }
-                // A hold let go of is not taken back: a heartbeat sent before the release may
-                // arrive after it. A page that goes on sending without one is refused once
-                // another resumes the upload, holding it.
-                match held(db, &id, Some(&hold)) {
-                    Ok(()) => {
-                        // A recording lasts while its page is heard; its live sound, as that page
-                        // keeps it (/api/sound/hold).
-                        if file.recording() {
-                            db.set_expiry("upload", &id, auth::now() + RECORDING_IDLE);
-                        }
-                        Reply::ok(json!({"held": true}))
-                    }
-                    Err(reply) => reply,
-                }
-            })
-        }
-        // The page stopped sending the upload, which another may now resume at once.
-        (Method::Post, "/api/uploads/release") => {
-            let id = param("id");
-            let hold = param("hold");
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                if db.file(&id).is_some_and(|f| f.uploader == who.id) {
-                    db.release_hold(&id, &hold);
-                }
-                Reply::ok(json!({"released": true}))
-            })
-        }
-        (Method::Get, "/api/uploads") => {
-            let id = param("id");
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                let Some(file) = db.file(&id).filter(|f| !f.complete()) else {
-                    return Reply::error(
-                        "Upload does not exist; it was completed, cancelled or has expired",
-                        404,
-                    );
-                };
-                if file.uploader != who.id {
-                    return denied(
-                        "Permission denied: this upload belongs to another account",
-                        &who,
-                    );
-                }
-                let committed: Vec<u64> = db.chunks(&id).into_iter().map(|c| c.idx).collect();
-                Reply::ok(json!({
-                    "id": id, "path": file.target, "size": file.size, "chunk_size": file.chunk_size,
-                    "sha256": file.sha256, "committed": committed,
-                }))
-            })
-        }
-        (Method::Post, "/api/uploads/complete") => {
-            let id = param("id");
-            let hold = param("hold");
-            // A recording's, which nobody knew before it ended.
-            let sha256 = Some(param("sha256"))
-                .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()));
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                if let Some(sha256) = &sha256
-                    && let Some(file) = db
-                        .file(&id)
-                        .filter(|f| f.recording() && f.uploader == who.id)
-                {
-                    db.grow_file(&id, file.size, Some(sha256));
-                }
-                finish_upload(db, &who, &id, Some(&hold), true)
-            })
-        }
-        (Method::Delete, "/api/uploads") => {
-            let id = param("id");
-            let hold = param("hold");
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                let Some(file) = db.file(&id).filter(|f| !f.complete()) else {
-                    return Reply::ok(json!({"cancelled":true}));
-                };
-                if file.uploader != who.id && who.id != 0 {
-                    return denied(
-                        "Permission denied: this upload belongs to another account",
-                        &who,
-                    );
-                }
-                // A page's Ctrl+C cancels the upload it holds, not one another page took over;
-                // jobs cancel ID, which holds nothing, cancels it wherever it goes on.
-                if !hold.is_empty() && db.hold(&id).is_some_and(|(token, _)| token != hold) {
-                    return Reply::error(ELSEWHERE, 409);
-                }
-                // A recording is stopped, not cancelled: it keeps what arrived, as when its page
-                // goes, and its live sound ends.
-                if file.recording() {
-                    finish_recording(db, &file);
-                    return Reply::ok(json!({"stopped":true}));
-                }
-                cancel(db, &file);
-                Reply::ok(json!({"cancelled":true}))
-            })
-        }
-        (Method::Get, "/internal/upload/chunk") => {
-            let id = param("id");
-            let index = param("index").parse::<u64>().ok();
-            let length = param("length").parse::<u64>().ok();
-            let hold = param("hold");
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                let Some(file) = db.file(&id).filter(|f| !f.complete()) else {
-                    return Reply::error("Upload was cancelled or has expired", 409);
-                };
-                if file.uploader != who.id {
-                    return denied(
-                        "Permission denied: this upload belongs to another account",
-                        &who,
-                    );
-                }
-                if let Err(reply) = held(db, &id, Some(&hold)) {
-                    return reply;
-                }
-                // A recording takes its next chunk, whole or, last, short; or one sent again.
-                if file.recording()
-                    && index == Some(file.chunk_count())
-                    && file.size.is_multiple_of(file.chunk_size)
-                {
-                    if !length.is_some_and(|n| n > 0 && n <= file.chunk_size) {
-                        return Reply::error(
-                            &format!("A recording's chunk is at most {} bytes", file.chunk_size),
-                            400,
-                        );
-                    }
-                    if file.size + length.unwrap_or_default() > RECORDING_MAX {
-                        return Reply::error(RECORDING_FULL, 413);
-                    }
-                    let (path, _) = match destination(db, &who, &file) {
-                        Ok(found) => found,
-                        Err(reply) => return reply,
-                    };
-                    let index = file.chunk_count();
-                    return Reply::ok(json!({"key": chunk_key(&id, index), "mime": mime(&path)}));
-                }
-                let Some(index) = index.filter(|i| *i < file.chunk_count()) else {
-                    return Reply::error("Chunk index is out of range", 400);
-                };
-                if length != Some(file.chunk_len(index)) {
-                    return Reply::error(
-                        &format!("Chunk {index} must be {} bytes", file.chunk_len(index)),
-                        400,
-                    );
-                }
-                let (path, _) = match destination(db, &who, &file) {
-                    Ok(found) => found,
-                    Err(reply) => return reply,
-                };
-                Reply::ok(json!({"key": chunk_key(&id, index), "mime": mime(&path)}))
-            })
-        }
-        (Method::Post, "/internal/upload/commit") => {
-            #[derive(Deserialize)]
-            struct Commit {
-                id: String,
-                index: Option<u64>,
-                key: Option<String>,
-                sha256: Option<String>,
-                #[serde(default)]
-                complete: bool,
-                hold: Option<String>,
-                /// The chunk's length, which a recording grows by.
-                length: Option<u64>,
-            }
-            let Ok(commit) = req.json::<Commit>().await else {
-                return Ok(Reply::error("Invalid upload request", 400));
-            };
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                commit_upload(
-                    db,
-                    &who,
-                    &commit.id,
-                    commit.index.zip(commit.key),
-                    commit.sha256,
-                    commit.hold.as_deref(),
-                    commit.complete,
-                    commit.length,
-                )
-            })
-        }
-        (Method::Post, "/internal/upload/abort") => {
-            #[derive(Deserialize)]
-            struct Abort {
-                id: String,
-            }
-            let Ok(abort) = req.json::<Abort>().await else {
-                return Ok(Reply::error("Invalid upload request", 400));
-            };
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                let Some(file) = db.file(&abort.id) else {
-                    return Reply::ok(json!({"cancelled":true}));
-                };
-                if file.uploader != who.id && who.id != 0 {
-                    return denied(
-                        "Permission denied: this upload belongs to another account",
-                        &who,
-                    );
-                }
-                cancel(db, &file);
-                Reply::ok(json!({"cancelled":true}))
             })
         }
         (_, endpoint)
@@ -708,17 +431,7 @@ fn job_reply(
                 view
             })
             .collect();
-        let uploads: Vec<Value> = db
-            .uploads_of(who.id)
-            .iter()
-            .map(|f| {
-                json!({
-                    "id": f.id, "path": f.target, "size": f.size, "received": db.received(f),
-                    "recording": f.recording(),
-                })
-            })
-            .collect();
-        return Reply::ok(json!({"jobs": jobs, "uploads": uploads}));
+        return Reply::ok(json!({ "jobs": jobs }));
     }
     let Some(job) = db.job(id) else {
         return Reply::error("Job does not exist", 404);
@@ -893,14 +606,8 @@ fn job_reply(
                 &real,
                 Begun {
                     size: body["size"].as_u64().unwrap_or(0),
-                    chunk_size: CHUNK_SIZE,
-                    limit: MAX_FILE,
-                    sha256: None,
                     overwrite,
-                    if_match: None,
-                    if_none_match: None,
                     mode: body["mode"].as_u64().map(|m| (m & 0o7777) as u16),
-                    hold: false,
                 },
             )
         }
@@ -937,10 +644,7 @@ fn job_reply(
                 .as_u64()
                 .zip(body["key"].as_str().map(String::from)),
             body["sha256"].as_str().map(String::from),
-            None,
             body["complete"] == true,
-            // Jobs write whole files, never recordings.
-            None,
         ),
         (Method::Post, "/internal/job/abort") => {
             if let Some(file) = db.file(body["upload"].as_str().unwrap_or_default())
@@ -1013,25 +717,18 @@ pub fn chunk_key(file: &str, index: u64) -> String {
     format!("chunks/{file}/{index}-{}", &auth::random_token()[..16])
 }
 /// Whether `key` is an object `chunk_key` named for chunk `index` of `file`.
-fn chunk_of(key: &str, file: &str, index: u64) -> bool {
+pub fn chunk_of(key: &str, file: &str, index: u64) -> bool {
     key.strip_prefix(&format!("chunks/{file}/{index}-"))
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// An upload to begin: `size` bytes, in chunks of `chunk_size`.
+/// A file an archive job writes: `size` bytes, written over one there if `overwrite`, with the
+/// archive's mode for a new one. Jobs write as their process; they move onto descriptors with
+/// processes (phase 5 of the system calls).
 struct Begun {
     size: u64,
-    chunk_size: u64,
-    /// The most bytes this way of uploading may write.
-    limit: u64,
-    sha256: Option<String>,
     overwrite: bool,
-    if_match: Option<String>,
-    if_none_match: Option<String>,
-    /// The mode a new file gets, if not 644, as one extracted from an archive.
     mode: Option<u16>,
-    /// Whether the page beginning it sends it in chunks, holding it (`HOLD`).
-    hold: bool,
 }
 
 /// Start writing to `path`: a new file appears at once, still uploading, and can be read as it
@@ -1039,14 +736,8 @@ struct Begun {
 fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply {
     let Begun {
         size,
-        chunk_size,
-        limit,
-        sha256,
         overwrite,
-        if_match,
-        if_none_match,
         mode,
-        hold,
     } = begin;
     // A link is written through, as open(2) does: one leading nowhere makes what it names.
     let real = real!(db, who, path, true);
@@ -1055,94 +746,28 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
     if path == "/" {
         return Reply::error("Cannot write to the root directory", 400);
     }
-    if size > limit {
+    if size > MAX_FILE {
         return Reply::error(
-            &format!("Maximum file size is {} MB", limit / 1_000_000),
+            &format!("Maximum file size is {} MB", MAX_FILE / 1_000_000),
             413,
         );
     }
     let old = db.node(path);
     let now = auth::now();
-    // The same file, to the same path, by the same account: resume its upload, from this page
-    // or another, unless a page is sending it now.
-    if sha256.is_some()
-        && let Some(file) = old
-            .as_ref()
-            .and_then(|n| n.file.as_deref())
-            .and_then(|id| db.file(id))
-        && !file.complete()
-        && file.uploader == who.id
-        && file.size == size
-        && file.sha256 == sha256
-    {
-        if db.hold(&file.id).is_some_and(|(_, held)| now < held + HOLD) {
-            return Reply::error(
-                &format!(
-                    "{path} is being uploaded from another tab or device; wait for it to finish, or stop it there"
-                ),
-                409,
-            );
-        }
-        let token = hold.then(auth::random_token);
-        if let Some(token) = &token {
-            db.set_hold(&file.id, token, now);
-        }
-        let committed: Vec<u64> = db.chunks(&file.id).into_iter().map(|c| c.idx).collect();
-        return Reply::ok(json!({
-            "id": file.id, "created": true, "resumed": true, "size": size,
-            "chunk_size": file.chunk_size, "committed": committed,
-            "mode": old.as_ref().map(|n| n.mode), "hold": token,
-        }));
-    }
-    if old.is_none() && if_match.is_some() {
-        return Reply::error("File was deleted or moved; save it as a new file", 412);
-    }
     let base = if let Some(old) = &old {
         acl!(db.access(who, path, WRITE), who);
         if old.directory {
             return Reply::error("A directory with this name already exists", 409);
         }
-        if if_none_match.as_deref() == Some("*") {
-            return Reply::error("File was created by another session; reopen it", 412);
-        }
-        if let Some(expected) = &if_match
-            && expected != "*"
-            && Some(expected.as_str()) != old.file.as_deref().map(etag).as_deref()
-        {
-            return Reply::error(
-                "File changed in another session; reopen it or download your draft to avoid overwriting changes",
-                412,
-            );
-        }
         if !overwrite {
-            let uploading = old
-                .file
-                .as_deref()
-                .and_then(|id| db.file(id))
-                .is_some_and(|f| !f.complete());
-            return Reply::error(
-                if uploading {
-                    "A file of this name is still being uploaded; wait for it to finish, or upload under another name"
-                } else {
-                    "File already exists; rename it before uploading"
-                },
-                409,
-            );
+            return Reply::error("File already exists; rename it before uploading", 409);
         }
         old.file.clone()
     } else {
         acl!(db.writable_parent(who, path), who);
         None
     };
-    let id = db.create_file(
-        size,
-        chunk_size,
-        sha256.as_deref(),
-        who.id,
-        path,
-        base.as_deref(),
-        now,
-    );
+    let id = db.create_file(size, CHUNK_SIZE, None, who.id, path, base.as_deref(), now);
     db.set_expiry("upload", &id, now + UPLOAD_TTL);
     // A new file has its mode from the start, so that nobody reads it as it arrives who may not
     // once it is there; an overwritten one keeps its own.
@@ -1169,84 +794,28 @@ fn begin_upload(db: &mut Db, who: &Identity, path: &str, begin: Begun) -> Reply 
             node.mode
         }
     };
-    let token = hold.then(auth::random_token);
-    if let Some(token) = &token {
-        db.set_hold(&id, token, now);
-    }
     Reply::ok(json!({
-        "id": id, "created": old.is_none(), "size": size, "chunk_size": chunk_size.max(1),
-        "mode": mode, "hold": token,
+        "id": id, "created": old.is_none(), "size": size, "chunk_size": CHUNK_SIZE,
+        "mode": mode,
     }))
 }
 
-/// How long an upload stays with the page sending it after it was last heard from, which is
-/// every few seconds while it is there (upload.mjs): until then, no other page resumes it.
-const HOLD: u64 = 20;
-/// Why a page may not go on with an upload.
-const ELSEWHERE: &str = "the upload goes on from another tab or device";
-
-/// Whether the page that sent `hold` may go on with upload `file`: the page holding it, which
-/// is heard from again, or any, for an upload no page holds (one request, or a job's).
-fn held(db: &mut Db, file: &str, hold: Option<&str>) -> std::result::Result<(), Reply> {
-    let Some((token, _)) = db.hold(file) else {
-        return Ok(());
-    };
-    if hold != Some(token.as_str()) {
-        return Err(Reply::error(ELSEWHERE, 409));
-    }
-    db.set_hold(file, &token, auth::now());
-    Ok(())
-}
-
-/// Record `chunk`, an index and the object written for it, as part of upload `id`, and complete
-/// the upload if asked. A chunk is committed once: what readers have seen of it never changes,
-/// and an object written for nothing goes to the garbage.
-#[allow(clippy::too_many_arguments)]
+/// Record `chunk`, an index and the object written for it, as part of the job's upload `id`,
+/// and complete the upload if asked. A chunk is committed once: what readers have seen of it
+/// never changes, and an object written for nothing goes to the garbage.
 fn commit_upload(
     db: &mut Db,
     who: &Identity,
     id: &str,
     chunk: Option<(u64, String)>,
     sha256: Option<String>,
-    hold: Option<&str>,
     complete: bool,
-    length: Option<u64>,
 ) -> Reply {
     let Some((index, key)) = chunk else {
-        return finish_upload(db, who, id, hold, complete);
+        return finish_upload(db, who, id, complete);
     };
     if !chunk_of(&key, id, index) {
         return Reply::error("Chunk key does not belong to this upload", 400);
-    }
-    // A recording's next chunk, which it grows by.
-    let growing = db.file(id).filter(|file| {
-        file.recording()
-            && file.uploader == who.id
-            && index == file.chunk_count()
-            && file.size.is_multiple_of(file.chunk_size)
-    });
-    if let Some(file) = growing {
-        let length = length.filter(|n| *n > 0 && *n <= file.chunk_size);
-        let refused = match (
-            length,
-            held(db, id, hold).and_then(|()| destination(db, who, &file)),
-        ) {
-            (None, _) => Some(Reply::error("A recording's chunk must say its length", 400)),
-            (Some(length), _) if file.size + length > RECORDING_MAX => {
-                Some(Reply::error(RECORDING_FULL, 413))
-            }
-            (_, Err(reply)) => Some(reply),
-            _ => None,
-        };
-        if let (Some(length), None) = (length, &refused) {
-            let now = auth::now();
-            db.add_chunk(id, index, &key, sha256.as_deref(), now);
-            db.grow_file(id, index * file.chunk_size + length, None);
-            db.set_expiry("upload", id, now + RECORDING_IDLE);
-            return Reply::ok(json!({"committed":index}));
-        }
-        db.discard(&key);
-        return refused.expect("refused").keep();
     }
     let refused = match db.file(id) {
         None => Some(Reply::error("Upload was cancelled or has expired", 409)),
@@ -1258,7 +827,7 @@ fn commit_upload(
         Some(file) if index >= file.chunk_count() => {
             Some(Reply::error("Chunk index is out of range", 400))
         }
-        Some(file) => match held(db, id, hold).and_then(|()| destination(db, who, &file)) {
+        Some(file) => match destination(db, who, &file) {
             Err(reply) => Some(reply),
             Ok(_) => match db.committed_hash(id, index) {
                 // Sent again: the chunk committed first stays.
@@ -1283,16 +852,10 @@ fn commit_upload(
     if !complete {
         return Reply::ok(json!({"committed":index}));
     }
-    finish_upload(db, who, id, hold, true)
+    finish_upload(db, who, id, true)
 }
-/// Complete upload `id` if asked and every chunk is committed, by the page holding it.
-fn finish_upload(
-    db: &mut Db,
-    who: &Identity,
-    id: &str,
-    hold: Option<&str>,
-    complete: bool,
-) -> Reply {
+/// Complete the job's upload `id` if asked and every chunk is committed.
+fn finish_upload(db: &mut Db, who: &Identity, id: &str, complete: bool) -> Reply {
     let Some(file) = db.file(id) else {
         return Reply::error("Upload was cancelled or has expired", 409);
     };
@@ -1307,9 +870,6 @@ fn finish_upload(
     }
     if !complete {
         return Reply::ok(json!({"committed":null}));
-    }
-    if let Err(reply) = held(db, id, hold) {
-        return reply;
     }
     let (path, node) = match destination(db, who, &file) {
         Ok(found) => found,
@@ -1329,9 +889,6 @@ fn finish_upload(
         );
     }
     db.finish_file(id);
-    if file.recording() {
-        end_live(db, &file, &path);
-    }
     Reply::ok(json!({"path":path,"size":file.size,"etag":file.etag()}))
         .status(if file.base.is_none() { 201 } else { 200 })
 }

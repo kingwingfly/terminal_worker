@@ -113,6 +113,56 @@ test('a guest is uid guest; sudo runs a batch as root only once its account has 
   await guest.context.dispose();
 });
 
+test('descriptors are their session\'s, a browser signed out its own; a clone shares content; a stale version is refused', async () => {
+  const O_WRONLY = 0o1, O_CREAT = 0o100, O_EXCL = 0o200, O_TRUNC = 0o1000, FICLONE = 0x40049409;
+  const dir = base + '/fds';
+  await root.batch([{ mkdir: { path: base, mode: 0o777 } }, { mkdir: { path: dir, mode: 0o777 } }, { chmod: { path: dir, mode: 0o1777 } }]);
+  const write = (session, path, text) => async () => {
+    const opened = await session.sys({ open: { path, flags: O_WRONLY | O_CREAT | O_EXCL, mode: 0o644, size: text.length } });
+    expect((await session.context.put(`/api/pwrite?fd=${opened.fd}&index=0`, { data: text })).ok()).toBe(true);
+    return session.sys({ close: { fd: opened.fd } });
+  };
+  // Two browsers signed out, each a session of its own by the cookie it is given: each has its
+  // own descriptor 3, and neither writes through the other's.
+  const one = await session(), two = await session();
+  try {
+    const first = await one.sys({ open: { path: dir + '/one.txt', flags: O_WRONLY | O_CREAT, mode: 0o644, size: 3 } });
+    const second = await two.sys({ open: { path: dir + '/two.txt', flags: O_WRONLY | O_CREAT, mode: 0o644, size: 3 } });
+    expect([first.fd, second.fd]).toEqual([3, 3]);
+    expect((await two.sys('fds')).map(fd => fd.path)).toEqual([dir + '/two.txt']);
+    expect((await two.context.put(`/api/pwrite?fd=3&index=0`, { data: 'two' })).ok()).toBe(true);
+    expect((await one.context.put(`/api/pwrite?fd=3&index=0`, { data: 'one' })).ok()).toBe(true);
+    expect((await one.sys({ close: { fd: 3 } })).path).toBe(dir + '/one.txt');
+    expect(await one.sys({ close: { fd: 3 } })).toBe('EBADF');
+    expect((await two.sys({ close: { fd: 3 } })).created).toBe(true);
+    expect(await (await root.context.get('/api/file?path=' + encodeURIComponent(dir + '/one.txt'))).text()).toBe('one');
+    expect(await (await root.context.get('/api/file?path=' + encodeURIComponent(dir + '/two.txt'))).text()).toBe('two');
+  } finally { await one.context.dispose(); await two.context.dispose(); }
+  // A clone takes the content it reads, shared: the same version, nothing copied.
+  expect((await write(ann, dir + '/a.txt', 'alpha')()).size).toBe(5);
+  const [reading, writing] = await ann.batch([
+    { open: { path: dir + '/a.txt', flags: 0 } },
+    { open: { path: dir + '/b.txt', flags: O_WRONLY | O_CREAT | O_EXCL, mode: 0o600, size: 5 } },
+  ]);
+  const cloned = await ann.batch([
+    { ioctl: { fd: writing.ok.fd, request: FICLONE, arg: reading.ok.fd } },
+    { close: { fd: writing.ok.fd } }, { close: { fd: reading.ok.fd } },
+  ]);
+  expect(cloned.map(r => 'ok' in r)).toEqual([true, true, true]);
+  expect(cloned[1].ok.version).toBe(cloned[2].ok.version);
+  expect(await (await ann.context.get('/api/file?path=' + encodeURIComponent(dir + '/b.txt'))).text()).toBe('alpha');
+  // Replacing what is not the version given, or reading what may not be read, is refused.
+  expect(await ann.sys({ open: { path: dir + '/a.txt', flags: O_WRONLY | O_TRUNC, size: 1, version: '"old"' } })).toBe('ESTALE');
+  expect(await root.sys({ open: { path: dir + '/b.txt', flags: 0 } })).toEqual(expect.objectContaining({ size: 5 }));
+  const guest = await session();
+  try { expect(await guest.sys({ open: { path: dir + '/b.txt', flags: 0 } })).toBe('EACCES'); }
+  finally { await guest.context.dispose(); }
+  // Unknown requests are not ioctls of a file.
+  const [held] = await ann.batch([{ open: { path: dir + '/a.txt', flags: 0 } }]);
+  expect(await ann.sys({ ioctl: { fd: held.ok.fd, request: 1 } })).toBe('ENOTTY');
+  expect((await ann.sys({ close: { fd: held.ok.fd } })).path).toBe(dir + '/a.txt');
+});
+
 test('a batch has a limit, and what is not a batch is refused', async () => {
   const response = await root.context.post('/api/sys', { data: { calls: Array.from({ length: 257 }, () => 'getcreds') } });
   expect(response.status()).toBe(400);

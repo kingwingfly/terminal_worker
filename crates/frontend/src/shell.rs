@@ -50,7 +50,7 @@ const GLOB_PATHS: usize = 10_000;
 const GLOB_CONCURRENCY: usize = 8;
 
 /// Server commands that xargs and fd -x may run many of in one request.
-const BATCHED: &[&str] = &["cp", "whoami", "id", "groups"];
+const BATCHED: &[&str] = &["whoami", "id", "groups"];
 
 #[derive(Clone)]
 pub enum LogLine {
@@ -156,21 +156,6 @@ fn js_message(error: JsValue) -> String {
         .and_then(|v| v.as_string())
         .or_else(|| error.as_string())
         .unwrap_or_else(|| "Operation failed".into())
-}
-/// Whether `args` are mv or cp -i, under sudo or not, which ask before replacing a file: run
-/// one by one, never in a batch, however xargs or fd -x start them. As on Linux, the last of -i,
-/// -n and -f is what counts.
-fn asks(args: &[String]) -> bool {
-    let args = &args[usize::from(args.first().is_some_and(|a| a == "sudo"))..];
-    match args.split_first() {
-        Some((name, rest)) if name == "cp" => {
-            cli::parse::<cli::files::Cp>(rest).is_ok_and(|cp| cp.interactive)
-        }
-        Some((name, rest)) if name == "mv" => {
-            cli::parse::<cli::files::Mv>(rest).is_ok_and(|mv| mv.interactive)
-        }
-        _ => false,
-    }
 }
 /// `args`, a command line clap accepts, as web/app.js reads it for the commands it runs itself,
 /// with their dialogs: as clap read them, options before operands and -- gone (sudo -ubob is
@@ -532,12 +517,20 @@ impl Shell {
         }
         decisions
     }
-    /// The jobs and unfinished uploads of this account, or, given the ID of `jobs cancel ID`,
-    /// cancel that one.
+    /// The jobs of this account, and the files this browser is writing (its descriptors, as
+    /// /proc/self/fd lists them), or, given `jobs cancel ID`, cancel that one: a job, or a
+    /// descriptor (`fdN`), closed, which completes a recording with what arrived and leaves an
+    /// upload, removed if it was making the file.
     async fn jobs(self, cancel: Option<&str>) -> Result<Output, String> {
+        use abi::{Call, Fd, O_APPEND};
         let value = request("/api/jobs", "GET").await?;
         let jobs = value["jobs"].as_array().cloned().unwrap_or_default();
-        let uploads = value["uploads"].as_array().cloned().unwrap_or_default();
+        let sys = crate::sys::HttpSys::default();
+        let fds: Vec<Fd> = userland::sys::call(&sys, Call::Fds)
+            .await
+            .unwrap_or_default();
+        let fds: Vec<Fd> = fds.into_iter().filter(|fd| fd.flags & 3 != 0).collect();
+        let recording = |fd: &Fd| fd.flags & O_APPEND != 0;
         match cancel {
             None => {
                 let mut text = String::new();
@@ -558,21 +551,21 @@ impl Shell {
                         progress["total"].as_u64().unwrap_or(0),
                     ));
                 }
-                for upload in &uploads {
-                    let id = &upload["id"].as_str().unwrap_or_default()[..8];
-                    let path = upload["path"].as_str().unwrap_or_default();
-                    let size = upload["size"].as_u64().unwrap_or(0);
+                for fd in &fds {
+                    let id = format!("fd{}", fd.fd);
                     // A recording has as many bytes as have arrived, and grows.
-                    if upload["recording"] == true {
+                    if recording(fd) {
                         text.push_str(&format!(
-                            "{id}  recording  {path}  {}\n",
-                            crate::viewer::size(size)
+                            "{id:<8}  recording  {}  {}\n",
+                            fd.path,
+                            crate::viewer::size(fd.size)
                         ));
                         continue;
                     }
                     text.push_str(&format!(
-                        "{id}  uploading  {path}  {}%\n",
-                        upload["received"].as_u64().unwrap_or(0) * 100 / size.max(1),
+                        "{id:<8}  uploading  {}  {}%\n",
+                        fd.path,
+                        fd.received * 100 / fd.size.max(1),
                     ));
                 }
                 if text.is_empty() {
@@ -586,16 +579,23 @@ impl Shell {
                     let id = job["id"].as_str().unwrap_or_default();
                     request(&format!("/api/jobs?id={id}"), "DELETE").await?;
                     Ok(Output::text(format!("Cancelling job {}\n", &id[..8])))
-                } else if let Some(upload) = uploads.iter().find(|u| starts(u)) {
-                    let id = upload["id"].as_str().unwrap_or_default();
-                    let path = upload["path"].as_str().unwrap_or_default();
-                    request(&format!("/api/uploads?id={id}"), "DELETE").await?;
+                } else if let Some(fd) = fds.iter().find(|fd| format!("fd{}", fd.fd) == wanted) {
+                    let mut calls = vec![Call::Close { fd: fd.fd }];
+                    if fd.created && !recording(fd) {
+                        calls.push(Call::Unlink {
+                            path: fd.path.clone(),
+                        });
+                    }
+                    userland::sys::calls::<Value>(&sys, calls).await;
                     self.refresh().await?;
                     // A recording stops, keeping what arrived; an upload is cancelled.
-                    Ok(Output::text(if upload["recording"] == true {
-                        format!("Stopped the recording of {path}; what arrived is kept\n")
+                    Ok(Output::text(if recording(fd) {
+                        format!(
+                            "Stopped the recording of {}; what arrived is kept\n",
+                            fd.path
+                        )
                     } else {
-                        format!("Cancelled the upload of {path}\n")
+                        format!("Cancelled the upload of {}\n", fd.path)
                     }))
                 } else {
                     Err(format!("jobs: no job or upload {wanted}"))
@@ -662,7 +662,7 @@ impl Shell {
         if BATCHED.contains(&first[0].as_str())
             && commands
                 .iter()
-                .all(|c| c[0] == first[0] && !cli::wants_help(c) && !asks(c))
+                .all(|c| c[0] == first[0] && !cli::wants_help(c))
         {
             return self.batch(commands, trace).await;
         }
@@ -835,64 +835,6 @@ impl Shell {
         self.asking.set(false);
         answer
     }
-    /// mv or cp -i, under sudo too: the server does what replaces nothing, and names each file
-    /// that exists, which this asks about, in turn, before replacing it as the same account.
-    async fn interactive(self, args: &[String]) -> Result<Output, String> {
-        let sudo = usize::from(args[0] == "sudo");
-        let command = args[sudo].clone();
-        // The options again, for each replacement, long ones too (--archive), less -i, which may
-        // come with others, as in -ri; the -f after them overrides any -n.
-        let mut options = Vec::new();
-        for arg in args[sudo + 1..].iter().take_while(|a| a.as_str() != "--") {
-            if arg.starts_with("--") {
-                if arg != "--interactive" {
-                    options.push(arg.clone());
-                }
-            } else if arg.starts_with('-') && arg.len() > 1 {
-                let rest: String = arg[1..].chars().filter(|c| *c != 'i').collect();
-                if !rest.is_empty() {
-                    options.push(format!("-{rest}"));
-                }
-            }
-        }
-        let value = self.call(args).await?;
-        let mut out = self.output(&value, true)?;
-        for pair in value["existing"].as_array().into_iter().flatten() {
-            if self.cancelled() {
-                break;
-            }
-            let (Some(src), Some(target)) = (pair[0].as_str(), pair[1].as_str()) else {
-                continue;
-            };
-            let answer = self
-                .ask(format!("{command}: overwrite '{target}'? (y/n)"))
-                .await;
-            if self.cancelled() || !answer.trim().to_lowercase().starts_with('y') {
-                continue;
-            }
-            let run: Vec<String> = args[..sudo]
-                .iter()
-                .cloned()
-                .chain([command.clone()])
-                .chain(options.iter().cloned())
-                .chain(["-f", "--", src, target].map(String::from))
-                .collect();
-            match self.call(&run).await.and_then(|v| self.output(&v, true)) {
-                Ok(o) => {
-                    out.stdout.push_str(&o.stdout);
-                    out.failed |= o.failed;
-                }
-                Err(e) => {
-                    self.error(e);
-                    out.failed = true;
-                }
-            }
-        }
-        out.failed |= self.cancelled();
-        self.refresh().await?;
-        Ok(out)
-    }
-
     /// Run the program of user space `args[0]`, under sudo if `sudo`, with `stdin`: what it
     /// left. Its questions (mv -i) go to this tab's next line, and Ctrl+C stops it between
     /// steps.

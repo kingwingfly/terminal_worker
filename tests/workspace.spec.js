@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { mkdirp, program, rmrf } from './sys.js';
+import { mkdirp, program, put, rmrf } from './sys.js';
 const origin=process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password=(await readFile('.dev.vars','utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const headers={Origin:origin,'CF-Connecting-IP':'workspace-regression'};
@@ -54,7 +54,7 @@ test('vim edits highlighted Rust, saves conditionally, preserves conflicting dra
   await expect(page.locator('.cm-line span').first()).toBeVisible();
   await page.keyboard.press('Control+s');await expect(page.locator('#editor-status')).toHaveText('Saved');expect(await (await request.get(file(base+'/main.rs'))).text()).toContain('let answer = 42;');
   const original=await request.get(file(base+'/main.rs'));const etag=original.headers().etag;
-  expect((await request.put(file(base+'/main.rs')+'&overwrite=true',{headers:{...headers,'If-Match':etag},data:'fn changed_elsewhere() {}'})).status()).toBe(200);
+  expect((await put(request, file(base+'/main.rs')+'&overwrite=true',{headers:{...headers,'If-Match':etag},data:'fn changed_elsewhere() {}'})).status()).toBe(200);
   await content.fill('fn unsaved_local() {}');await page.getByRole('button',{name:'Save Cmd / Ctrl S',exact:true}).click();await expect(page.locator('#editor-status')).toContainText('changed in another session');
   expect(await (await request.get(file(base+'/main.rs'))).text()).toBe('fn changed_elsewhere() {}');
   await page.getByRole('button',{name:'Close editor'}).click();await expect(page.getByRole('button',{name:'Discard changes'})).toBeVisible();await expect(content).toContainText('unsaved_local');await page.getByRole('button',{name:'Discard changes'}).click();await expect(page.locator('#editor')).toBeHidden();
@@ -67,11 +67,11 @@ test('vim edits highlighted Rust, saves conditionally, preserves conflicting dra
 test('PDF pages and PNG/JPEG/WebP previews load through protected file APIs',async({page,request})=>{
  const base='/preview-'+Date.now();await request.post('/api/login',{headers,data:{password}});await mkdirp(request, base);
  try{
-  expect((await request.put(file(base+'/sample.pdf'),{headers,data:pdfBytes()})).status()).toBe(201);
+  expect((await put(request, file(base+'/sample.pdf'),{headers,data:pdfBytes()})).status()).toBe(201);
   await page.goto('/');
   for(const [ext,mime] of [['png','image/png'],['jpeg','image/jpeg'],['webp','image/webp']]){
    const bytes=await page.evaluate(async mime=>{const canvas=document.createElement('canvas');canvas.width=8;canvas.height=8;canvas.getContext('2d').fillRect(0,0,8,8);return [...new Uint8Array(await(await fetch(canvas.toDataURL(mime))).arrayBuffer())];},mime);
-   expect((await request.put(file(base+'/image.'+ext),{headers,data:Buffer.from(bytes)})).status()).toBe(201);
+   expect((await put(request, file(base+'/image.'+ext),{headers,data:Buffer.from(bytes)})).status()).toBe(201);
    await run(page,'open '+base+'/image.'+ext);await expect.poll(()=>page.locator('.media-frame img').evaluate(e=>e.naturalWidth)).toBe(8);await page.getByRole('button',{name:'Close preview'}).click();
   }
   // A PDF scrolls as one document, its pages drawn as they come near, and opens where it was left.

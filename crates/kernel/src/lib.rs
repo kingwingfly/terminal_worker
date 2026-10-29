@@ -8,7 +8,7 @@
 mod namei;
 mod xattr;
 
-use abi::{Call, Dirent, Errno, Error, Stat};
+use abi::{Call, Dirent, Errno, Error, O_ACCMODE, O_CREAT, O_EXCL, O_RDONLY, Stat};
 use serde_json::{Value, json};
 use terminal_worker_core::parent;
 use terminal_worker_core::permissions::*;
@@ -37,7 +37,8 @@ pub trait Fs: Store {
     }
 }
 
-/// The store in memory, for tests and tools: no clock, no times, every file whole.
+/// The store in memory, for tests and tools: no clock, no times, every file whole but those
+/// marked `incomplete`, of which nothing has arrived.
 impl Fs for MemStore {
     fn now(&self) -> u64 {
         0
@@ -49,8 +50,8 @@ impl Fs for MemStore {
     fn empty(&mut self, _owner: u32, path: &str) -> String {
         format!("empty:{path}")
     }
-    fn writing(&self, _file: &str) -> Option<(u64, bool)> {
-        None
+    fn writing(&self, file: &str) -> Option<(u64, bool)> {
+        self.incomplete.contains(file).then_some((0, false))
     }
 }
 
@@ -68,7 +69,13 @@ type Result<T> = std::result::Result<T, Error>;
 pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
     let cred = &process.cred;
     match call {
-        Call::Getcreds => Err(Errno::ENOSYS.into()),
+        // The session's, and descriptors' content, are the host's.
+        Call::Getcreds
+        | Call::Open { .. }
+        | Call::Close { .. }
+        | Call::Lease { .. }
+        | Call::Fds
+        | Call::Ioctl { .. } => Err(Errno::ENOSYS.into()),
         Call::Stat { path } => stat(fs, cred, &path, true).map(|stat| json!(stat)),
         Call::Lstat { path } => stat(fs, cred, &path, false).map(|stat| json!(stat)),
         Call::Getdents { path } => getdents(fs, cred, &path).map(|entries| json!(entries)),
@@ -261,6 +268,45 @@ fn writable_dir(fs: &impl Fs, cred: &Identity, real: &str) -> Result<Node> {
         ));
     }
     Ok(dir)
+}
+
+/// What open(2) found at a path: the node a descriptor reads or writes, or the regular file
+/// `O_CREAT` makes, which the host makes once it has content for it.
+#[derive(Clone, Debug)]
+pub enum Opening {
+    Existing { path: String, node: Node },
+    New { path: String, node: Node },
+}
+/// open(2)'s checks: a link at the end is followed, and one leading nowhere makes what it
+/// names, except with `O_CREAT | O_EXCL`, which fails on anything there; a directory is not
+/// opened (EISDIR); what is there must be readable, or writable, as `flags` ask. What it makes
+/// has `mode` less the umask, as mknod does.
+pub fn open(fs: &impl Fs, process: &Process, path: &str, flags: u32, mode: u16) -> Result<Opening> {
+    let cred = &process.cred;
+    let write = flags & O_ACCMODE != O_RDONLY;
+    let exclusive = flags & O_CREAT != 0 && flags & O_EXCL != 0;
+    let name = namei(fs, cred, path, !exclusive)?;
+    match name.node {
+        Some(_) if exclusive => Err(Errno::EEXIST.into()),
+        Some(node) if node.directory => Err(Errno::EISDIR.into()),
+        Some(node) => {
+            require(cred, &node, if write { WRITE } else { READ })?;
+            Ok(Opening::Existing {
+                path: name.path,
+                node,
+            })
+        }
+        None if flags & O_CREAT == 0 => Err(Errno::ENOENT.into()),
+        None if path.ends_with('/') => Err(Errno::EISDIR.into()),
+        None => {
+            let dir = writable_dir(fs, cred, &name.path)?;
+            let node = created(cred, &dir, mode & 0o777, false, process.umask);
+            Ok(Opening::New {
+                path: name.path,
+                node,
+            })
+        }
+    }
 }
 
 pub fn mkdir(fs: &mut impl Fs, process: &Process, path: &str, mode: u16) -> Result<()> {

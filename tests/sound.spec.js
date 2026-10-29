@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { call, entry, names, program, rmrf } from './sys.js';
+import { call, entry, errno, names, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -63,8 +63,8 @@ test('stream records the microphone into a file that grows as it is heard, and i
     await run(other, 'jobs');
     await expect(transcript(other)).toContainText(new RegExp(`recording  ${recording}  [\\d.]+ KB`));
     await other.close();
-    // An upload that is not a recording says how big it will be.
-    expect((await root.post('/api/uploads?path=' + encodeURIComponent(home + '/sizeless.bin'), { data: {} })).status()).toBe(400);
+    // A file written whole, not a recording, says how big it will be.
+    expect(await errno(root, { open: { path: home + '/sizeless.bin', flags: 0o101 } })).toBe('EINVAL');
     // What arrived may be read meanwhile, from its start.
     const partial = await (await root.get(file(recording), { headers: { 'Accept-Encoding': 'identity' } })).body();
     expect(partial.length).toBeGreaterThanOrEqual(grown);
@@ -114,7 +114,7 @@ test('live sound: /dev/snd/NAME is heard by whoever may read the recording, and 
   const remote = await speaker.context.newPage(); await remote.goto(origin + '/');
   const recording = home + '/lecture.weba', deck = home + '/lecture.slides.md';
   try {
-    expect((await root.put(file(deck), { data: '# One\n\n---\n\n# Two\n' })).status()).toBe(201);
+    expect((await put(root, file(deck), { data: '# One\n\n---\n\n# Two\n' })).status()).toBe(201);
     for (const args of [['chmod', '755', home], ['chmod', '644', deck]]) expect((await program(root, args)).ok()).toBe(true);
     await run(speaker.page, 'cd ~');
     await run(speaker.page, 'stream -n lecture lecture.weba');
@@ -154,7 +154,7 @@ test('jobs cancel stops a recording from another tab, keeping what arrived', asy
     const other = await speaker.context.newPage(); await other.goto(origin + '/');
     await run(other, 'jobs');
     await expect(transcript(other)).toContainText(`recording  ${recording}`);
-    const listed = (await transcript(other).textContent()).match(new RegExp(`([0-9a-f]{8})  recording  ${recording}`));
+    const listed = (await transcript(other).textContent()).match(new RegExp(`(fd\\d+) +recording  ${recording}`));
     expect(listed).toBeTruthy();
     await run(other, 'jobs cancel ' + listed[1]);
     await expect(transcript(other)).toContainText(`Stopped the recording of ${recording}; what arrived is kept`);
@@ -228,8 +228,8 @@ test('stream -m gives the recording its ACL as it is made; entries it cannot tak
   try {
     await run(page, 'cd ~');
     await run(page, 'stream -m bogus:x:r refused.weba');
-    await expect(transcript(page)).toContainText('stream -m');
-    expect(await entry(root, home + '/refused.weba')).toBe(null);
+    await expect(transcript(page)).toContainText('stream -m: ');
+    await expect.poll(() => entry(root, home + '/refused.weba')).toBe(null);
     await run(page, 'stream -m g:guest:r,o::- shared.weba');
     await expect(transcript(page)).toContainText(/● \d\d:\d\d/);
     const acl = JSON.parse(Buffer.from(await call(root, { getxattr: { path: recording, name: 'system.posix_acl_access' } })).toString());
@@ -281,7 +281,7 @@ test('a chunk R2 did not take once is sent again, and the recording goes on', as
   const speaker = await device(browser, name, password);
   const page = speaker.page, recording = home + '/retried.weba';
   let refused = 0;
-  await page.route('**/api/uploads/chunk?**', route => {
+  await page.route('**/api/pwrite?**', route => {
     if (refused++ === 0) return route.fulfill({ status: 400, json: { error: 'Chunk upload failed, or the chunk does not match its SHA-256; send it again' } });
     return route.continue();
   });

@@ -6,6 +6,7 @@
 //!
 //! The page runs them (crates/frontend), as the shell's commands; tests run them over the
 //! kernel in memory.
+mod copy;
 mod files;
 mod find;
 pub mod io;
@@ -20,8 +21,8 @@ pub use sys::Sys;
 
 /// The programs of user space.
 pub const PROGRAMS: &[&str] = &[
-    "ls", "stat", "mkdir", "rmdir", "rm", "mv", "ln", "readlink", "realpath", "touch", "chmod",
-    "chown", "chgrp", "getfacl", "setfacl", "getfattr", "setfattr", "fd",
+    "ls", "stat", "mkdir", "rmdir", "rm", "mv", "cp", "ln", "readlink", "realpath", "touch",
+    "chmod", "chown", "chgrp", "getfacl", "setfacl", "getfattr", "setfattr", "fd",
 ];
 
 /// Run the program `io.args[0]`, with what `io` gives it: its exit status, as a shell sees it;
@@ -35,6 +36,7 @@ pub async fn run(sys: &impl Sys, io: &mut Io<'_>) -> Option<i32> {
         "rmdir" => files::rmdir(sys, io).await,
         "rm" => files::rm(sys, io).await,
         "mv" => files::mv(sys, io).await,
+        "cp" => copy::cp(sys, io).await,
         "ln" => files::ln(sys, io).await,
         "readlink" => files::readlink(sys, io, false).await,
         "realpath" => files::readlink(sys, io, true).await,

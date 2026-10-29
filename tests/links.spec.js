@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { entry, mkdirp, program, rmrf } from './sys.js';
+import { entry, errno, mkdirp, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -12,7 +12,7 @@ test.beforeEach(async ({ request, page }) => {
   await page.setExtraHTTPHeaders({ 'CF-Connecting-IP': 'links-ui-' + base });
   expect((await request.post('/api/login', { headers, data: { password } })).ok()).toBe(true);
   for (const dir of ['', '/docs']) await mkdirp(request, base + dir);
-  for (const [name, text] of Object.entries({ 'a.md': 'alpha\n', 'docs/b.md': 'beta\n' })) expect((await request.put(file(base + '/' + name), { headers, data: text })).status()).toBe(201);
+  for (const [name, text] of Object.entries({ 'a.md': 'alpha\n', 'docs/b.md': 'beta\n' })) expect((await put(request, file(base + '/' + name), { headers, data: text })).status()).toBe(201);
 });
 test.afterEach(async ({ request }) => { await rmrf(request, base); });
 
@@ -49,7 +49,7 @@ test('ln makes symbolic and hard links that behave as on Linux', async ({ page, 
   expect(await output(page, 'readlink link.md')).toBe('docs/b.md');
   expect(await output(page, 'readlink -f link.md')).toBe(base + '/docs/b.md');
   // Writing through one name of a file changes it under every name; chmod too.
-  expect((await request.put(file(base + '/a-too.md') + '&overwrite=true', { headers, data: 'changed\n' })).ok()).toBe(true);
+  expect((await put(request, file(base + '/a-too.md') + '&overwrite=true', { headers, data: 'changed\n' })).ok()).toBe(true);
   expect(await (await request.get(file(base + '/a.md'), { headers })).text()).toBe('changed\n');
   await run(page, 'chmod 600 a-too.md');
   expect(await output(page, 'ls -l a.md')).toMatch(/^-rw------- +2 /);
@@ -84,13 +84,13 @@ test('ln makes symbolic and hard links that behave as on Linux', async ({ page, 
   for (const dir of ['copy', 'kept']) await rmrf(request, `/${dir}-${base.slice(1)}`);
   // ln -f replaces a name only once its link can be made: one that cannot leaves what was there.
   await run(page, 'mkdir t');
-  for (const name of ['docs', 'a-too.md']) expect((await request.put(file(`${base}/t/${name}`), { headers, data: 'keep\n' })).status()).toBe(201);
+  for (const name of ['docs', 'a-too.md']) expect((await put(request, file(`${base}/t/${name}`), { headers, data: 'keep\n' })).status()).toBe(201);
   await run(page, 'ln -f a-too.md docs t');
   await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText('hard link not allowed for directory');
   expect(await (await request.get(file(base + '/t/docs'), { headers })).text()).toBe('keep\n');
   expect(await (await request.get(file(base + '/t/a-too.md'), { headers })).text()).toBe('changed\n');
   // A file still uploading is copied once whole, also when a link leads to it.
-  expect((await request.post('/api/uploads?path=' + encodeURIComponent(base + '/up.bin'), { headers, data: { size: 4 } })).ok()).toBe(true);
+  expect(await errno(request, { open: { path: base + '/up.bin', flags: 0o101, size: 4 } })).toBe(null);
   await run(page, 'mkdir withlink'); await run(page, 'ln -s ../up.bin withlink/l');
   await run(page, 'cp -rL withlink taken'); await expect(last(page)).toContainText('still uploading');
   expect(await entry(request, base + '/taken')).toBe(null);
@@ -130,7 +130,7 @@ test('a visitor makes an account in /guest, which is sticky, and shares files wi
     expect(await output(page, 'ls -l note.txt')).toMatch(/^-rw-rw-r--\+ /);
     await run(page, 'chmod g-w note.txt');
     expect(await output(page, 'getfacl note.txt')).toBe(`# file: guest/${ada}/note.txt\n# owner: ${ada}\n# group: ${ada}\nuser::rw-\nuser:${bob}:rw-\t#effective:r--\ngroup::r--\nmask::r--\nother::r--`);
-    expect((await other.put(file(`/guest/${ada}/note.txt`) + '&overwrite=true', { data: 'x' })).status()).toBe(403);
+    expect((await put(other, file(`/guest/${ada}/note.txt`) + '&overwrite=true', { data: 'x' })).status()).toBe(403);
     // A default ACL is what new files get.
     await run(page, `setfacl -d -m u:${bob}:rw .`); await run(page, 'touch later.txt');
     expect(await output(page, `getfacl -c later.txt`)).toContain(`user:${bob}:rw-`);

@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { mkdirp, rmrf } from './sys.js';
+import { mkdirp, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -17,7 +17,7 @@ test.beforeEach(async ({ request, page }) => {
     'notes.txt': 'a.b axb A.B\nsecond line\n',
     'guide.md': '# Guide\n\nSearch **this** text, and this `code`.\n',
   };
-  for (const [name, text] of Object.entries(files)) expect((await request.put(file(`${base}/${name}`), { headers, data: text })).status()).toBe(201);
+  for (const [name, text] of Object.entries(files)) expect((await put(request, file(`${base}/${name}`), { headers, data: text })).status()).toBe(201);
 });
 test.afterEach(async ({ request }) => { await rmrf(request, base); });
 

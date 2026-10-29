@@ -85,6 +85,16 @@ impl DurableObject for TerminalAuthority {
                         db.add_lines(&id, &[(true, why.into())]);
                         jobs::finish(db, &id, "cancelled");
                     }
+                    // A descriptor not kept for long is closed; what it wrote waits, unfinished,
+                    // for a writer to go on with it.
+                    ("fd", _, _) => {
+                        if let Some((sid, fd)) = id.rsplit_once(' ')
+                            && let Ok(fd) = fd.parse()
+                        {
+                            db.close_fd(sid, fd);
+                        }
+                        db.clear_expiry(&kind, &id);
+                    }
                     // A session ends when it expires, and the pages holding it hear so.
                     ("session", _, _) => {
                         db.delete_session(&id);

@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { entry, errno, mkdirp, program, rmrf } from './sys.js';
+import { call, entry, errno, mkdirp, program, put, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const password = 'testing-long-passphrase-8274';
@@ -31,7 +31,7 @@ async function setup() {
 test('owner/group/other, traversal, ranges, revocation and root bypass are enforced by the API', async () => {
  const f = await setup(); const {root,alice,bob,guest,a,team,home} = f; const path=home+'/private.txt';
  try {
-  await ok(await alice.put(file(path),{data:'0123456789'}),201);
+  await ok(await put(alice, file(path),{data:'0123456789'}),201);
   for (const client of [bob,guest]) for (const method of ['get','head']) expect((await client[method](file(path))).status()).toBe(client===guest?401:403);
   await ok(await command(alice,['chmod','750',home]));
   // A user's private group is different from their supplementary sharing group.
@@ -82,7 +82,7 @@ test('sudo verifies the caller, stays per-command, revokes membership immediatel
   await ok(await alice.post('/api/sudo',{data:{password}}));
   await ok(await command(root,['usermod','-G',f.team,a]));
   expect((await command(alice,['users'],{sudo:true})).status()).toBe(403);
-  await ok(await alice.put(file(home+'/kept.txt'),{data:'preserve bytes'}),201);
+  await ok(await put(alice, file(home+'/kept.txt'),{data:'preserve bytes'}),201);
   await ok(await command(alice,['chmod','600',home+'/kept.txt']));
   const next='/home/moved-'+a;
   await ok(await command(root,['usermod','-d',next,'-m',a]));
@@ -112,18 +112,18 @@ test('public directory write, file overwrite, recursive deletion, concurrent upd
  const f=await setup();const {root,alice,bob,guest,a,b,home,team}=f;const shared='/shared-'+a;
  try {
   await ok(await command(root,['mkdir',shared]));await ok(await command(root,['chmod','o+wx',shared]));
-  await ok(await guest.put(file(shared+'/guest.txt'),{data:'guest data'}),201);
+  await ok(await put(guest, file(shared+'/guest.txt'),{data:'guest data'}),201);
   expect(await errno(guest, { unlink: { path: shared+'/guest.txt' } })).toBe(null);
-  await ok(await command(root,['chmod','755',shared]));expect((await guest.put(file(shared+'/denied.txt'),{data:'x'})).status()).toBe(401);
+  await ok(await command(root,['chmod','755',shared]));expect((await put(guest, file(shared+'/denied.txt'),{data:'x'})).status()).toBe(401);
   await ok(await command(root,['chown',a+':'+team,shared]));await ok(await command(root,['chmod','770',shared]));
-  await ok(await alice.put(file(shared+'/locked.txt'),{data:'old'}),201);await ok(await command(alice,['chmod','444',shared+'/locked.txt']));
-  expect((await alice.put(file(shared+'/locked.txt')+'&overwrite=true',{data:'new'})).status()).toBe(403);
+  await ok(await put(alice, file(shared+'/locked.txt'),{data:'old'}),201);await ok(await command(alice,['chmod','444',shared+'/locked.txt']));
+  expect((await put(alice, file(shared+'/locked.txt')+'&overwrite=true',{data:'new'})).status()).toBe(403);
   // Deletion is controlled by the parent, not by the file's write bits.
   expect(await errno(bob, { unlink: { path: shared+'/locked.txt' } })).toBe(null);
   await mkdirp(alice, shared+'/private');await ok(await command(alice,['chmod','700',shared+'/private']));
   // rm -r takes what it may, as on Linux: what alice's private directory holds, it may not.
   expect(await rmrf(bob, shared)).toBe('EACCES');
-  await ok(await alice.put(file(shared+'/private/keep.txt'),{data:'intact'}),201);
+  await ok(await put(alice, file(shared+'/private/keep.txt'),{data:'intact'}),201);
   await Promise.all([ok(await command(root,['usermod','-aG','wheel',a])),ok(await command(root,['chmod','750',shared]))]);
   const results=await Promise.all([command(root,['groupadd',team+'one']),command(root,['groupadd',team+'two'])]);for(const result of results)await ok(result);
   await ok(await command(root,['groupmod','-n',team+'new',team]));
@@ -134,37 +134,37 @@ test('public directory write, file overwrite, recursive deletion, concurrent upd
  } finally {await command(root,['rm','-r',shared]);await f.cleanup();}
 });
 
-test('an upload goes on only while its account may still write where the file is', async () => {
+test('a file is written only while its account may still write where it is', async () => {
  const f=await setup();const {root,alice,a}=f;const dir='/upload-'+a;
  const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
- const begin=async path=>(await ok(await alice.post('/api/uploads?path='+encodeURIComponent(path),{data:{size:4}}))).json();
- // Chunks and completion come from the page holding the upload, by the token it began with.
- const chunk=(up,text)=>alice.put(`/api/uploads/chunk?id=${up.id}&index=0`,{headers:{'X-Chunk-SHA256':sha(Buffer.from(text)),'X-Upload-Hold':up.hold,'Content-Type':'application/octet-stream'},data:Buffer.from(text)});
- const complete=up=>alice.post(`/api/uploads/complete?id=${up.id}&hold=${up.hold}`);
+ // A descriptor of a new file of four bytes; each write and the close ask again.
+ const begin=async path=>(await call(alice,{open:{path,flags:0o101,mode:0o666,size:4}})).fd;
+ const chunk=(fd,text)=>alice.put(`/api/pwrite?fd=${fd}&index=0`,{headers:{'X-Chunk-SHA256':sha(Buffer.from(text)),'Content-Type':'application/octet-stream'},data:Buffer.from(text)});
+ const complete=async fd=>(await sys(alice,[{close:{fd}}]))[0];
  try {
   await ok(await command(root,['mkdir',dir]));await ok(await command(root,['chown',a,dir]));
-  // Shut out of the directory, the uploader may neither send nor publish the file.
+  // Shut out of the directory, the writer may not write the file.
   const revoked=await begin(dir+'/a.txt');
   await ok(await command(root,['chown','root',dir]));await ok(await command(root,['chmod','700',dir]));
   expect(await errno(alice, { stat: { path: dir+'/a.txt' } })).toBe('EACCES');
-  expect((await chunk(revoked,'abcd')).status()).toBe(403);
-  expect((await complete(revoked)).status()).toBe(403);
+  const shut=await chunk(revoked,'abcd');
+  expect([shut.status(),(await shut.json()).errno]).toEqual([403,'EACCES']);
   // Let back in, the file being still hers, it goes on.
   await ok(await command(root,['chmod','755',dir]));
-  await ok(await chunk(revoked,'abcd'));await ok(await complete(revoked),201);
+  await ok(await chunk(revoked,'abcd'));expect((await complete(revoked)).ok).toMatchObject({path:dir+'/a.txt',created:true});
   expect(await (await root.get(file(dir+'/a.txt'))).text()).toBe('abcd');
-  // Moved while it uploads, a new file is written, and published, where it is now.
+  // Moved while it is written, a new file is written, and complete, where it is now.
   await ok(await command(root,['chown',a,dir]));
   const moved=await begin(dir+'/b.txt');
   await ok(await command(alice,['mv',dir+'/b.txt',dir+'/c.txt']));
   await ok(await chunk(moved,'wxyz'));
-  expect((await (await ok(await complete(moved),201)).json()).path).toBe(dir+'/c.txt');
+  expect((await complete(moved)).ok.path).toBe(dir+'/c.txt');
   expect(await (await alice.get(file(dir+'/c.txt'))).text()).toBe('wxyz');
-  // Given to an account that alone may write it, it is the uploader's no more.
+  // Given to an account that alone may write it, it is the writer's no more.
   const given=await begin(dir+'/d.txt');
   await ok(await command(root,['chown','root',dir+'/d.txt']));
   expect((await chunk(given,'1234')).status()).toBe(403);
-  expect((await complete(given)).status()).toBe(403);
+  expect((await complete(given)).err.errno).toBe('EACCES');
  } finally {await command(root,['rm','-r',dir]);await f.cleanup();}
 });
 
@@ -172,23 +172,21 @@ test('cp and mv tell nothing of a destination below a directory the caller may n
  const f=await setup();const {root,alice,home}=f;
  try {
   await ok(await command(root,['mkdir','/root/acl-hidden-'+f.a]));
-  for (const name of ['one.txt','two.txt']) await ok(await alice.put(file(home+'/'+name),{data:name}),201);
-  for (const cmd of ['cp','mv']) for (const dest of ['/root/acl-hidden-'+f.a,'/root/acl-missing-'+f.a]) {
-   const reply=await command(alice,[cmd,home+'/one.txt',home+'/two.txt',dest]);
-   // mv is user space's: the kernel says only EACCES; cp, still the server's, says where.
-   expect(reply.status(),dest).toBe(403);const body=await reply.json();
-   if (cmd === 'cp') expect(body.error).toContain('cannot traverse /root'); else expect(body.errno).toBe('EACCES');
+  for (const name of ['one.txt','two.txt']) await ok(await put(alice, file(home+'/'+name),{data:name}),201);
+  // What they look at and make there is refused alike, whether it is there or not: the kernel
+  // says only EACCES, which is all user space's cp and mv can say.
+  for (const dest of ['/root/acl-hidden-'+f.a,'/root/acl-missing-'+f.a]) {
+   expect(await errno(alice, { stat: { path: dest } }),dest).toBe('EACCES');
+   expect(await errno(alice, { open: { path: dest+'/one.txt', flags: 0o301, size: 3 } }),dest).toBe('EACCES');
+   const reply=await command(alice,['mv',home+'/one.txt',home+'/two.txt',dest]);
+   expect([reply.status(),(await reply.json()).errno],dest).toEqual([403,'EACCES']);
   }
-  // Nor below one deep in a merge: cp -ri is refused alike whether the file there is or not, and
-  // names nothing it would ask about.
+  // Nor below one deep in a merge: a file there is as hidden as one that is not.
   const dst='/acl-merge-'+f.a,hidden=dst+'/src/private';
-  await mkdirp(alice, home+'/src/private');
-  await ok(await alice.put(file(home+'/src/private/probe.txt'),{data:'probe'}),201);
   await ok(await command(root,['mkdir','-p',hidden]));await ok(await command(root,['chmod','777',dst,dst+'/src']));await ok(await command(root,['chmod','700',hidden]));
   for (const leaf of [true,false]) {
-   if (leaf) await ok(await root.put(file(hidden+'/probe.txt'),{data:'kept'}),201); else expect(await errno(root, { unlink: { path: hidden+'/probe.txt' } })).toBe(null);
-   const reply=await command(alice,['cp','-ri',home+'/src',dst]);const body=await reply.json();
-   expect(reply.status(),String(leaf)).toBe(403);expect(body.error).toContain('cannot traverse '+hidden);expect(body.existing).toBeUndefined();
+   if (leaf) await ok(await put(root, file(hidden+'/probe.txt'),{data:'kept'}),201); else expect(await errno(root, { unlink: { path: hidden+'/probe.txt' } })).toBe(null);
+   expect(await errno(alice, { lstat: { path: hidden+'/probe.txt' } }),String(leaf)).toBe('EACCES');
   }
   await command(root,['rm','-r',dst]);
  } finally {await command(root,['rm','-r','/root/acl-hidden-'+f.a]);await f.cleanup();}

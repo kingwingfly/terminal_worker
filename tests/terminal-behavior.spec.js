@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { entry, errno, mkdirp, rmrf } from './sys.js';
+import { entry, errno, mkdirp, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const headers = { Origin: origin };
@@ -44,7 +44,7 @@ test('removal is the kernel\'s to allow, from this site only; removing a tree le
   try {
     for (const dir of [target + '/nested', sibling]) {
       await mkdirp(request, dir);
-      expect((await request.put(url(dir + '/With spaces.txt'), { headers, data: 'keep or delete' })).status()).toBe(201);
+      expect((await put(request, url(dir + '/With spaces.txt'), { headers, data: 'keep or delete' })).status()).toBe(201);
     }
     expect((await request.post('/api/sys', { headers: { Origin: 'https://elsewhere.invalid' }, data: { calls: [{ rmdir: { path: target } }] } })).status()).toBe(403);
     expect(await errno(request, { rmdir: { path: '/a/..' } })).toBe('ENOENT');
@@ -87,6 +87,7 @@ test('rm requires explicit login, handles quoted paths, refreshes lists and refu
     await expect(input).toHaveValue('rm -r "Delete this directory/"'); await input.press('Enter');
     await expect(page.locator('.filename').filter({ hasText: 'Delete this directory' })).toHaveCount(0);
     await command(page, 'rm -r .'); await expect(page.locator('.transcript pre').last()).toContainText("rm: refusing to remove '.' or '..' directory");
+    await expect(page.locator('.busy')).toHaveText('↵');
     const chooser = page.waitForEvent('filechooser'); await page.getByRole('button', { name: '↑ Upload files' }).click();
     await (await chooser).setFiles({ name: 'Delete me.txt', mimeType: 'text/plain', buffer: Buffer.from('temporary') });
     await expect(page.locator('.filename').filter({ hasText: 'Delete me.txt' })).toBeVisible();

@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { entry, errno, listing, mkdirp, names, program, rmrf } from './sys.js';
+import { entry, errno, listing, mkdirp, names, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -59,7 +59,7 @@ test.afterAll(async () => {
 // A deck of the speaker's, of its own name.
 async function deck() {
   const stem = 'talk' + Date.now().toString(36) + ++sequence, path = `${base}/${stem}.slides.md`;
-  expect((await root.put(file(path), { data: '# One\n\n---\n\n# Two\n' })).status()).toBe(201);
+  expect((await put(root, file(path), { data: '# One\n\n---\n\n# Two\n' })).status()).toBe(201);
   expect((await program(root, ['chown', name, path])).ok()).toBe(true);
   return { stem, path };
 }

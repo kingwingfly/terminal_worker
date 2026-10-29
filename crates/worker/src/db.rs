@@ -34,7 +34,7 @@ const ROLLBACK: &str = "rollback";
 /// The version of the tables below, which local state made by an older one does not have.
 pub const SCHEMA_VERSION: &str = "3";
 
-const SCHEMA: [&str; 23] = [
+const SCHEMA: [&str; 24] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
@@ -54,9 +54,11 @@ const SCHEMA: [&str; 23] = [
     // last one short. An upload names its target path, and the file it replaces there, if any.
     "CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY, size INTEGER NOT NULL, chunk_size INTEGER NOT NULL, state TEXT NOT NULL, sha256 TEXT, uploader INTEGER NOT NULL, target TEXT NOT NULL, base TEXT, touched INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS chunks(file TEXT NOT NULL, idx INTEGER NOT NULL, key TEXT NOT NULL, sha256 TEXT, PRIMARY KEY(file, idx))",
-    // The page sending an upload in chunks, by the token it was given, and when it was last
-    // heard from: one page at a time (api::HOLD). A table of its own, made where it is missing.
-    "CREATE TABLE IF NOT EXISTS upload_holds(file TEXT PRIMARY KEY, token TEXT NOT NULL, held INTEGER NOT NULL)",
+    // File descriptors (fds.rs): a session's (each browser is one), by number; the content it
+    // reads or writes (none once another writer took it over), where, its open(2) flags,
+    // whether it made the file, and when it was last kept (its lease).
+    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, PRIMARY KEY(sid, fd))",
+    "CREATE INDEX IF NOT EXISTS fds_file ON fds(file)",
     // R2 objects nothing refers to any more, which the alarm deletes.
     "CREATE TABLE IF NOT EXISTS garbage(key TEXT PRIMARY KEY)",
     "CREATE TABLE IF NOT EXISTS expiries(kind TEXT NOT NULL, id TEXT NOT NULL, due INTEGER NOT NULL, PRIMARY KEY(kind, id))",
@@ -367,6 +369,30 @@ impl File {
 pub fn etag(file: &str) -> String {
     format!("\"{file}\"")
 }
+/// A file descriptor (fds.rs).
+#[derive(Clone, Debug, Deserialize)]
+pub struct Fd {
+    pub fd: u32,
+    /// What it reads or writes; none once another writer took the file over.
+    pub file: Option<String>,
+    pub path: String,
+    pub flags: u32,
+    #[serde(deserialize_with = "flag")]
+    pub created: bool,
+    pub leased: u64,
+}
+impl Fd {
+    pub fn writes(&self) -> bool {
+        self.flags & abi::O_ACCMODE != abi::O_RDONLY
+    }
+}
+fn flag<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<bool, D::Error> {
+    Ok(u8::deserialize(d)? != 0)
+}
+/// How the alarm names a descriptor's expiry.
+pub fn fd_key(sid: &str, fd: u32) -> String {
+    format!("{sid} {fd}")
+}
 /// A device of /dev: its path there, whose it is, the file it presents, and what its live sound
 /// is heard by, if it has one.
 #[derive(Clone, Debug, Deserialize)]
@@ -512,26 +538,95 @@ impl Db {
             .map(|chunk| file.chunk_len(chunk.idx))
             .sum()
     }
-    /// The token of the page sending upload `file`, and when it was last heard from.
-    pub fn hold(&self, file: &str) -> Option<(String, u64)> {
-        #[derive(Deserialize)]
-        struct Hold {
-            token: String,
-            held: u64,
-        }
-        self.rows::<Hold>(
-            "SELECT token, held FROM upload_holds WHERE file = ?",
+    /// The descriptor `fd` of the session `sid`.
+    pub fn fd(&self, sid: &str, fd: u32) -> Option<Fd> {
+        self.rows(
+            "SELECT fd, file, path, flags, created, leased FROM fds WHERE sid = ? AND fd = ?",
+            vec![text(sid), int(fd)],
+        )
+        .pop()
+    }
+    /// The descriptors of the session `sid`.
+    pub fn fds_of(&self, sid: &str) -> Vec<Fd> {
+        self.rows(
+            "SELECT fd, file, path, flags, created, leased FROM fds WHERE sid = ? ORDER BY fd",
+            vec![text(sid)],
+        )
+    }
+    /// The descriptor writing `file`, if one is.
+    pub fn writer(&self, file: &str) -> Option<Fd> {
+        self.rows(
+            "SELECT fd, file, path, flags, created, leased FROM fds WHERE file = ? AND flags & 3 != 0",
             vec![text(file)],
         )
         .pop()
-        .map(|hold| (hold.token, hold.held))
     }
-    /// Let go of upload `file`, if `token` holds it.
-    pub fn release_hold(&mut self, file: &str, token: &str) {
+    /// A new descriptor of the session `sid`, the lowest number free from 3, as open(2) gives
+    /// the lowest; it is kept from `now`.
+    pub fn add_fd(
+        &mut self,
+        sid: &str,
+        file: Option<&str>,
+        path: &str,
+        flags: u32,
+        created: bool,
+        now: u64,
+    ) -> u32 {
+        let taken: BTreeSet<u32> = self.fds_of(sid).into_iter().map(|fd| fd.fd).collect();
+        let fd = (3..).find(|n| !taken.contains(n)).unwrap_or(3);
         self.run(
-            "DELETE FROM upload_holds WHERE file = ? AND token = ?",
-            vec![text(file), text(token)],
+            "INSERT INTO fds(sid, fd, file, path, flags, created, leased) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                text(sid),
+                int(fd),
+                file.into(),
+                text(path),
+                int(flags),
+                int(created as u8),
+                int(now),
+            ],
         );
+        fd
+    }
+    /// Keep the descriptor `fd` of `sid`, from `now`.
+    pub fn lease_fd(&mut self, sid: &str, fd: u32, now: u64) {
+        self.run(
+            "UPDATE fds SET leased = ? WHERE sid = ? AND fd = ?",
+            vec![int(now), text(sid), int(fd)],
+        );
+    }
+    /// The descriptor `fd` of `sid` now reads or writes `file`.
+    pub fn set_fd_file(&mut self, sid: &str, fd: u32, file: &str) {
+        self.run(
+            "UPDATE fds SET file = ? WHERE sid = ? AND fd = ?",
+            vec![text(file), text(sid), int(fd)],
+        );
+    }
+    /// The descriptors writing `file` write it no more: another took it over.
+    pub fn revoke_writers(&mut self, file: &str) {
+        self.run(
+            "UPDATE fds SET file = NULL WHERE file = ? AND flags & 3 != 0",
+            vec![text(file)],
+        );
+    }
+    /// Close the descriptor `fd` of `sid`: what it read goes, if nothing else keeps it. What a
+    /// writer leaves unfinished waits for another to go on with it, until it expires.
+    pub fn close_fd(&mut self, sid: &str, fd: u32) {
+        #[derive(Deserialize)]
+        struct Closed {
+            file: Option<String>,
+            flags: u32,
+        }
+        let closed = self.rows::<Closed>(
+            "DELETE FROM fds WHERE sid = ? AND fd = ? RETURNING file, flags",
+            vec![text(sid), int(fd)],
+        );
+        self.clear_expiry("fd", &fd_key(sid, fd));
+        for closed in closed {
+            if closed.flags & abi::O_ACCMODE == abi::O_RDONLY {
+                self.release(closed.file);
+            }
+        }
     }
     /// Delete the sessions `condition` selects, and their expiries; the pages holding them hear
     /// that they ended, if any did.
@@ -546,16 +641,13 @@ impl Db {
         );
         for session in &ended {
             self.clear_expiry("session", &session.key);
+            for fd in self.fds_of(&session.key) {
+                self.close_fd(&session.key, fd.fd);
+            }
         }
         if !ended.is_empty() {
             ENDED.set(true);
         }
-    }
-    pub fn set_hold(&mut self, file: &str, token: &str, now: u64) {
-        self.run(
-            "INSERT OR REPLACE INTO upload_holds(file, token, held) VALUES(?, ?, ?)",
-            vec![text(file), text(token), int(now)],
-        );
     }
     pub fn file(&self, id: &str) -> Option<File> {
         self.rows(
@@ -616,7 +708,11 @@ impl Db {
             "UPDATE files SET state = 'complete' WHERE id = ?",
             vec![text(file)],
         );
-        self.run("DELETE FROM upload_holds WHERE file = ?", vec![text(file)]);
+        // Its writers are done: one closing it, or one whose page went (a recording).
+        self.run(
+            "DELETE FROM fds WHERE file = ? AND flags & 3 != 0",
+            vec![text(file)],
+        );
         self.clear_expiry("upload", file);
     }
     /// Delete `file` and send its chunks to the garbage, whatever refers to it: every object
@@ -625,7 +721,7 @@ impl Db {
         self.discard(&format!("chunks/{file}/"));
         self.run("DELETE FROM chunks WHERE file = ?", vec![text(file)]);
         self.run("DELETE FROM files WHERE id = ?", vec![text(file)]);
-        self.run("DELETE FROM upload_holds WHERE file = ?", vec![text(file)]);
+        self.run("DELETE FROM fds WHERE file = ?", vec![text(file)]);
         self.clear_expiry("upload", file);
         ALARM.set(true);
     }
@@ -640,10 +736,10 @@ impl Db {
     }
     fn release(&mut self, file: Option<String>) {
         let Some(file) = file else { return };
-        // A job still reading it keeps it too.
+        // A job still reading it keeps it too, and so does a descriptor.
         let referenced = !self
             .rows::<Key>(
-                "SELECT CAST(id AS TEXT) AS key FROM inodes WHERE file = ?1 UNION ALL SELECT job AS key FROM job_files WHERE file = ?1 LIMIT 1",
+                "SELECT CAST(id AS TEXT) AS key FROM inodes WHERE file = ?1 UNION ALL SELECT job AS key FROM job_files WHERE file = ?1 UNION ALL SELECT sid AS key FROM fds WHERE file = ?1 LIMIT 1",
                 vec![text(&file)],
             )
             .is_empty();
@@ -784,13 +880,6 @@ impl Db {
         for file in files {
             self.release(Some(file));
         }
-    }
-    /// The uploads `uploader` has not finished.
-    pub fn uploads_of(&self, uploader: u32) -> Vec<File> {
-        self.rows(
-            "SELECT id, size, chunk_size, state, sha256, uploader, target, base FROM files WHERE uploader = ? AND state IN ('uploading', 'recording') ORDER BY touched DESC LIMIT 50",
-            vec![int(uploader)],
-        )
     }
     /// The SHA-256 chunk `index` of `file` was committed with, or `None` if it is not committed.
     pub fn committed_hash(&self, file: &str, index: u64) -> Option<Option<String>> {

@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { errno, listing, mkdirp } from './sys.js';
+import { errno, listing, mkdirp, put } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 // A line is typed at the prompt, once the one before has ended, as the shell takes no other.
@@ -15,21 +15,23 @@ test('R2 API enforces auth, same-origin writes, no-overwrite and byte ranges', a
   expect((await request.post('/api/login', { headers: { Origin: origin }, data: { password } })).ok()).toBeTruthy();
   await mkdirp(request, name);
   const url = '/api/file?path=' + encodeURIComponent(name + '/With spaces.txt');
-  expect((await request.put(url, { headers: { Origin: origin }, data: '0123456789' })).status()).toBe(201);
-  expect((await request.put(url, { headers: { Origin: origin }, data: 'replace' })).status()).toBe(409);
+  expect((await put(request, url, { headers: { Origin: origin }, data: '0123456789' })).status()).toBe(201);
+  expect((await put(request, url, { headers: { Origin: origin }, data: 'replace' })).status()).toBe(409);
   const range = await request.get(url, { headers: { Range: 'bytes=2-4' } });
   expect(range.status()).toBe(206); expect(await range.text()).toBe('234'); expect(range.headers()['content-range']).toBe('bytes 2-4/10');
   expect((await request.get(url, { headers: { Range: 'bytes=99-' } })).status()).toBe(416);
   expect((await request.head(url)).headers()['content-length']).toBe('10');
   expect((await listing(request, name))[0].name).toBe('With spaces.txt');
   const empty = '/api/file?path=' + name + '/empty.txt';
-  expect((await request.put(empty, { headers: { Origin: origin, 'Content-Length': '0' }, data: '' })).status()).toBe(201);
+  expect((await put(request, empty, { headers: { Origin: origin, 'Content-Length': '0' }, data: '' })).status()).toBe(201);
   expect(await (await request.get(empty)).text()).toBe('');
   expect((await request.head(empty)).headers()['content-length']).toBe('0');
 
+  // Bytes are written from this site only.
+  expect((await request.put('/api/pwrite?fd=3&index=0', { headers: { Origin: 'https://elsewhere.invalid' }, data: 'x' })).status()).toBe(403);
   await request.post('/api/logout', { headers: { Origin: origin } });
   expect((await request.get(url)).ok()).toBeTruthy();
-  expect((await request.put('/api/file?path=' + name + '/x.txt', { headers: { Origin: origin }, data: 'x' })).status()).toBe(401);
+  expect((await put(request, '/api/file?path=' + name + '/x.txt', { headers: { Origin: origin }, data: 'x' })).status()).toBe(401);
 });
 
 // Tab completes a sole match at once; of several, the first Tab lists them, and the next picks
