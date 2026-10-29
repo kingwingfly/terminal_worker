@@ -296,6 +296,26 @@ fn rename_replaces_as_linux_does_and_never_moves_a_directory_into_itself() {
 }
 
 #[test]
+fn a_device_is_neither_renamed_nor_linked() {
+    let mut fs = fs();
+    dir(&mut fs, "/dev", 0, 0o755);
+    fs.set_node("/dev/x", &Node::device(0, 0, 0o644, "present"));
+    let stat = stat(&fs, &Identity::root(), "/dev/x", true).unwrap();
+    assert_eq!(
+        (stat.kind(), stat.rdev.as_deref()),
+        (abi::S_IFCHR, Some("present"))
+    );
+    assert_eq!(
+        errno(rename(&mut fs, &Identity::root(), "/dev/x", "/y", false)),
+        Errno::EPERM
+    );
+    assert_eq!(
+        errno(link(&mut fs, &Identity::root(), "/dev/x", "/y", false)),
+        Errno::EPERM
+    );
+}
+
+#[test]
 fn hard_links_of_anothers_file_need_it_to_be_safe_to_link() {
     let mut fs = fs();
     let ann = user(1000, &[]);

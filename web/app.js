@@ -2,6 +2,7 @@ import { inspectFaststart } from './faststart.mjs';
 import { uploadFile, Cancelled } from './upload.mjs';
 import { record, clock } from './record.mjs';
 import { speak, listen as hearLive } from './sound.mjs';
+import * as dev from './dev.mjs';
 
 let configuration;
 export const ready = fetch('/terminal-config.json').then(async response => {
@@ -138,7 +139,9 @@ function listen() {
   };
   socket.onclose = () => { clearInterval(ping); if (events === socket) setTimeout(listen, Math.min(30000, 1000 * 2 ** eventsRetry++)); };
 }
-listen();
+// The line opens once the browser has its session, signed out too (its terminal_guest cookie,
+// which the first request is given): a driver's news to it is for that session.
+fetch('/api/session').catch(() => {}).finally(listen);
 // Slides and PDFs presented follow each other (owner's request, 2026-10-28): the place a page
 // presents (viewer.rs calls present) shows in this browser's other windows showing that file,
 // and in the account's pages signed in elsewhere, which the authority tells (store.rs relay).
@@ -177,7 +180,7 @@ async function attend(device) {
   const turn = ++followings;
   // An answer, or a failure, for an attend the page has left since says nothing.
   let info;
-  try { info = await (await api('/api/device?path=' + encodeURIComponent(device))).json(); }
+  try { info = await dev.attend(device); }
   catch (error) { if (turn === followings) throw error; return; }
   if (turn !== followings) return;
   if (following?.device !== info.device) declined = null;
@@ -194,7 +197,7 @@ function unfollow() {
   followings++;
   if (!following) return;
   // Leaving the presentation withdraws an ask to speak, and ends the voice sent.
-  if (bar.asking) { if (bar.asking.state === 'asking') say({ ask: null }); void stopSpeaking(); }
+  if (bar.asking) { if (bar.asking.state === 'asking') void dev.ask(bar.asking.presentation, true).catch(() => {}); void stopSpeaking(); }
   following = null; follows();
 }
 // Follow the device `name` again, as it shows something else now: the presentation followed, the
@@ -415,7 +418,7 @@ async function recordSound(path, name, acl, told) {
     catch (error) { throw new Error('No microphone: ' + error.message); }
     // Live only, kept nowhere: until Ctrl+C, or the microphone ends.
     if (!path) {
-      sending(await speak(null, name, microphone, acl));
+      sending(await speak(name, microphone, { acl }));
       const started = performance.now(), track = microphone.getAudioTracks()[0];
       const seconds = () => (performance.now() - started) / 1000;
       const say = () => progress(`● live as ${live.device} · ${clock(seconds())}`);
@@ -426,7 +429,7 @@ async function recordSound(path, name, acl, told) {
     }
     const saved = await record(path, microphone, { acl, signal: controller.signal, progress: text => progress(text + liveNote),
       // Live once the file is there, which its device links to; a recording all the same if not.
-      begun: () => { speaking = speak(path, name, microphone).then(sent => { sending(sent); liveNote = ` · live as ${sent.device}`; }, error => { liveNote = ` · not live: ${error.message}`; }); } });
+      begun: () => { speaking = speak(name, microphone, { acl }).then(sent => { sending(sent); liveNote = ` · live as ${sent.device}`; }, error => { liveNote = ` · not live: ${error.message}`; }); } });
     await speaking;
     return { ...saved, device: live?.device ?? null, note: liveNote + (saved.stopped ? ` · ${saved.stopped}` : '') };
   } finally {
@@ -554,22 +557,21 @@ async function barOf(path) {
   Object.assign(bar, { path, presented: [], asks: [], voices: [], note: '' });
   barChanged();
   try {
-    const presented = await (await api('/api/present?path=' + encodeURIComponent(path))).json();
+    const presented = await dev.presented(path);
     if (turn !== barTurns) return;
     Object.assign(bar, { user: presented.user, presented: presented.devices, asks: presented.asks, voices: presented.voices });
   } catch (error) { if (turn === barTurns) bar.note = error.message; }
   barChanged();
 }
-const deviceName = device => device.slice(device.lastIndexOf('/') + 1);
 // Present the file to others, as /dev/present/NAME, or stop presenting it.
 async function togglePresenting(path) {
   try {
     if (bar.presented.length) {
-      for (const { device } of bar.presented) await api('/api/present?name=' + encodeURIComponent(deviceName(device)), { method: 'DELETE' });
+      for (const { device } of bar.presented) await dev.stop(device);
       bar.presented = [];
     } else {
-      const made = await (await api('/api/present?path=' + encodeURIComponent(path), { method: 'POST' })).json();
-      bar.presented = [{ device: made.device }];
+      const made = await dev.present(path);
+      bar.presented = [{ device: made.device, version: made.version }];
     }
     barChanged();
   } catch (error) { barNote(error.message); }
@@ -621,42 +623,49 @@ function asksChanged(asking) {
 function askToSpeak() {
   const presentation = following?.device;
   if (!presentation) return;
-  if (bar.asking?.state === 'asking') { say({ ask: null }); bar.asking = null; }
+  if (bar.asking?.state === 'asking') { void dev.ask(presentation, true).catch(() => {}); bar.asking = null; }
   else if (bar.asking && ['connecting', 'speaking'].includes(bar.asking.state)) { void stopSpeaking(); return; }
-  else { bar.asking = { presentation, state: 'asking' }; say({ ask: presentation }); }
+  else {
+    bar.asking = { presentation, state: 'asking' };
+    dev.ask(presentation).then(asked => answered({ asked }), error => answered({ asked: { presentation, error: error.message } }));
+  }
   barChanged();
 }
 // The presenter answers an ask to speak: allowed, everyone following hears them.
 function answerAsk(id, allow) {
+  const asked = bar.asks.find(ask => ask.id === id);
+  if (!asked) return;
   if (allow) allowed.add(id);
-  say(allow ? { allow: id } : { dismiss: id });
+  dev.answer(asked.presentation, id, allow).catch(error => barNote(error.message));
   bar.asks = bar.asks.filter(ask => ask.id !== id); barChanged();
 }
 // End a listener's voice, as its presenter.
 async function endVoice(device) {
-  try { await api('/api/sound?name=' + encodeURIComponent(deviceName(device)), { method: 'DELETE' }); }
+  try { await dev.stop(device); }
   catch (error) { barNote(error.message); }
 }
-// What the presenter said to this page's ask: noted, allowed (with the token to speak with), or
+// What the presenter said to this page's ask: noted, allowed (with a descriptor to speak through, a guest's), or
 // not now.
 function answered({ asked, granted, denied }) {
   const answer = asked ?? granted ?? denied;
   if (bar.asking?.presentation !== answer.presentation) return;
   if (asked?.error) bar.asking = { ...bar.asking, state: 'error', error: asked.error };
   else if (asked) bar.asking.id = asked.id;
-  else if (granted) { void startSpeaking(granted.token); return; }
+  else if (granted) { void startSpeaking(granted); return; }
   else { bar.asking = { ...bar.asking, state: 'denied' }; setTimeout(() => { if (bar.asking?.state === 'denied') { bar.asking = null; barChanged(); } }, 5000); }
   barChanged();
   if (fullscreen()) showChrome();
 }
-// The voice this page sends, allowed: what it is, what ends it, and the microphone.
+// The voice this page sends, allowed: what it is, what ends it, and the microphone. A guest
+// speaks through the descriptor its presenter passed to its session (`granted.fd`); an
+// account, through one it opens, its presenter's ACL entry letting it.
 let speaking = null;
-async function startSpeaking(grant) {
+async function startSpeaking(granted) {
   bar.asking = { ...bar.asking, state: 'connecting' }; barChanged();
   let microphone;
   try {
     microphone = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
-    const sent = await speak(null, null, microphone, null, grant);
+    const sent = await speak(null, microphone, { presentation: granted.presentation, fd: granted.fd ?? null, ask: granted.id });
     // Withdrawn meanwhile.
     if (bar.asking?.state !== 'connecting') { microphone.getTracks().forEach(track => track.stop()); await sent.end(); return; }
     speaking = { ...sent, microphone };
@@ -896,7 +905,7 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, present, presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
+window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]')) return;

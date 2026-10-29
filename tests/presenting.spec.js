@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { mkdirp, names, program, put, rmrf } from './sys.js';
+import { mkdirp, names, program, put, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -409,7 +409,7 @@ test('a presentation that comes to show another file takes its listeners with it
     await laptop.page.keyboard.press('ArrowRight');
     await expect(shown(guest.page).locator('h1')).toHaveText('Bee two');
   } finally {
-    await root.delete('/api/present?name=' + stem);
+    await sys(root, [{ unlink: { path: '/dev/present/' + stem } }]);
     await command(['userdel', '-r', name]);
     await laptop.context.close(); await guest.context.close();
   }
@@ -443,7 +443,7 @@ test('a listener whose line was down when the presentation came to show another 
     await expect(shown(guest.page).locator('h1')).toHaveText('Bee two');
     await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
   } finally {
-    await root.delete('/api/present?name=' + stem);
+    await sys(root, [{ unlink: { path: '/dev/present/' + stem } }]);
     await command(['userdel', '-r', name]);
     await laptop.context.close(); await guest.context.close();
   }
@@ -464,7 +464,7 @@ test('a replacement heard after the listener left the presentation does not take
     // What the device shows after its replacement comes late, held by the test.
     let asked = false, release;
     const held = new Promise(resolve => { release = resolve; });
-    await guest.page.route('**/api/device?**', async route => { asked = true; await held; await route.continue().catch(() => {}); });
+    await guest.page.route(url => url.pathname === '/api/file' && url.searchParams.get('path')?.startsWith('/dev/present/'), async route => { asked = true; await held; await route.continue().catch(() => {}); });
     await laptop.page.getByRole('button', { name: 'Close preview' }).click();
     await run(laptop.page, `present -n ${stem} ${base}/other.slides.md`);
     await expect.poll(() => asked, { timeout: 10_000 }).toBe(true);
@@ -478,7 +478,7 @@ test('a replacement heard after the listener left the presentation does not take
     await expect(shown(guest.page).locator('h1')).toHaveText('Sea');
     await expect(guest.page.locator('.presentation-badge')).toHaveCount(0);
   } finally {
-    await root.delete('/api/present?name=' + stem);
+    await sys(root, [{ unlink: { path: '/dev/present/' + stem } }]);
     await command(['userdel', '-r', name]);
     await laptop.context.close(); await guest.context.close();
   }
@@ -519,7 +519,7 @@ test('a page whose line was down when its presentation changed hands learns it o
     await listener.page.keyboard.press('Home');
     await expect(shown(guest.page).locator('h1')).toHaveText('One');
   } finally {
-    await root.delete('/api/present?name=' + stem);
+    await sys(root, [{ unlink: { path: '/dev/present/' + stem } }]);
     await command(['userdel', '-r', name]);
     for (const { context } of [presenter, guest, listener, other]) await context.close();
   }
@@ -544,7 +544,7 @@ test('a failure heard for a replacement the listener has since gone past does no
     // The guest may not follow the secret deck; that refusal comes late, held by the test.
     let asked = false, release;
     const held = new Promise(resolve => { release = resolve; });
-    await guest.page.route('**/api/device?**', async route => { if (!asked) { asked = true; await held; } await route.continue().catch(() => {}); });
+    await guest.page.route(url => url.pathname === '/api/file' && url.searchParams.get('path')?.startsWith('/dev/present/'), async route => { if (!asked) { asked = true; await held; } await route.continue().catch(() => {}); });
     for (const deck of [secret, `${base}/third.slides.md`]) {
       await laptop.page.getByRole('button', { name: 'Close preview' }).click();
       await run(laptop.page, `present -n ${stem} ${deck}`);
@@ -559,7 +559,7 @@ test('a failure heard for a replacement the listener has since gone past does no
     await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
     await expect(guest.page.locator('.presentation-badge')).toBeEnabled();
   } finally {
-    await root.delete('/api/present?name=' + stem);
+    await sys(root, [{ unlink: { path: '/dev/present/' + stem } }]);
     await rmrf(root, secret);
     await command(['userdel', '-r', name]);
     await laptop.context.close(); await guest.context.close();

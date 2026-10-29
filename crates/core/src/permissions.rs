@@ -50,6 +50,11 @@ pub struct Node {
     /// A symbolic link's target, as written.
     #[serde(default)]
     pub link: Option<String>,
+    /// A character device's driver, as Linux's `i_rdev` names one (`present`, `snd`): what
+    /// reading, writing and its other operations do is the driver's; who may is its mode's
+    /// and ACL's, as for any file.
+    #[serde(default)]
+    pub rdev: Option<String>,
     /// How many names it has: for a directory, 2 and one for each directory in it. A store
     /// says; storing ignores it.
     #[serde(default)]
@@ -73,9 +78,18 @@ impl Node {
             file: None,
             size: 0,
             link: None,
+            rdev: None,
             links: 0,
             acl: None,
             default_acl: None,
+        }
+    }
+    /// A character device of the driver `driver`, as mknod(2) makes one.
+    pub fn device(owner: u32, group: u32, mode: u16, driver: &str) -> Self {
+        Self {
+            directory: false,
+            rdev: Some(driver.into()),
+            ..Self::directory(owner, group, mode)
         }
     }
     pub fn file(owner: u32, group: u32, mode: u16, file: String, size: u64) -> Self {
@@ -98,9 +112,12 @@ impl Node {
     pub fn is_link(&self) -> bool {
         self.link.is_some()
     }
-    /// A regular file: neither a directory nor a link.
+    /// A regular file: neither a directory, nor a link, nor a device.
     pub fn is_file(&self) -> bool {
-        !self.directory && !self.is_link()
+        !self.directory && !self.is_link() && !self.is_device()
+    }
+    pub fn is_device(&self) -> bool {
+        self.rdev.is_some()
     }
     /// The same, as a new inode, which storing creates.
     pub fn fresh(&self) -> Self {

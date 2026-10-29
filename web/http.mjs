@@ -29,8 +29,9 @@ export function answered(answer) {
   const error = new Error(answer.err.detail || STRERROR[answer.err.errno] || answer.err.errno);
   error.errno = answer.err.errno; throw error;
 }
-// One system call, `{name: args}`: its value, or an error with its errno.
-export async function call(name, args, options) { return answered((await sys([{ [name]: args }], options))[0]); }
+// One system call, `{name: args}` (one without arguments, as getcreds, its name alone): its
+// value, or an error with its errno.
+export async function call(name, args, options) { return answered((await sys([args === undefined ? name : { [name]: args }], options))[0]); }
 // Close the descriptors `fds` as the page goes, when no request may wait for an answer.
 export function closeOnLeaving(fds) {
   if (fds.length) navigator.sendBeacon('/api/sys', new Blob([JSON.stringify({ calls: fds.map(fd => ({ close: { fd } })) })], { type: 'application/json' }));

@@ -2,10 +2,9 @@
 //! awaiting (reading the body, hashing a password) is done. It never touches file bytes; the
 //! Worker asks it whether it may, and tells it what it wrote.
 use crate::db::{Db, File, transact};
-use crate::{auth, commands, devices, jobs, sound};
+use crate::{auth, commands, jobs};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use terminal_worker_core::devices::{PRESENT, SOUND};
 use terminal_worker_core::{CHUNK_SIZE, MAX_FILE, mime, permissions::*, resolve};
 use worker::*;
 
@@ -169,7 +168,7 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             Reply::ok(view)
         }),
         // System calls (sys.rs): what user space, the page, asks of the kernel.
-        (Method::Post, "/api/sys") => crate::sys::handle(req, state, key).await,
+        (Method::Post, "/api/sys") => crate::sys::handle(req, env, state, key).await,
         (Method::Post, "/api/login") => login(req, env, state, key, https).await,
         (Method::Post, "/api/logout") => run(state, move |db| {
             if let Some(key) = &key {
@@ -225,105 +224,42 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             }
             Ok(Reply::ok(json!({ "results": results })))
         }
-        // Presentations (devices.rs): what the account presents of the file at `path`, for the
-        // bar of its pages showing it; start one of it, as `name`; stop one; and what one at
-        // `path` (/dev/present/NAME) shows, to follow it.
-        (Method::Get, "/api/present") => {
-            let asks = crate::store::asks(state);
+        (Method::Get, "/internal/read") => {
+            let guest = auth::guest_key(req);
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
-                Reply::ok(devices::presented(db, &who, &path, &asks))
+                let real = real!(db, &who, &path, true);
+                let node = acl!(db.access(&who, &real, READ), &who);
+                // /etc/passwd and /etc/group are the kernel's to write as they are read; a device's
+                // content is its driver's state.
+                if let Some(text) = crate::sys::generated(db, &real) {
+                    return Reply::ok(json!({ "generated": text }));
+                }
+                if node.is_device() {
+                    let sid = auth::sid(db, key.as_deref(), guest.as_deref());
+                    return match crate::dev::read(db, &who, sid.as_deref(), &real) {
+                        Some(state) => Reply::ok(json!({ "device": state })),
+                        None => Reply::error("No such device or address", 404),
+                    };
+                }
+                let Some(id) = node.file else {
+                    return Reply::error("This is a directory", 400);
+                };
+                let Some(file) = db.file(&id) else {
+                    return Reply::error("File content does not exist", 404);
+                };
+                let chunks: Vec<_> = db
+                    .chunks(&id)
+                    .into_iter()
+                    .map(|c| json!([c.idx, c.key]))
+                    .collect();
+                Reply::ok(json!({
+                    "file": id, "size": file.size, "chunk_size": file.chunk_size,
+                    "state": file.state, "etag": file.etag(), "mime": mime(&real), "chunks": chunks,
+                    "readable": db.readable(&file),
+                }))
             })
         }
-        (Method::Post, "/api/present") => {
-            let name = param("name");
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                let name = (!name.is_empty()).then_some(name.as_str());
-                Reply::ok(acl!(devices::start(db, &who, &path, name), &who))
-            })
-        }
-        (Method::Delete, "/api/present") => {
-            let name = param("name");
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                Reply::ok(acl!(
-                    devices::stop(db, &who, PRESENT, &name, None, None),
-                    &who
-                ))
-            })
-        }
-        // Live sound (sound.rs): send it, as the recording at `path` is made, or a listener's
-        // voice, as its presenter let them (`grant`); stop it; hear the device at `path`
-        // (/dev/snd/NAME); answer what Realtime offered, to hear it.
-        (Method::Post, "/api/sound") => {
-            let name = Some(param("name")).filter(|name| !name.is_empty());
-            let entries = Some(param("acl")).filter(|entries| !entries.is_empty());
-            let grant = Some(param("grant")).filter(|grant| !grant.is_empty());
-            // Of a recording, or kept nowhere.
-            let recording = (!param("path").is_empty()).then_some(path);
-            let sent = sound::Sent {
-                path: recording,
-                name,
-                entries,
-                grant,
-            };
-            sound::speak(req, env, state, key, sent).await
-        }
-        // The page sending a live sound still does: it lasts (devices::SOUND_IDLE).
-        (Method::Post, "/api/sound/hold") => {
-            let (name, version) = (param("name"), param("version"));
-            let grant = Some(param("grant")).filter(|grant| !grant.is_empty());
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                let kept = devices::keep(db, &who, &name, &version, grant.as_deref());
-                Reply::ok(acl!(kept, &who))
-            })
-        }
-        (Method::Delete, "/api/sound") => {
-            let name = param("name");
-            let version = Some(param("version")).filter(|version| !version.is_empty());
-            let grant = Some(param("grant")).filter(|grant| !grant.is_empty());
-            run(state, move |db| {
-                let who = auth::identity(db, key.as_deref());
-                let stopped =
-                    devices::stop(db, &who, SOUND, &name, version.as_deref(), grant.as_deref());
-                Reply::ok(acl!(stopped, &who))
-            })
-        }
-        (Method::Post, "/api/sound/listen") => sound::listen(req, env, state, key, path).await,
-        (Method::Put, "/api/sound/answer") => {
-            sound::answer(req, env, state, param("session")).await
-        }
-        (Method::Get, "/api/device") => run(state, move |db| {
-            let who = auth::identity(db, key.as_deref());
-            Reply::ok(acl!(devices::attend(db, &who, &path), &who))
-        }),
-        (Method::Get, "/internal/read") => run(state, move |db| {
-            let who = auth::identity(db, key.as_deref());
-            let real = real!(db, &who, &path, true);
-            let node = acl!(db.access(&who, &real, READ), &who);
-            // /etc/passwd and /etc/group are the kernel's to write as they are read.
-            if let Some(text) = crate::sys::generated(db, &real) {
-                return Reply::ok(json!({ "generated": text }));
-            }
-            let Some(id) = node.file else {
-                return Reply::error("This is a directory", 400);
-            };
-            let Some(file) = db.file(&id) else {
-                return Reply::error("File content does not exist", 404);
-            };
-            let chunks: Vec<_> = db
-                .chunks(&id)
-                .into_iter()
-                .map(|c| json!([c.idx, c.key]))
-                .collect();
-            Reply::ok(json!({
-                "file": id, "size": file.size, "chunk_size": file.chunk_size,
-                "state": file.state, "etag": file.etag(), "mime": mime(&real), "chunks": chunks,
-                "readable": db.readable(&file),
-            }))
-        }),
         // pwrite(2) through a descriptor, as the Worker streams its bytes to R2 (files.rs):
         // where the chunk goes, then that it is there.
         (Method::Get, "/internal/pwrite") => {
@@ -952,7 +888,7 @@ pub fn finish_recording(db: &mut Db, file: &File) {
 /// live no more.
 fn end_live(db: &mut Db, file: &File, path: &str) {
     for device in db.presenting(file.uploader, path) {
-        devices::end(db, &device.name);
+        crate::dev::hangup(db, &device.name, true);
     }
 }
 

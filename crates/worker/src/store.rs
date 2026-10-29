@@ -1,5 +1,5 @@
 use crate::db::{self, transact};
-use crate::{api, auth, devices, jobs};
+use crate::{api, auth, dev, jobs};
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use terminal_worker_core::devices::PRESENT;
@@ -52,13 +52,24 @@ impl DurableObject for TerminalAuthority {
         Ok(())
     }
     async fn websocket_close(&self, ws: WebSocket, _: usize, _: String, _: bool) -> Result<()> {
-        // A page that goes asks to speak no more.
-        if let Some(asking) = Line::of(&ws).asking {
-            self.ready().await?;
-            self.tell_presenter(
-                asking.owner,
-                serde_json::json!({ "asking": { "id": asking.id, "gone": true } }),
-            );
+        // A session whose last page goes asks to speak no more (dev/present.rs).
+        if let Some(sid) = Line::of(&ws).sid {
+            let others = self
+                .state
+                .get_websockets()
+                .iter()
+                .filter(|other| other.as_ref() != ws.as_ref())
+                .any(|other| Line::of(other).sid.as_deref() == Some(sid.as_str()));
+            if !others {
+                self.ready().await?;
+                let _ = transact(&self.state, move |db| {
+                    for ask in db.asks_of(&sid) {
+                        dev::present::withdraw(db, &ask.device, &sid);
+                    }
+                    ((), true)
+                });
+                self.broadcast();
+            }
         }
         let _ = ws.close(Some(1000), Some("closed"));
         Ok(())
@@ -91,7 +102,7 @@ impl DurableObject for TerminalAuthority {
                         if let Some((sid, fd)) = id.rsplit_once(' ')
                             && let Ok(fd) = fd.parse()
                         {
-                            db.close_fd(sid, fd);
+                            crate::fds::release(db, sid, fd);
                         }
                         db.clear_expiry(&kind, &id);
                     }
@@ -100,15 +111,9 @@ impl DurableObject for TerminalAuthority {
                         db.delete_session(&id);
                         db.clear_expiry(&kind, &id);
                     }
-                    // So does a presentation, unturned for long; its followers hear so.
-                    ("device", _, _) => devices::end(db, &id),
-                    // A listener let speak who did not.
-                    ("grant", _, _) => {
-                        if db.grant(&id).is_some_and(|grant| grant.device.is_none()) {
-                            db.delete_grant(&id);
-                        }
-                        db.clear_expiry(&kind, &id);
-                    }
+                    // So does a device: a presentation unturned for long, a sound unkept; its
+                    // followers hear so.
+                    ("device", _, _) => dev::hangup(db, &id, true),
                     _ => db.clear_expiry(&kind, &id),
                 }
             }
@@ -165,20 +170,23 @@ impl TerminalAuthority {
         }
         let pair = WebSocketPair::new()?;
         self.state.accept_web_socket(&pair.server);
-        // A cookie whose session is gone is a guest's, which has nothing to end.
+        // A cookie whose session is gone is a guest's, which has nothing to end; each browser
+        // signed out is a session all the same (auth::sid), which a driver's news may be for.
         let key = auth::token_key(req);
-        let uid = transact(&self.state, {
+        let guest = auth::guest_key(req);
+        let (uid, sid) = transact(&self.state, {
             let key = key.clone();
             move |db| {
                 let id = auth::identity(db, key.as_deref()).id;
-                (Some(id).filter(|id| *id != GUEST), false)
+                let sid = auth::sid(db, key.as_deref(), guest.as_deref());
+                ((Some(id).filter(|id| *id != GUEST), sid), false)
             }
         })?;
         pair.server.serialize_attachment(Line {
             session: key.filter(|_| uid.is_some()),
             uid,
+            sid,
             follows: Vec::new(),
-            asking: None,
         })?;
         if self.state.get_websocket_auto_response().is_none()
             && let Ok(ping) = worker::worker_sys::WebSocketRequestResponsePair::new("ping", "pong")
@@ -198,13 +206,20 @@ impl TerminalAuthority {
         let ended = db::take_ended();
         let removed = db::take_removed();
         let started = db::take_started();
-        if changed.is_empty() && !ended && removed.is_empty() && started.is_empty() {
+        let told = db::take_told();
+        if changed.is_empty()
+            && !ended
+            && removed.is_empty()
+            && started.is_empty()
+            && told.is_empty()
+        {
             return;
         }
         let sockets = self.state.get_websockets();
         if sockets.is_empty() {
             return;
         }
+        self.tell(&sockets, told);
         let lines: Vec<Line> = sockets.iter().map(Line::of).collect();
         let asked: Vec<(Option<String>, Vec<String>)> = lines
             .iter()
@@ -217,7 +232,7 @@ impl TerminalAuthority {
                 .iter()
                 .filter_map(|name| db.device(name))
                 .map(|device| {
-                    let voice = devices::voice(&device);
+                    let voice = dev::present::voice(&device);
                     (device, voice)
                 })
                 .collect();
@@ -250,12 +265,12 @@ impl TerminalAuthority {
                             if presentation.is_none() && !mine {
                                 return None;
                             }
-                            devices::followed(db, &who, &sound.name).ok()?;
+                            dev::followed(db, &who, &sound.name).ok()?;
                             Some(match voice {
                                 Some(voice) => serde_json::json!({ "sound": voice }),
                                 None => serde_json::json!({ "sound": {
                                     "device": sound.name, "presentation": presentation?.name,
-                                    "version": devices::version(sound),
+                                    "version": dev::version(sound),
                                 } }),
                             })
                         })
@@ -310,26 +325,35 @@ impl TerminalAuthority {
             }
         }
     }
-    /// Tell the pages of the account `owner`, those still signed in as it, `message`: a listener
-    /// asking to speak in its presentation, or no longer.
-    fn tell_presenter(&self, owner: u32, message: serde_json::Value) {
-        let sockets: Vec<WebSocket> = self
-            .state
-            .get_websockets()
-            .into_iter()
-            .filter(|ws| Line::of(ws).uid == Some(owner))
-            .collect();
-        let keys: Vec<Option<String>> = sockets.iter().map(|ws| Line::of(ws).session).collect();
-        let theirs = transact(&self.state, move |db| {
-            let theirs: Vec<bool> = keys
+    /// Send the drivers' news to the pages it is for: an account's, those still signed in as
+    /// it (a presenter's, of an ask to speak), or a session's (a listener's, of its answer).
+    fn tell(&self, sockets: &[WebSocket], told: Vec<(db::Told, serde_json::Value)>) {
+        if told.is_empty() {
+            return;
+        }
+        let lines: Vec<Line> = sockets.iter().map(Line::of).collect();
+        let keys: Vec<Option<String>> = lines.iter().map(|line| line.session.clone()).collect();
+        let uids = transact(&self.state, move |db| {
+            let uids: Vec<Option<u32>> = keys
                 .iter()
-                .map(|key| key.is_some() && auth::identity(db, key.as_deref()).id == owner)
+                .map(|key| {
+                    key.as_ref()
+                        .map(|key| auth::identity(db, Some(key)).id)
+                        .filter(|id| *id != GUEST)
+                })
                 .collect();
-            (theirs, false)
-        });
-        for (ws, theirs) in sockets.iter().zip(theirs.unwrap_or_default()) {
-            if theirs {
-                let _ = ws.send_with_str(message.to_string());
+            (uids, false)
+        })
+        .unwrap_or_default();
+        for (whom, message) in told {
+            for ((ws, line), uid) in sockets.iter().zip(&lines).zip(&uids) {
+                let theirs = match &whom {
+                    db::Told::Account(owner) => line.uid == Some(*owner) && *uid == Some(*owner),
+                    db::Told::Session(sid) => line.sid.as_deref() == Some(sid.as_str()),
+                };
+                if theirs {
+                    let _ = ws.send_with_str(message.to_string());
+                }
             }
         }
     }
@@ -344,11 +368,8 @@ impl TerminalAuthority {
     /// - `{"follow": [name...]}`: it follows these devices, a presentation /dev/present/NAME and
     ///   sounds /dev/snd/NAME, and no others; it is told what each shows (`followed`) and where
     ///   a presentation is, and hears when one ends or is replaced.
-    /// - `{"ask": name}`: a listener asks to speak in the presentation `name`, which they follow
-    ///   (owner's request, 2026-10-28); its presenter's pages hear so (`asking`), until it is
-    ///   answered, or the listener asks no more (`{"ask": null}`), or goes.
-    /// - `{"allow": id}`, `{"dismiss": id}`: the presenter answers the ask `id`. Allowed, the
-    ///   listener's page gets a token (`granted`) to send its voice with (devices::allow).
+    ///
+    /// Asking to speak, and answering, are a presentation's driver's (dev/present.rs).
     fn heard(&self, from: &WebSocket, text: &str) {
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "lowercase")]
@@ -356,9 +377,6 @@ impl TerminalAuthority {
             Present(Place),
             Where(String),
             Follow(Vec<String>),
-            Ask(Option<String>),
-            Allow(String),
-            Dismiss(String),
         }
         #[derive(serde::Deserialize, serde::Serialize)]
         struct Place {
@@ -401,13 +419,25 @@ impl TerminalAuthority {
                         return (Vec::new(), false);
                     }
                     db.set_place(who.id, &path, at);
-                    let presented: Vec<String> = db
-                        .presenting(who.id, &path)
+                    // The presentations of the file it may write (turn): its account's, and
+                    // another's that lets it, which its turn turns too.
+                    let writable: Vec<db::Device> = db
+                        .presentations_of(&path)
                         .into_iter()
-                        .map(|device| device.name)
+                        .filter(|device| {
+                            db.node(&device.name)
+                                .is_some_and(|node| dev::present::turns(&who, device, &node))
+                        })
                         .collect();
+                    let mut presented = Vec::new();
+                    for device in writable {
+                        if device.owner != who.id {
+                            db.set_place(device.owner, &path, at);
+                        }
+                        presented.push(device.name);
+                    }
                     for device in &presented {
-                        db.set_expiry("device", device, auth::now() + devices::PRESENT_TTL);
+                        db.set_expiry("device", device, auth::now() + dev::PRESENT_TTL);
                     }
                     // Whether each account may follow each device, asked once per turn: an
                     // audience of guests is one account.
@@ -432,7 +462,7 @@ impl TerminalAuthority {
                             (elsewhere && reader.id == who.id)
                                 || watching.into_iter().any(|device| {
                                     *may.entry((reader.id, device.as_str())).or_insert_with(|| {
-                                        devices::followed(db, &reader, device).is_ok()
+                                        dev::followed(db, &reader, device).is_ok()
                                     })
                                 })
                         })
@@ -473,8 +503,8 @@ impl TerminalAuthority {
                     let followed: Vec<_> = asked
                         .into_iter()
                         .map(|name| {
-                            let device = devices::followed(db, &who, &name).map(|device| {
-                                let version = devices::version(&device);
+                            let device = dev::followed(db, &who, &name).map(|device| {
+                                let version = dev::version(&device);
                                 (db.place(device.owner, &device.path), device.path, version)
                             });
                             (name, device)
@@ -511,134 +541,7 @@ impl TerminalAuthority {
                 }
                 line.keep(from);
             }
-            Said::Ask(asked) => {
-                // An earlier ask is withdrawn.
-                if let Some(asking) = line.asking.take() {
-                    line.keep(from);
-                    self.tell_presenter(
-                        asking.owner,
-                        serde_json::json!({ "asking": { "id": asking.id, "gone": true } }),
-                    );
-                }
-                let Some(presentation) = asked else {
-                    return;
-                };
-                let key = line.session.clone();
-                let followed = presentation.clone();
-                let checked = transact(&self.state, move |db| {
-                    let who = auth::identity(db, key.as_deref());
-                    let checked = devices::followed(db, &who, &followed).and_then(|device| {
-                        if terminal_worker_core::parent(&device.name) != PRESENT {
-                            return Err(format!("{followed}: not a presentation"));
-                        }
-                        if device.owner == who.id {
-                            return Err(format!("{followed}: you present it"));
-                        }
-                        Ok((device.owner, db.username(who.id)))
-                    });
-                    (checked, false)
-                });
-                let (owner, name) = match checked {
-                    Ok(Ok(checked)) => checked,
-                    Ok(Err(error)) => {
-                        let said =
-                            serde_json::json!({ "presentation": presentation, "error": error });
-                        return reply(from, serde_json::json!({ "asked": said }));
-                    }
-                    Err(_) => return,
-                };
-                let id = auth::random_token()[..16].to_string();
-                line.asking = Some(Asking {
-                    presentation: presentation.clone(),
-                    id: id.clone(),
-                    owner,
-                    name: name.clone(),
-                });
-                line.keep(from);
-                reply(
-                    from,
-                    serde_json::json!({ "asked": { "presentation": presentation, "id": id } }),
-                );
-                self.tell_presenter(
-                    owner,
-                    serde_json::json!({ "asking": { "presentation": presentation, "id": id, "name": name } }),
-                );
-            }
-            Said::Allow(id) => self.answer(from, &line, id, true),
-            Said::Dismiss(id) => self.answer(from, &line, id, false),
         }
-    }
-    /// The presenter's answer to the ask `id`, from the line `line`: allowed, the listener's page
-    /// gets a token to speak with; dismissed, it hears so. The presenter's pages hear it is
-    /// answered.
-    fn answer(&self, from: &WebSocket, line: &Line, id: String, allow: bool) {
-        let reply = |ws: &WebSocket, message: serde_json::Value| {
-            let _ = ws.send_with_str(message.to_string());
-        };
-        let asker = self
-            .state
-            .get_websockets()
-            .into_iter()
-            .find(|ws| Line::of(ws).asking.is_some_and(|asking| asking.id == id));
-        let Some(asker) = asker else {
-            return reply(
-                from,
-                serde_json::json!({ "asking": { "id": id, "gone": true } }),
-            );
-        };
-        let mut asking_line = Line::of(&asker);
-        let Some(asking) = asking_line.asking.clone() else {
-            return;
-        };
-        let key = line.session.clone();
-        let answered = asking.clone();
-        let answer = transact(&self.state, move |db| {
-            let who = auth::identity(db, key.as_deref());
-            if allow {
-                let allowed = devices::allow(
-                    db,
-                    &who,
-                    &answered.presentation,
-                    &answered.name,
-                    &answered.id,
-                );
-                let commit = allowed.is_ok();
-                (allowed.map(Some), commit)
-            } else {
-                let theirs = db
-                    .device(&answered.presentation)
-                    .is_some_and(|device| device.owner == who.id);
-                let dismissed = theirs
-                    .then_some(None)
-                    .ok_or_else(|| "Permission denied: it is another account's".into());
-                (dismissed, false)
-            }
-        });
-        let token = match answer {
-            Ok(Ok(token)) => token,
-            Ok(Err(error)) => {
-                return reply(
-                    from,
-                    serde_json::json!({ "asking": { "id": id, "error": error } }),
-                );
-            }
-            Err(_) => return,
-        };
-        asking_line.asking = None;
-        asking_line.keep(&asker);
-        let said = match token {
-            Some(token) => serde_json::json!({ "granted": {
-                "presentation": asking.presentation, "id": id, "token": token,
-            } }),
-            None => serde_json::json!({ "denied": {
-                "presentation": asking.presentation, "id": id,
-            } }),
-        };
-        reply(&asker, said);
-        self.tell_presenter(
-            asking.owner,
-            serde_json::json!({ "asking": { "id": id, "gone": true, "allowed": allow } }),
-        );
     }
     /// Run the alarm soon if a transaction left garbage or a deadline; it reschedules itself.
     async fn schedule(&self) -> Result<()> {
@@ -657,7 +560,7 @@ impl TerminalAuthority {
         }
         // /dev is there from the start, for storage made before it was too.
         transact(&self.state, |db| {
-            devices::ensure(db);
+            dev::ensure(db);
             crate::sys::ensure(db);
             ((), true)
         })?;
@@ -733,20 +636,9 @@ impl TerminalAuthority {
 /// The most devices a page follows: a presentation, its sound and voices.
 const FOLLOWS_MAX: usize = 8;
 
-/// The listeners asking to speak, on the pages' lines, as `GET /api/present` lists them for a
-/// presenter's bar: presentation, ask, who.
-pub fn asks(state: &State) -> Vec<(String, String, String)> {
-    state
-        .get_websockets()
-        .iter()
-        .filter_map(|ws| Line::of(ws).asking)
-        .map(|asking| (asking.presentation, asking.id, asking.name))
-        .collect()
-}
-
 /// What a page's line keeps: the session it was opened with (none for a guest's, or once that
-/// session ended), its account then, the devices it follows: a presentation, sounds; and its
-/// ask to speak, if it asks.
+/// session ended), its account then, its session as descriptors are kept (auth::sid, a guest's
+/// browser too), and the devices it follows: a presentation, sounds.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Line {
     session: Option<String>,
@@ -754,18 +646,9 @@ struct Line {
     #[serde(default)]
     uid: Option<u32>,
     #[serde(default)]
-    follows: Vec<String>,
+    sid: Option<String>,
     #[serde(default)]
-    asking: Option<Asking>,
-}
-/// A listener's ask to speak in the presentation `presentation`, whose account is `owner`, as
-/// `name` (guest, signed out): `id` names it to the presenter, who answers it.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct Asking {
-    presentation: String,
-    id: String,
-    owner: u32,
-    name: String,
+    follows: Vec<String>,
 }
 impl Line {
     fn of(ws: &WebSocket) -> Self {
@@ -777,9 +660,7 @@ impl Line {
                 let session = ws.deserialize_attachment::<Option<String>>().ok()??;
                 Some(Line {
                     session,
-                    uid: None,
-                    follows: Vec::new(),
-                    asking: None,
+                    ..Line::default()
                 })
             })
             .unwrap_or_default()

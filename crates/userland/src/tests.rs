@@ -67,7 +67,9 @@ impl Mem {
                 request: FICLONE,
                 arg,
             } => {
-                let source = fds.get(&(arg as u32)).ok_or(Errno::EBADF)?;
+                let source = fds
+                    .get(&(arg.as_u64().unwrap_or(u64::MAX) as u32))
+                    .ok_or(Errno::EBADF)?;
                 let (file, size) = (source.file.clone(), source.size);
                 let target = fds.get(&fd).filter(|f| f.write).ok_or(Errno::EBADF)?;
                 let node = fs.node(&target.path).ok_or(Errno::ENOENT)?;

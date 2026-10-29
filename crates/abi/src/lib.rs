@@ -254,6 +254,19 @@ pub const O_APPEND: u32 = 0o2000;
 /// the one `arg` reads, shared, nothing copied (what `cp` does).
 pub const FICLONE: u32 = 0x4004_9409;
 
+/// The requests of /dev/present's driver: show a file (`{path}`), on a descriptor that writes
+/// it; ask to speak (`{withdraw}` to withdraw), on one that reads it; answer an ask (`{id,
+/// allow}`), as its owner; speak (`{sdp, mid}`), on one that writes it, which an answer gave.
+pub const PRESENT_SHOW: u32 = 0x5001;
+pub const PRESENT_ASK: u32 = 0x5002;
+pub const PRESENT_ANSWER: u32 = 0x5003;
+pub const PRESENT_SPEAK: u32 = 0x5004;
+/// The requests of /dev/snd's: send the sound (`{sdp, mid}`), on a descriptor that writes it;
+/// hear it, on one that reads it; answer what Realtime offered (`{session, sdp}`).
+pub const SND_PUBLISH: u32 = 0x5101;
+pub const SND_LISTEN: u32 = 0x5102;
+pub const SND_ANSWER: u32 = 0x5103;
+
 /// What open(2) gave: the descriptor, and what a writer needs to write the file in chunks:
 /// their size, those already there (an unfinished file it goes on with), and whether the
 /// file is new.
@@ -325,10 +338,14 @@ pub enum Call {
         path: String,
         mode: u16,
     },
-    /// A regular file, empty, as mknod(2) makes one with `S_IFREG` (what touch makes).
+    /// A regular file, empty, as mknod(2) makes one with `S_IFREG` (what touch makes); or,
+    /// with `rdev`, a character device of that driver, in its directory (/dev/present,
+    /// /dev/snd), as its driver lets: signed in, a name free or the caller's own.
     Mknod {
         path: String,
         mode: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rdev: Option<String>,
     },
     Rmdir {
         path: String,
@@ -430,11 +447,13 @@ pub enum Call {
     },
     /// The session's descriptors.
     Fds,
+    /// A request of the file or device `fd` reads or writes, about `arg`: FICLONE's the
+    /// descriptor cloned from; a driver's, what its request takes.
     Ioctl {
         fd: u32,
         request: u32,
         #[serde(default)]
-        arg: u64,
+        arg: serde_json::Value,
     },
 }
 fn creation_mode() -> u16 {

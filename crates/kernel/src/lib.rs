@@ -82,7 +82,9 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
         Call::Access { path, mode } => access(fs, cred, &path, mode).map(|()| Value::Null),
         Call::Readlink { path } => readlink(fs, cred, &path).map(Value::String),
         Call::Mkdir { path, mode } => mkdir(fs, process, &path, mode).map(|()| Value::Null),
-        Call::Mknod { path, mode } => mknod(fs, process, &path, mode).map(|()| Value::Null),
+        // A device is its driver's to make (the host's).
+        Call::Mknod { rdev: Some(_), .. } => Err(Errno::ENOSYS.into()),
+        Call::Mknod { path, mode, .. } => mknod(fs, process, &path, mode).map(|()| Value::Null),
         Call::Rmdir { path } => rmdir(fs, cred, &path).map(|()| Value::Null),
         Call::Unlink { path } => unlink(fs, cred, &path).map(|()| Value::Null),
         Call::Rename {
@@ -146,6 +148,8 @@ pub fn stat_of(fs: &impl Fs, node: &Node) -> Stat {
         abi::S_IFDIR
     } else if node.is_link() {
         abi::S_IFLNK
+    } else if node.is_device() {
+        abi::S_IFCHR
     } else {
         abi::S_IFREG
     };
@@ -170,7 +174,7 @@ pub fn stat_of(fs: &impl Fs, node: &Node) -> Stat {
         mtime,
         ctime,
         link: node.link.clone(),
-        rdev: None,
+        rdev: node.rdev.clone(),
         acl: node.acl.is_some(),
         writing,
     }
@@ -395,6 +399,13 @@ pub fn rename(
         return Err(Errno::EBUSY.into());
     }
     let (source, node) = existing(fs, cred, from, false)?;
+    // A device's name is its driver's, which knows it by it.
+    if node.is_device() {
+        return Err(Error::because(
+            Errno::EPERM,
+            "a device stays where its driver made it",
+        ));
+    }
     let target = namei(fs, cred, to, false)?;
     let dir = fs.node(parent(&target.path)).ok_or(Errno::ENOENT)?;
     require(cred, &dir, WRITE | EXEC)?;
@@ -469,7 +480,7 @@ pub fn rename(
 /// may read and write, and not setuid, nor setgid and group-executable.
 pub fn link(fs: &mut impl Fs, cred: &Identity, from: &str, to: &str, follow: bool) -> Result<()> {
     let (_, node) = existing(fs, cred, from, follow)?;
-    if node.directory {
+    if node.directory || node.is_device() {
         return Err(Errno::EPERM.into());
     }
     if node.file.as_deref().is_some_and(|id| fs.uploading(id)) {

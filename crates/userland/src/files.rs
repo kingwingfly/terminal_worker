@@ -65,6 +65,7 @@ fn entry(
             .as_ref()
             .is_some_and(|writing| writing.recording),
         link: lstat.link.clone(),
+        device: lstat.rdev.clone(),
         links: lstat.nlink,
         acl: lstat.acl,
         denied,
@@ -884,6 +885,7 @@ pub async fn touch(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
             .map(|(_, path)| Call::Mknod {
                 path: (*path).clone(),
                 mode: 0o666,
+                rdev: None,
             })
             .collect(),
     )

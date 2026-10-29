@@ -279,7 +279,7 @@ pub fn delete_account(
     }
     db.delete_sessions(user.id);
     for device in db.devices_of(user.id) {
-        crate::devices::end(db, &device);
+        crate::dev::hangup(db, &device, true);
     }
     db.delete_places(user.id);
     Ok(kept)

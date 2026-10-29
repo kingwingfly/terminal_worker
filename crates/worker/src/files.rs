@@ -113,6 +113,10 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
         headers.set("Content-Type", "text/plain; charset=utf-8")?;
         return Ok(Response::ok(text)?.with_headers(headers));
     }
+    // A device's content is its driver's state, as it is now (cat /dev/present/NAME).
+    if grant["device"].is_object() {
+        return Response::from_json(&grant);
+    }
     let grant: Grant = serde_json::from_value(grant)?;
     let headers = Headers::new();
     headers.set("Content-Type", &grant.mime)?;

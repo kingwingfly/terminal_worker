@@ -15,8 +15,7 @@ use wasm_bindgen_futures::JsFuture;
 
 use super::{LogLine, Output, Shell, js_message};
 use crate::{
-    choose_files, endpoint, enterable, listing, open_file, record_sound, request, set_directory,
-    stat, upload_files,
+    choose_files, enterable, listing, open_file, record_sound, set_directory, stat, upload_files,
 };
 
 /// A command the tab runs.
@@ -330,19 +329,23 @@ impl TerminalCommand for Present {
     ) -> LocalBoxFuture<'static, Result<Output, String>> {
         async move {
             let present = cli::parse::<files::Present>(rest(&args))?;
-            let encode = |text: &str| String::from(js_sys::encode_uri_component(text));
+            let failed = |error: wasm_bindgen::JsValue| format!("present: {}", js_message(error));
             if let Some(name) = present.stop {
-                let stopped =
-                    request(&format!("/api/present?name={}", encode(&name)), "DELETE").await?;
-                let device = stopped["device"].as_str().unwrap_or(&name);
+                let stopped = JsFuture::from(crate::stop_presenting(&name))
+                    .await
+                    .map_err(failed)?;
+                let device = js_sys::Reflect::get(&stopped, &"device".into())
+                    .ok()
+                    .and_then(|device| device.as_string())
+                    .unwrap_or(name);
                 return Ok(Output::text(format!("Stopped {device}\n")));
             }
             let path = shell.path(present.file.as_deref().unwrap_or_default())?;
-            let mut url = endpoint("present", &path);
-            if let Some(name) = &present.name {
-                url.push_str(&format!("&name={}", encode(name)));
-            }
-            let started = request(&url, "POST").await?;
+            let started = JsFuture::from(crate::present_file(&path, present.name.clone()))
+                .await
+                .map_err(failed)?;
+            let started: serde_json::Value =
+                serde_wasm_bindgen::from_value(started).unwrap_or_default();
             let device = started["device"].as_str().unwrap_or_default().to_string();
             // Shown presented, a PDF a page at a time and Markdown as slides, from where the
             // account showed it last.

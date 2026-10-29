@@ -42,6 +42,11 @@ extern "C" {
     ) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = stopRecording)]
     fn stop_recording() -> bool;
+    /// present: /dev/present/NAME made of system calls (web/dev.mjs).
+    #[wasm_bindgen(js_namespace = terminal, js_name = presentFile)]
+    fn present_file(path: &str, name: Option<String>) -> js_sys::Promise;
+    #[wasm_bindgen(js_namespace = terminal, js_name = stopPresenting)]
+    fn stop_presenting(name: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_namespace = terminal, js_name = cancelChoosing)]
     fn cancel_choosing() -> bool;
     #[wasm_bindgen(js_namespace = terminal, js_name = setDirectory)]

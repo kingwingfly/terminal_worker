@@ -34,7 +34,7 @@ const ROLLBACK: &str = "rollback";
 /// The version of the tables below, which local state made by an older one does not have.
 pub const SCHEMA_VERSION: &str = "3";
 
-const SCHEMA: [&str; 24] = [
+const SCHEMA: [&str; 25] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
@@ -46,7 +46,7 @@ const SCHEMA: [&str; 24] = [
     "CREATE INDEX IF NOT EXISTS nodes_ino ON nodes(ino)",
     // An inode: a directory, a file showing content, or a symbolic link to `link`; its ACLs as
     // JSON (crate::acl); when its content (a directory's entries) last changed, and it at all.
-    "CREATE TABLE IF NOT EXISTS inodes(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, grp INTEGER NOT NULL, mode INTEGER NOT NULL, directory INTEGER NOT NULL, file TEXT, size INTEGER NOT NULL, link TEXT, acl TEXT, default_acl TEXT, mtime INTEGER NOT NULL DEFAULT 0, ctime INTEGER NOT NULL DEFAULT 0)",
+    "CREATE TABLE IF NOT EXISTS inodes(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, grp INTEGER NOT NULL, mode INTEGER NOT NULL, directory INTEGER NOT NULL, file TEXT, size INTEGER NOT NULL, link TEXT, acl TEXT, default_acl TEXT, mtime INTEGER NOT NULL DEFAULT 0, ctime INTEGER NOT NULL DEFAULT 0, rdev TEXT)",
     "CREATE INDEX IF NOT EXISTS inodes_file ON inodes(file)",
     // Extended attributes, their values in hexadecimal.
     "CREATE TABLE IF NOT EXISTS xattrs(ino INTEGER NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(ino, name))",
@@ -57,7 +57,8 @@ const SCHEMA: [&str; 24] = [
     // File descriptors (fds.rs): a session's (each browser is one), by number; the content it
     // reads or writes (none once another writer took it over), where, its open(2) flags,
     // whether it made the file, and when it was last kept (its lease).
-    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, PRIMARY KEY(sid, fd))",
+    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, PRIMARY KEY(sid, fd))",
+    "CREATE INDEX IF NOT EXISTS fds_device ON fds(device)",
     "CREATE INDEX IF NOT EXISTS fds_file ON fds(file)",
     // R2 objects nothing refers to any more, which the alarm deletes.
     "CREATE TABLE IF NOT EXISTS garbage(key TEXT PRIMARY KEY)",
@@ -76,10 +77,9 @@ const SCHEMA: [&str; 24] = [
     // What /dev holds (devices.rs): presentations others follow, whose they are, and the file
     // presented; `media`, what a live sound has to be heard by.
     "CREATE TABLE IF NOT EXISTS devices(name TEXT PRIMARY KEY, owner INTEGER NOT NULL, path TEXT NOT NULL, media TEXT, started INTEGER NOT NULL)",
-    // A listener a presenter let speak (devices::allow): by the token its page was given, in
-    // which presentation, as whom, for which ask, and the voice it sends, once it does. A
-    // table of its own, made where it is missing.
-    "CREATE TABLE IF NOT EXISTS grants(token TEXT PRIMARY KEY, presentation TEXT NOT NULL, speaker TEXT NOT NULL, ask TEXT NOT NULL, device TEXT)",
+    // Listeners asking to speak in a presentation (dev/present.rs): a session at a time, by
+    // the id its presenter answers, as whom.
+    "CREATE TABLE IF NOT EXISTS asks(device TEXT NOT NULL, sid TEXT NOT NULL, id TEXT NOT NULL, uid INTEGER NOT NULL, name TEXT NOT NULL, PRIMARY KEY(device, sid))",
 ];
 
 thread_local! {
@@ -104,6 +104,23 @@ thread_local! {
     /// ... and those committed transactions started, which the pages following a presentation
     /// of their account hear of, to hear them (owner's request, 2026-10-28).
     static STARTED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// What the running transaction has for some pages to hear (a driver's news: an ask to
+    /// speak, its answer), ...
+    static TELLING: RefCell<Vec<(Told, serde_json::Value)>> = const { RefCell::new(Vec::new()) };
+    /// ... and what committed transactions had, which store.rs sends.
+    static TOLD: RefCell<Vec<(Told, serde_json::Value)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Whose pages hear something: an account's signed in as it, or a session's (auth::sid).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Told {
+    Account(u32),
+    Session(String),
+}
+
+/// What committed transactions had for pages to hear since this was last asked.
+pub fn take_told() -> Vec<(Told, serde_json::Value)> {
+    TOLD.take()
 }
 
 /// A device removed, or replaced (`replaced`), as it was: whose, and which (devices::version).
@@ -183,6 +200,14 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
             )?;
         }
     }
+    // Inodes made before devices were nodes of their own have no driver, and descriptors
+    // made before then open no device.
+    if sql.exec("SELECT rdev FROM inodes LIMIT 0", None).is_err() {
+        sql.exec("ALTER TABLE inodes ADD COLUMN rdev TEXT", None)?;
+    }
+    if sql.exec("SELECT device FROM fds LIMIT 0", None).is_err() {
+        sql.exec("ALTER TABLE fds ADD COLUMN device TEXT", None)?;
+    }
     // Tables made just now are this version's, said at once: initialization may fail (a
     // missing ADMIN_PASSWORD), and the next start must not take them for an older version's.
     if !tables.iter().any(|t| t.name == "users") {
@@ -214,12 +239,14 @@ pub fn transact<T: 'static>(
         CHANGING.take();
         REMOVING.take();
         STARTING.take();
+        TELLING.take();
         let mut db = Db { sql: sql.clone() };
         let (value, commit) = work(&mut db);
         *slot.borrow_mut() = Some(value);
         let changing = CHANGING.take();
         let removing = REMOVING.take();
         let starting = STARTING.take();
+        let telling = TELLING.take();
         match FAILED.with(|f| f.borrow_mut().take()) {
             Some(error) => JsValue::from_str(&error),
             None if !commit => JsValue::from_str(ROLLBACK),
@@ -227,6 +254,7 @@ pub fn transact<T: 'static>(
                 CHANGED.with(|changed| changed.borrow_mut().extend(changing));
                 REMOVED.with(|removed| removed.borrow_mut().extend(removing));
                 STARTED.with(|started| started.borrow_mut().extend(starting));
+                TOLD.with(|told| told.borrow_mut().extend(telling));
                 JsValue::UNDEFINED
             }
         }
@@ -255,6 +283,7 @@ struct NodeRow {
     file: Option<String>,
     size: u64,
     link: Option<String>,
+    rdev: Option<String>,
     acl: Option<String>,
     default_acl: Option<String>,
     links: u32,
@@ -272,6 +301,7 @@ impl NodeRow {
                 file: self.file,
                 size: self.size,
                 link: self.link,
+                rdev: self.rdev,
                 links: self.links,
                 acl: self.acl.and_then(|a| serde_json::from_str(&a).ok()),
                 default_acl: self.default_acl.and_then(|a| serde_json::from_str(&a).ok()),
@@ -375,6 +405,8 @@ pub struct Fd {
     pub fd: u32,
     /// What it reads or writes; none once another writer took the file over.
     pub file: Option<String>,
+    /// The device it opens, if it is one (dev/).
+    pub device: Option<String>,
     pub path: String,
     pub flags: u32,
     #[serde(deserialize_with = "flag")]
@@ -402,14 +434,15 @@ pub struct Device {
     pub path: String,
     pub media: Option<String>,
 }
-/// A listener let speak in a presentation (devices::allow).
+/// A listener asking to speak in the presentation `device` (dev/present.rs): its session, the
+/// id its presenter answers, and as whom.
 #[derive(Clone, Debug, Deserialize)]
-pub struct Grant {
-    pub token: String,
-    pub presentation: String,
-    pub speaker: String,
-    pub ask: String,
-    pub device: Option<String>,
+pub struct Ask {
+    pub device: String,
+    pub sid: String,
+    pub id: String,
+    pub uid: u32,
+    pub name: String,
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct Chunk {
@@ -541,7 +574,7 @@ impl Db {
     /// The descriptor `fd` of the session `sid`.
     pub fn fd(&self, sid: &str, fd: u32) -> Option<Fd> {
         self.rows(
-            "SELECT fd, file, path, flags, created, leased FROM fds WHERE sid = ? AND fd = ?",
+            "SELECT fd, file, device, path, flags, created, leased FROM fds WHERE sid = ? AND fd = ?",
             vec![text(sid), int(fd)],
         )
         .pop()
@@ -549,14 +582,14 @@ impl Db {
     /// The descriptors of the session `sid`.
     pub fn fds_of(&self, sid: &str) -> Vec<Fd> {
         self.rows(
-            "SELECT fd, file, path, flags, created, leased FROM fds WHERE sid = ? ORDER BY fd",
+            "SELECT fd, file, device, path, flags, created, leased FROM fds WHERE sid = ? ORDER BY fd",
             vec![text(sid)],
         )
     }
     /// The descriptor writing `file`, if one is.
     pub fn writer(&self, file: &str) -> Option<Fd> {
         self.rows(
-            "SELECT fd, file, path, flags, created, leased FROM fds WHERE file = ? AND flags & 3 != 0",
+            "SELECT fd, file, device, path, flags, created, leased FROM fds WHERE file = ? AND flags & 3 != 0",
             vec![text(file)],
         )
         .pop()
@@ -992,6 +1025,25 @@ impl Db {
             vec![text(presentation)],
         )
     }
+    /// The presentations of the file at `path`, whoever's.
+    pub fn presentations_of(&self, path: &str) -> Vec<Device> {
+        self.rows::<Device>(
+            "SELECT name, owner, path, media FROM devices WHERE path = ? AND name LIKE '/dev/present/%'",
+            vec![text(path)],
+        )
+    }
+    /// The devices in the directory `directory` (/dev/present, /dev/snd).
+    pub fn devices_in(&self, directory: &str) -> Vec<Device> {
+        self.rows::<Device>(
+            "SELECT name, owner, path, media FROM devices WHERE name LIKE ? ORDER BY name",
+            vec![text(&format!("{directory}/%"))],
+        )
+    }
+    /// Remove the device `name` with no word to its followers: one of the same name replaces it,
+    /// which they hear of (`replaced_device`).
+    pub fn forget_device(&mut self, name: &str) {
+        self.run("DELETE FROM devices WHERE name = ?", vec![text(name)]);
+    }
     /// The names of `owner`'s devices.
     pub fn devices_of(&self, owner: u32) -> Vec<String> {
         self.rows::<Device>(
@@ -1032,7 +1084,7 @@ impl Db {
             name: name.to_string(),
             replaced,
             owner: device.owner,
-            version: crate::devices::version(&device),
+            version: crate::dev::version(&device),
         };
         REMOVING.with(|removing| removing.borrow_mut().push(removed));
     }
@@ -1041,34 +1093,62 @@ impl Db {
     pub fn started_sound(&mut self, name: &str) {
         STARTING.with(|starting| starting.borrow_mut().push(name.to_string()));
     }
-    pub fn grant(&self, token: &str) -> Option<Grant> {
-        self.rows::<Grant>(
-            "SELECT token, presentation, speaker, ask, device FROM grants WHERE token = ?",
-            vec![text(token)],
+    /// The asks to speak in the presentation `device`, in the order asked.
+    pub fn asks(&self, device: &str) -> Vec<Ask> {
+        self.rows(
+            "SELECT device, sid, id, uid, name FROM asks WHERE device = ? ORDER BY rowid",
+            vec![text(device)],
         )
-        .pop()
     }
-    pub fn set_grant(&mut self, grant: &Grant) {
+    /// The asks of the session `sid`.
+    pub fn asks_of(&self, sid: &str) -> Vec<Ask> {
+        self.rows(
+            "SELECT device, sid, id, uid, name FROM asks WHERE sid = ?",
+            vec![text(sid)],
+        )
+    }
+    pub fn set_ask(&mut self, ask: &Ask) {
         self.run(
-            "INSERT OR REPLACE INTO grants(token, presentation, speaker, ask, device) VALUES(?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO asks(device, sid, id, uid, name) VALUES(?, ?, ?, ?, ?)",
             vec![
-                text(&grant.token),
-                text(&grant.presentation),
-                text(&grant.speaker),
-                text(&grant.ask),
-                grant.device.as_deref().map_or(SqlStorageValue::Null, text),
+                text(&ask.device),
+                text(&ask.sid),
+                text(&ask.id),
+                int(ask.uid),
+                text(&ask.name),
             ],
         );
     }
-    pub fn delete_grant(&mut self, token: &str) {
-        self.run("DELETE FROM grants WHERE token = ?", vec![text(token)]);
-    }
-    /// Forget the grants of the presentation, or the voice, `name`, which ended.
-    pub fn delete_grants_of(&mut self, name: &str) {
+    pub fn delete_ask(&mut self, device: &str, sid: &str) {
         self.run(
-            "DELETE FROM grants WHERE presentation = ? OR device = ?",
-            vec![text(name), text(name)],
+            "DELETE FROM asks WHERE device = ? AND sid = ?",
+            vec![text(device), text(sid)],
         );
+    }
+    /// Forget the asks of the presentation `device`, which ended.
+    pub fn delete_asks_of(&mut self, device: &str) {
+        self.run("DELETE FROM asks WHERE device = ?", vec![text(device)]);
+    }
+    /// A new descriptor of the session `sid` that opens the device `device` at `path`: the
+    /// lowest number free from 3.
+    pub fn add_device_fd(&mut self, sid: &str, device: &str, flags: u32, now: u64) -> u32 {
+        let fd = self.add_fd(sid, None, device, flags, false, now);
+        self.run(
+            "UPDATE fds SET device = ? WHERE sid = ? AND fd = ?",
+            vec![text(device), text(sid), int(fd)],
+        );
+        fd
+    }
+    /// The descriptors of the device `device`, which went, open nothing any more (EBADF).
+    pub fn revoke_device(&mut self, device: &str) {
+        self.run(
+            "UPDATE fds SET device = NULL WHERE device = ?",
+            vec![text(device)],
+        );
+    }
+    /// Have the pages of `whom` hear `message`, once this commits.
+    pub fn tell(&mut self, whom: Told, message: serde_json::Value) {
+        TELLING.with(|telling| telling.borrow_mut().push((whom, message)));
     }
     pub fn set_expiry(&mut self, kind: &str, id: &str, due: u64) {
         self.run(
@@ -1125,7 +1205,7 @@ impl Db {
 
 /// Names and their inodes, with how many names each has: a directory, 2 and one for each
 /// directory in it.
-const NODE: &str = "SELECT n.path, i.id AS ino, i.owner, i.grp, i.mode, i.directory, i.file, i.size, i.link, i.acl, i.default_acl, CASE WHEN i.directory = 1 THEN 2 + (SELECT COUNT(*) FROM nodes c JOIN inodes ci ON ci.id = c.ino WHERE c.parent = n.path AND ci.directory = 1) ELSE (SELECT COUNT(*) FROM nodes m WHERE m.ino = i.id) END AS links FROM nodes n JOIN inodes i ON i.id = n.ino";
+const NODE: &str = "SELECT n.path, i.id AS ino, i.owner, i.grp, i.mode, i.directory, i.file, i.size, i.link, i.rdev, i.acl, i.default_acl, CASE WHEN i.directory = 1 THEN 2 + (SELECT COUNT(*) FROM nodes c JOIN inodes ci ON ci.id = c.ino WHERE c.parent = n.path AND ci.directory = 1) ELSE (SELECT COUNT(*) FROM nodes m WHERE m.ino = i.id) END AS links FROM nodes n JOIN inodes i ON i.id = n.ino";
 const JOB: &str =
     "SELECT id, owner, actor, kind, spec, state, progress, question, created FROM jobs";
 
@@ -1214,15 +1294,7 @@ impl kernel::Fs for Db {
         cred: &Identity,
         path: &str,
     ) -> Option<std::result::Result<(), abi::Error>> {
-        let stopped = crate::devices::remove(self, cred, path)?;
-        Some(stopped.map(|_| ()).map_err(|why| {
-            let errno = if crate::commands::is_permission_error(&why) {
-                abi::Errno::EACCES
-            } else {
-                abi::Errno::EPERM
-            };
-            abi::Error::because(errno, why)
-        }))
+        crate::dev::unlink(self, cred, path)
     }
 }
 
@@ -1278,6 +1350,7 @@ impl Store for Db {
             node.file.as_deref().into(),
             int(node.size),
             node.link.as_deref().into(),
+            node.rdev.as_deref().into(),
             json(node.acl.as_ref().map(|a| serde_json::json!(a).to_string())),
             json(
                 node.default_acl
@@ -1289,7 +1362,7 @@ impl Store for Db {
             let mut values = values;
             values.extend([int(now), int(now)]);
             self.rows::<Id>(
-                "INSERT INTO inodes(owner, grp, mode, directory, file, size, link, acl, default_acl, mtime, ctime) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                "INSERT INTO inodes(owner, grp, mode, directory, file, size, link, rdev, acl, default_acl, mtime, ctime) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
                 values,
             )
             .pop()
@@ -1308,7 +1381,7 @@ impl Store for Db {
             let mut values = values;
             values.extend([int(mtime), int(now), int(node.ino)]);
             self.run(
-                "UPDATE inodes SET owner = ?, grp = ?, mode = ?, directory = ?, file = ?, size = ?, link = ?, acl = ?, default_acl = ?, mtime = ?, ctime = ? WHERE id = ?",
+                "UPDATE inodes SET owner = ?, grp = ?, mode = ?, directory = ?, file = ?, size = ?, link = ?, rdev = ?, acl = ?, default_acl = ?, mtime = ?, ctime = ? WHERE id = ?",
                 values,
             );
             // Every name of it shows the change.

@@ -1,8 +1,12 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { call, entry, errno, names, program, put, rmrf } from './sys.js';
+import { call, entry, errno, names, program, put, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
-const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const vars = await readFile('.dev.vars', 'utf8');
+const rootPassword = vars.match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+// Whether the site has a Realtime app: its keys are named in .dev.vars (their values are not
+// read here).
+const realtime = /^REALTIME_APP_ID=.+$/m.test(vars) && /^REALTIME_APP_TOKEN=.+$/m.test(vars);
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 // Chromium's fake microphone, which plays a tone, granted without asking; and the launch options
 // of playwright.config.js, which test.use replaces.
@@ -107,9 +111,8 @@ test('a recording whose microphone stops on its own is saved, with what it heard
   }
 });
 
-test('live sound: /dev/snd/NAME is heard by whoever may read the recording, and with the presentation of its name', async ({ browser }) => {
-  const live = await root.post('/api/sound/listen?path=' + encodeURIComponent('/dev/snd/nothing'));
-  test.skip(live.status() === 503, 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)');
+test('live sound: /dev/snd/NAME is heard by whoever may read it, and with the presentation of its name', async ({ browser }) => {
+  test.skip(!realtime, 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)');
   const speaker = await device(browser, name, password), guest = await device(browser);
   const remote = await speaker.context.newPage(); await remote.goto(origin + '/');
   const recording = home + '/lecture.weba', deck = home + '/lecture.slides.md';
@@ -119,7 +122,7 @@ test('live sound: /dev/snd/NAME is heard by whoever may read the recording, and 
     await run(speaker.page, 'cd ~');
     await run(speaker.page, 'stream -n lecture lecture.weba');
     await expect(transcript(speaker.page)).toContainText('live as /dev/snd/lecture', { timeout: 20_000 });
-    // A guest hears it, as the recording, made with the umask, may be read by others.
+    // A guest hears it, as the device, made with the umask, may be read by others.
     await run(guest.page, 'open /dev/snd/lecture');
     const player = guest.page.getByRole('region', { name: 'Live sound' });
     await expect(player).toBeVisible(); await expect(player).toHaveAttribute('data-state', /live|paused/, { timeout: 20_000 });
@@ -138,7 +141,7 @@ test('live sound: /dev/snd/NAME is heard by whoever may read the recording, and 
     await expect(guest.page.getByRole('region', { name: 'Live sound' })).toBeHidden({ timeout: 10_000 });
   } finally {
     await rmrf(root, recording); await rmrf(root, deck);
-    await root.delete('/api/present?name=lecture');
+    await sys(root, [{ unlink: { path: '/dev/present/lecture' } }]);
     await speaker.context.close(); await guest.context.close();
   }
 });
@@ -172,8 +175,7 @@ test('jobs cancel stops a recording from another tab, keeping what arrived', asy
 });
 
 test('a live sound that never connects leaves no device behind', async ({ browser }) => {
-  const live = await root.post('/api/sound/listen?path=' + encodeURIComponent('/dev/snd/nothing'));
-  test.skip(live.status() === 503, 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)');
+  test.skip(!realtime, 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)');
   // Relayed candidates only, and no relay: the connection never comes.
   const speaker = await device(browser, name, password, context => context.addInitScript(() => {
     const Real = window.RTCPeerConnection;
@@ -196,8 +198,7 @@ test('a live sound that never connects leaves no device behind', async ({ browse
 });
 
 test('a page that stops its live sound leaves alone the one that took its name over', async ({ browser }) => {
-  const live = await root.post('/api/sound/listen?path=' + encodeURIComponent('/dev/snd/nothing'));
-  test.skip(live.status() === 503, 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)');
+  test.skip(!realtime, 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)');
   const laptop = await device(browser, name, password), phone = await device(browser, name, password);
   const first = home + '/first.weba', second = home + '/second.weba';
   const listed = () => names(root, '/dev/snd');
@@ -243,8 +244,7 @@ test('stream -m gives the recording its ACL as it is made; entries it cannot tak
 });
 
 test('stream -n NAME is live only: /dev/snd/NAME is a file of its own, whose permissions say who hears', async ({ browser }) => {
-  const live = await root.post('/api/sound/listen?path=' + encodeURIComponent('/dev/snd/nothing'));
-  test.skip(live.status() === 503, 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)');
+  test.skip(!realtime, 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)');
   const speaker = await device(browser, name, password), guest = await device(browser);
   const open = 'open' + Date.now().toString(36), closed = 'closed' + Date.now().toString(36);
   const listed = () => names(root, '/dev/snd');
@@ -272,7 +272,7 @@ test('stream -n NAME is live only: /dev/snd/NAME is a file of its own, whose per
     await expect.poll(listed, { timeout: 10_000 }).not.toContain(open);
     expect(await listed()).not.toContain(closed);
   } finally {
-    await root.delete('/api/sound?name=' + open); await root.delete('/api/sound?name=' + closed);
+    await sys(root, [{ unlink: { path: '/dev/snd/' + open } }]); await sys(root, [{ unlink: { path: '/dev/snd/' + closed } }]);
     await speaker.context.close(); await guest.context.close();
   }
 });

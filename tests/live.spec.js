@@ -1,8 +1,9 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { entry, errno, listing, mkdirp, names, program, put, rmrf } from './sys.js';
+import { call, entry, errno, mkdirp, names, program, put, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
-const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
+const vars = await readFile('.dev.vars', 'utf8');
+const rootPassword = vars.match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
 // Chromium's fake microphone, granted without asking; and the launch options of
 // playwright.config.js, which test.use replaces.
@@ -38,7 +39,9 @@ async function device(browser, username, password) {
 
 let root, name, password, base;
 const listed = directory => names(root, directory);
-const realtime = async () => (await root.post('/api/sound/listen?path=' + encodeURIComponent('/dev/snd/nothing'))).status() !== 503;
+// Whether the site has a Realtime app: its keys are named in .dev.vars (their values are not
+// read here).
+const realtime = async () => /^REALTIME_APP_ID=.+$/m.test(vars) && /^REALTIME_APP_TOKEN=.+$/m.test(vars);
 const NO_REALTIME = 'The site has no Cloudflare Realtime app (REALTIME_APP_ID, REALTIME_APP_TOKEN)';
 test.beforeAll(async () => {
   root = await playwrightRequest.newContext({ baseURL: origin, extraHTTPHeaders: { Origin: origin, 'CF-Connecting-IP': address('api') } });
@@ -98,8 +101,46 @@ test('Present in the bar makes /dev/present/NAME; rm of it stops it, as its acco
     await expect(shown(guest.page).locator('h1')).toHaveText('One');
     await expect(guest.page.getByRole('button', { name: 'Present to others' })).toBeHidden();
   } finally {
-    await root.delete('/api/present?name=' + stem);
+    await sys(root, [{ unlink: { path: '/dev/present/' + stem } }]);
     for (const { context } of [laptop, phone, guest]) await context.close();
+  }
+});
+
+test('a presentation is a character device: ls -l and cat tell of it; chmod decides who follows, setfacl who turns', async ({ browser }) => {
+  const { stem, path } = await deck();
+  const cohost = 'cohost' + Date.now().toString(36);
+  expect((await program(root, ['useradd', '-m', cohost])).ok()).toBe(true);
+  expect((await root.post('/api/passwd', { data: { username: cohost, password } })).ok()).toBe(true);
+  const laptop = await device(browser, name, password), guest = await device(browser), helper = await device(browser, cohost, password);
+  const device_ = `/dev/present/${stem}`;
+  try {
+    await run(laptop.page, `present ${path}`);
+    await expect(shown(laptop.page).locator('h1')).toHaveText('One');
+    await laptop.page.getByRole('button', { name: 'Close preview' }).click();
+    // Its presenter's, made as a file is, with the file's mode.
+    await run(guest.page, `ls -l ${device_}`);
+    await expect(transcript(guest.page)).toContainText(new RegExp(`crw-r--r-- +1 ${name}:${name} +0 ${device_}`));
+    await run(guest.page, `cat ${device_}`);
+    await expect(transcript(guest.page)).toContainText(`"path":"${path}"`);
+    // Its mode says who follows it: chmod 600, and guests may not.
+    await run(laptop.page, `chmod 600 ${device_}`);
+    await run(guest.page, `open ${device_}`);
+    await expect(transcript(guest.page)).toContainText('Permission denied');
+    await run(laptop.page, `chmod 644 ${device_}`);
+    await run(guest.page, `open ${device_}`);
+    await expect(guest.page.locator('.presentation-badge')).toHaveText(`Following ${name}`);
+    // An ACL entry that lets another account write it makes a co-host, whose turns are the
+    // presentation's.
+    await run(laptop.page, `setfacl -m u:${cohost}:rw ${device_}`);
+    await run(helper.page, `open ${device_}`);
+    await expect(shown(helper.page).locator('h1')).toHaveText('One');
+    await expect(helper.page.locator('.presentation-badge')).toHaveCount(0);
+    await helper.page.keyboard.press('ArrowRight');
+    await expect(shown(guest.page).locator('h1')).toHaveText('Two');
+  } finally {
+    await sys(root, [{ unlink: { path: device_ } }]);
+    await program(root, ['userdel', '-r', cohost]);
+    for (const { context } of [laptop, guest, helper]) await context.close();
   }
 });
 
@@ -156,7 +197,7 @@ test('stream is live as the account\'s name; its presentation\'s listeners conne
     await expect(transcript(phone.page)).toContainText(new RegExp(`✓ /dev/snd/${name} · \\d\\d:\\d\\d`), { timeout: 30_000 });
     await expect(player(guest.page)).toBeHidden({ timeout: 10_000 });
   } finally {
-    await root.delete('/api/present?name=' + stem); await root.delete('/api/sound?name=' + name);
+    await sys(root, [{ unlink: { path: '/dev/present/' + stem } }]); await sys(root, [{ unlink: { path: '/dev/snd/' + name } }]);
     for (const { context } of [laptop, phone, guest]) await context.close();
   }
 });
@@ -203,12 +244,17 @@ test('a listener asks to speak; allowed, everyone following hears them, until th
     await laptop.page.getByRole('menuitem', { name: 'Allow' }).click();
     await expect(ask).toHaveAttribute('title', /^Speaking/, { timeout: 20_000 });
     await expect.poll(() => listed('/dev/snd'), { timeout: 10_000 }).toContain(`${stem}-guest`);
-    const voice = (await listing(root, '/dev/snd')).find(entry => entry.name === `${stem}-guest`);
-    expect([voice.owner, voice.link]).toEqual([name, path]);
+    // The presenter's, a device that whoever follows the presentation hears.
+    const voice = await entry(root, `/dev/snd/${stem}-guest`);
+    expect([voice.owner, voice.mode]).toEqual([name, 0o644]);
     await expect(other.page.locator('#listening-name')).toHaveText('guest speaking', { timeout: 20_000 });
     await expect(player(other.page)).toHaveAttribute('data-state', /live|paused/);
     await expect.poll(() => laptop.page.evaluate(() => document.querySelectorAll('.voice-audio').length), { timeout: 20_000 }).toBe(1);
     await expect(asker.page.locator('#listening-name')).not.toHaveText(/guest speaking/);
+    // Two guest browsers are one account, two sessions: the one allowed writes the
+    // presentation through the descriptor passed to it; the other may not.
+    expect(await errno(other.context.request, { open: { path: `/dev/present/${stem}`, flags: 1 } })).toBe('EACCES');
+    expect((await call(asker.context.request, 'fds')).filter(fd => fd.path === `/dev/present/${stem}` && fd.flags & 1)).toHaveLength(1);
     // Ended by the presenter, the bars shown again by the pointer: the listener's microphone
     // stops, and the others hear it no more.
     await laptop.page.mouse.move(400, 300); await laptop.page.mouse.move(410, 310);
@@ -220,11 +266,13 @@ test('a listener asks to speak; allowed, everyone following hears them, until th
     await expect(player(other.page)).toBeHidden({ timeout: 10_000 });
     expect(await listed('/dev/snd')).not.toContain(`${stem}-guest`);
     await laptop.page.evaluate(() => document.exitFullscreen());
-    // No one speaks without a grant, and a grant starts one voice.
-    const forged = await asker.context.request.post(origin + '/api/sound?grant=' + 'f'.repeat(64), { headers: { Origin: origin }, data: { sdp: 'v=0', mid: '0' } });
-    expect([forged.status(), (await forged.json()).error]).toEqual([400, 'Not allowed to speak, or no longer: ask again']);
+    // No one speaks without the presenter's leave: a guest's session may not write the
+    // presentation, now that its voice ended, nor speak through a descriptor that reads it.
+    expect(await errno(asker.context.request, { open: { path: `/dev/present/${stem}`, flags: 1 } })).toBe('EACCES');
+    const [reading] = await sys(asker.context.request, [{ open: { path: `/dev/present/${stem}`, flags: 0 } }]);
+    expect(await errno(asker.context.request, { ioctl: { fd: reading.ok.fd, request: 0x5004, arg: { sdp: 'v=0', mid: '0' } } })).toBe('EBADF');
   } finally {
-    await root.delete('/api/present?name=' + stem);
+    await sys(root, [{ unlink: { path: '/dev/present/' + stem } }]);
     for (const { context } of [laptop, asker, other]) await context.close();
   }
 });
@@ -234,7 +282,8 @@ test('a sound whose connection fails is heard again', async ({ browser }) => {
   const speaker = await device(browser, name, password), guest = await device(browser);
   const sound = 'again' + Date.now().toString(36);
   let listens = 0;
-  guest.page.on('request', request => { if (request.url().includes('/api/sound/listen')) listens++; });
+  // A listen is the sound driver's request (abi::SND_LISTEN).
+  guest.page.on('request', request => { if (request.url().endsWith('/api/sys') && (request.postData() || '').includes('"request":20738')) listens++; });
   try {
     await run(speaker.page, `stream -n ${sound}`);
     await expect(transcript(speaker.page)).toContainText(`● live as /dev/snd/${sound}`, { timeout: 20_000 });
@@ -253,7 +302,7 @@ test('a sound whose connection fails is heard again', async ({ browser }) => {
     await speaker.page.locator('#command').press('Control+c');
     await expect(player(guest.page)).toBeHidden({ timeout: 10_000 });
   } finally {
-    await root.delete('/api/sound?name=' + sound);
+    await sys(root, [{ unlink: { path: '/dev/snd/' + sound } }]);
     await speaker.context.close(); await guest.context.close();
   }
 });

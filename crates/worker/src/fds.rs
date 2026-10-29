@@ -47,10 +47,14 @@ pub fn call(db: &mut Db, sid: Option<&str>, process: &Process, call: Call) -> Re
         Call::Close { fd } => close(db, sid, &process.cred, fd).map(|c| json!(c)),
         Call::Lease { fd } => lease(db, sid, fd).map(|()| Value::Null),
         Call::Fds => Ok(json!(fds(db, sid))),
-        Call::Ioctl { fd, request, arg } if request == FICLONE => {
-            clone(db, sid, &process.cred, fd, arg).map(|()| Value::Null)
-        }
-        Call::Ioctl { .. } => Err(Errno::ENOTTY.into()),
+        Call::Ioctl { fd, request, arg } => match crate::dev::request(db, sid, fd)? {
+            Some(device) => crate::dev::ioctl(db, process, device, request, arg),
+            None if request == FICLONE => {
+                clone(db, sid, &process.cred, fd, arg.as_u64().unwrap_or(u64::MAX))
+                    .map(|()| Value::Null)
+            }
+            None => Err(Errno::ENOTTY.into()),
+        },
         _ => Err(Errno::ENOSYS.into()),
     }
 }
@@ -93,6 +97,12 @@ fn open(
     let cred = &process.cred;
     let now = auth::now();
     let opening = kernel::open(db, process, path, flags, mode)?;
+    // A device is its driver's to open.
+    if let Opening::Existing { path, node } = &opening
+        && node.is_device()
+    {
+        return crate::dev::open(db, sid, path, flags);
+    }
     if flags & O_ACCMODE == O_RDONLY {
         let (path, node) = match opening {
             Opening::Existing { path, node } => (path, node),
@@ -275,7 +285,19 @@ pub fn writable(db: &mut Db, who: &Identity, file: &File) -> Result<(String, Nod
 /// recording is complete with what arrived.
 fn close(db: &mut Db, sid: &str, who: &Identity, fd: u32) -> Result<Closed> {
     let found = db.fd(sid, fd).ok_or(Errno::EBADF)?;
-    db.close_fd(sid, fd);
+    release(db, sid, fd);
+    if found.file.is_none() {
+        return match found.device {
+            Some(device) => Ok(Closed {
+                path: device,
+                ..Closed::default()
+            }),
+            None if found.path.starts_with("/dev/") => {
+                Err(Error::because(Errno::EBADF, "the device was hung up"))
+            }
+            None => Err(Error::because(Errno::EBADF, ELSEWHERE)),
+        };
+    }
     let closed = closing(db, who, &found);
     // A new file removed while it was written goes with its last descriptor, as an unlinked
     // file does on Linux.
@@ -289,6 +311,14 @@ fn close(db: &mut Db, sid: &str, who: &Identity, fd: u32) -> Result<Closed> {
         db.drop_file(&file.id);
     }
     closed
+}
+/// Close the descriptor `fd` of `sid`, however it ends (close, its lease out): a device's
+/// driver hears so.
+pub fn release(db: &mut Db, sid: &str, fd: u32) {
+    if let Some(device) = db.fd(sid, fd).and_then(|found| found.device) {
+        crate::dev::closed(db, sid, fd, &device);
+    }
+    db.close_fd(sid, fd);
 }
 fn closing(db: &mut Db, who: &Identity, found: &crate::db::Fd) -> Result<Closed> {
     let file = found
@@ -341,8 +371,14 @@ fn closing(db: &mut Db, who: &Identity, found: &crate::db::Fd) -> Result<Closed>
 }
 
 fn lease(db: &mut Db, sid: &str, fd: u32) -> Result<()> {
-    let (found, file) = descriptor(db, sid, fd)?;
     let now = auth::now();
+    if let Some(device) = crate::dev::request(db, sid, fd)? {
+        crate::dev::leased(db, sid, fd, &device.device.name);
+        db.lease_fd(sid, fd, now);
+        db.set_expiry("fd", &fd_key(sid, fd), now + IDLE);
+        return Ok(());
+    }
+    let (found, file) = descriptor(db, sid, fd)?;
     if found.writes() {
         let file = unfinished(db, &file)?;
         // A recording lasts while its page is heard.
@@ -360,6 +396,14 @@ fn fds(db: &Db, sid: &str) -> Vec<Fd> {
     db.fds_of(sid)
         .into_iter()
         .filter_map(|found| {
+            if let Some(device) = &found.device {
+                return Some(Fd {
+                    fd: found.fd,
+                    path: device.clone(),
+                    flags: found.flags,
+                    ..Fd::default()
+                });
+            }
             let file = db.file(found.file.as_deref()?)?;
             Some(Fd {
                 fd: found.fd,
