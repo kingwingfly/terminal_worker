@@ -34,14 +34,21 @@ test('a page shows what other devices change as it happens, and hears nothing of
     // A guest's page hears of a directory it may list, and nothing of /root.
     const guest = await browser.newContext({ extraHTTPHeaders: { 'CF-Connecting-IP': 'sync-guest-' + Date.now() } });
     const listener = await guest.newPage(); await listener.goto(origin + '/');
-    await listener.evaluate(url => new Promise(opened => {
+    // It watches what it may list (inotify_add_watch), and may not watch /root.
+    const watched = await listener.evaluate(async ([url, base]) => {
+      const sys = async calls => (await (await fetch('/api/sys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ calls }) })).json()).results;
+      const [dir, root] = await sys([{ inotify_add_watch: { path: base } }, { inotify_add_watch: { path: '/root' } }]);
       window.heard = []; const socket = new WebSocket(url.replace(/^http/, 'ws') + '/api/events');
-      socket.onmessage = event => window.heard.push(...JSON.parse(event.data).changed); socket.onopen = opened;
-    }), origin);
+      socket.onmessage = event => window.heard.push(...(JSON.parse(event.data).inotify ?? []));
+      await new Promise(opened => { socket.onopen = opened; });
+      return [dir.ok, root.err?.errno];
+    }, [origin, base]);
+    expect(watched[1]).toBe('EACCES');
     expect((await put(other, file('/root/sync-secret.txt') + '&overwrite=true', { data: 'x' })).status()).toBeLessThan(300);
     expect((await put(other, file(base + '/public.txt'), { data: 'x' })).status()).toBe(201);
-    await expect.poll(() => listener.evaluate(() => window.heard)).toContain(base);
-    expect(await listener.evaluate(() => window.heard)).not.toContain('/root');
+    // What changed in it is told, as IN_MODIFY of its watch (the page's own watches are told on
+    // this line too, as it is the same session's).
+    await expect.poll(() => listener.evaluate(() => window.heard)).toContainEqual({ wd: watched[0], mask: 2 });
     await guest.close();
     // Only this site may open the line, which carries the session cookie.
     expect((await other.get('/api/events', { headers: { Origin: 'https://elsewhere.example' } })).status()).toBe(403);

@@ -435,6 +435,8 @@ pub fn renew(db: &mut Db, sid: &str, now: u64) {
         db.set_expiry("fd", &fd_key(sid, found.fd), now + IDLE);
     }
     db.lease_fds(sid, now);
+    // Its watches last while it is heard from.
+    db.set_expiry("watches", sid, now + IDLE);
 }
 
 /// ioctl(fd, FICLONE, source): the file `fd` writes, nothing of it written yet, takes the

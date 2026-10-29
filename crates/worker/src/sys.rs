@@ -469,6 +469,30 @@ fn run(
             kernel::stat(db, &process.cred, &path, true)?;
             Ok(json!(statfs(db)))
         }
+        Call::InotifyAddWatch { path, mask } => {
+            let sid = sid.ok_or(Errno::EBADF)?;
+            let stat = kernel::stat(db, &process.cred, &path, true)?;
+            if !stat.is_dir() {
+                return Err(Error::because(
+                    Errno::ENOTDIR,
+                    "only a directory's changes are told",
+                ));
+            }
+            kernel::access(db, &process.cred, &path, abi::R_OK | abi::X_OK)?;
+            // The directory itself, wherever links on the way led.
+            let real = kernel::namei(db, &process.cred, &path, true)?.path;
+            db.add_watch(sid, &real, mask)
+                .map(|wd| json!(wd))
+                .ok_or_else(|| Errno::ENOSPC.into())
+        }
+        Call::InotifyRmWatch { wd } => {
+            let sid = sid.ok_or(Errno::EBADF)?;
+            if db.rm_watch(sid, wd) {
+                Ok(serde_json::Value::Null)
+            } else {
+                Err(Errno::EINVAL.into())
+            }
+        }
         Call::Mknod {
             path,
             mode,

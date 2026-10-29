@@ -34,7 +34,7 @@ const ROLLBACK: &str = "rollback";
 /// The version of the tables below, which local state made by an older one does not have.
 pub const SCHEMA_VERSION: &str = "3";
 
-const SCHEMA: [&str; 25] = [
+const SCHEMA: [&str; 27] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
@@ -62,6 +62,10 @@ const SCHEMA: [&str; 25] = [
     "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, PRIMARY KEY(sid, fd))",
     "CREATE INDEX IF NOT EXISTS fds_device ON fds(device)",
     "CREATE INDEX IF NOT EXISTS fds_file ON fds(file)",
+    // Directories a session watches (inotify), by its watch numbers: what changes in them is
+    // told on its lines of the events socket.
+    "CREATE TABLE IF NOT EXISTS watches(sid TEXT NOT NULL, wd INTEGER NOT NULL, path TEXT NOT NULL, mask INTEGER NOT NULL, PRIMARY KEY(sid, wd))",
+    "CREATE INDEX IF NOT EXISTS watches_path ON watches(path)",
     // R2 objects nothing refers to any more, which the alarm deletes.
     "CREATE TABLE IF NOT EXISTS garbage(key TEXT PRIMARY KEY)",
     "CREATE TABLE IF NOT EXISTS expiries(kind TEXT NOT NULL, id TEXT NOT NULL, due INTEGER NOT NULL, PRIMARY KEY(kind, id))",
@@ -638,6 +642,68 @@ impl Db {
         )
         .pop()
         .map(|writer| (writer.sid, writer.leased))
+    }
+    /// The watch of the session `sid` on `path`, made if it has none: its number, or None if it
+    /// has as many as it may.
+    pub fn add_watch(&mut self, sid: &str, path: &str, mask: u32) -> Option<u32> {
+        #[derive(Deserialize)]
+        struct Wd {
+            wd: u32,
+        }
+        if let Some(found) = self
+            .rows::<Wd>(
+                "SELECT wd FROM watches WHERE sid = ? AND path = ?",
+                vec![text(sid), text(path)],
+            )
+            .pop()
+        {
+            self.run(
+                "UPDATE watches SET mask = ? WHERE sid = ? AND wd = ?",
+                vec![int(mask), text(sid), int(found.wd)],
+            );
+            return Some(found.wd);
+        }
+        let watches = self.watches_of(sid);
+        if watches.len() >= abi::WATCHES_MAX {
+            return None;
+        }
+        let wd = watches.iter().map(|(wd, _)| *wd).max().unwrap_or(0) + 1;
+        self.run(
+            "INSERT INTO watches(sid, wd, path, mask) VALUES(?, ?, ?, ?)",
+            vec![text(sid), int(wd), text(path), int(mask)],
+        );
+        Some(wd)
+    }
+    /// Remove the watch `wd` of `sid`: whether it had one.
+    pub fn rm_watch(&mut self, sid: &str, wd: u32) -> bool {
+        let had = self
+            .watches_of(sid)
+            .iter()
+            .any(|(watched, _)| *watched == wd);
+        self.run(
+            "DELETE FROM watches WHERE sid = ? AND wd = ?",
+            vec![text(sid), int(wd)],
+        );
+        had
+    }
+    /// The watches of `sid`: each one's number and directory.
+    pub fn watches_of(&self, sid: &str) -> Vec<(u32, String)> {
+        #[derive(Deserialize)]
+        struct Watch {
+            wd: u32,
+            path: String,
+        }
+        self.rows::<Watch>(
+            "SELECT wd, path FROM watches WHERE sid = ? ORDER BY wd",
+            vec![text(sid)],
+        )
+        .into_iter()
+        .map(|watch| (watch.wd, watch.path))
+        .collect()
+    }
+    /// Forget every watch of `sid`, a session not heard from for long.
+    pub fn drop_watches(&mut self, sid: &str) {
+        self.run("DELETE FROM watches WHERE sid = ?", vec![text(sid)]);
     }
     /// Keep every descriptor of the session `sid`, as of `now`.
     pub fn lease_fds(&mut self, sid: &str, now: u64) {

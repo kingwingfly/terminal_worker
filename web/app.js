@@ -96,11 +96,12 @@ function askCredentials({ title, description, username, chooseUser = false, newP
     dialog.showModal(); (currentPassword ? $('current-password') : password).focus();
   });
 }
-// What others change, as it happens: the authority tells this page which directories changed
-// that its account may list (/api/events), and the tabs that show one list it again. A burst of
-// changes comes as one. Pings keep proxies and tunnels from closing a quiet line; a line that
+// What others change, as it happens: the kernel tells this page what changed in the directories
+// its session watches (inotify, the watches its Rust side makes as it lists them; crates/frontend
+// sys.rs), which forget what they knew of them at once, and the tabs that show one list it again,
+// a burst of changes as one. Pings keep proxies and tunnels from closing a quiet line; a line that
 // drops opens again, and what was missed meanwhile is listed again.
-let events, eventsRetry = 0, pendingDirs = new Set(), pendingTimer;
+let events, eventsRetry = 0, pendingTimer;
 function listen() {
   events?.close();
   const socket = events = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/events`);
@@ -149,11 +150,10 @@ function listen() {
       window.dispatchEvent(new CustomEvent('terminal:device', { detail: message.device }));
       return;
     }
-    const dirs = message.changed;
-    if (!Array.isArray(dirs)) return;
-    dirs.forEach(dir => pendingDirs.add(dir));
+    if (!Array.isArray(message.inotify)) return;
+    window.dispatchEvent(new CustomEvent('terminal:inotify', { detail: message.inotify }));
     clearTimeout(pendingTimer);
-    pendingTimer = setTimeout(() => { const detail = [...pendingDirs]; pendingDirs = new Set(); window.dispatchEvent(new CustomEvent('terminal-remote', { detail })); }, 250);
+    pendingTimer = setTimeout(() => window.dispatchEvent(new CustomEvent('terminal-remote')), 250);
   };
   socket.onclose = () => { clearInterval(ping); if (events === socket) setTimeout(listen, Math.min(30000, 1000 * 2 ** eventsRetry++)); };
 }

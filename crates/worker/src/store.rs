@@ -99,6 +99,8 @@ impl DurableObject for TerminalAuthority {
                         db.add_lines(&id, &[(true, why.into())]);
                         jobs::finish(db, &id, "cancelled");
                     }
+                    // A session not heard from for long watches nothing any more.
+                    ("watches", _, _) => db.drop_watches(&id),
                     // A descriptor not kept for long is closed; what it wrote waits, unfinished,
                     // for a writer to go on with it.
                     ("fd", _, _) => {
@@ -198,8 +200,8 @@ impl TerminalAuthority {
         }
         Response::from_websocket(pair.client)
     }
-    /// Tell the listening pages which directories changed, each only those its account may
-    /// list, so that they show what others did as it happens; those whose session ended (signed
+    /// Tell the listening pages what changed in the directories their sessions watch (inotify),
+    /// those their accounts may still list, so that they show what others did as it happens; those whose session ended (signed
     /// out elsewhere, a password changed, the account locked or removed, expired) that it did,
     /// once, as their account is a guest's from then on; those following a device that ended,
     /// or its account's, that it did; and those following a presentation whose account started
@@ -224,9 +226,9 @@ impl TerminalAuthority {
         }
         self.tell(&sockets, told);
         let lines: Vec<Line> = sockets.iter().map(Line::of).collect();
-        let asked: Vec<(Option<String>, Vec<String>)> = lines
+        let asked: Vec<(Option<String>, Option<String>, Vec<String>)> = lines
             .iter()
-            .map(|line| (line.session.clone(), line.follows.clone()))
+            .map(|line| (line.session.clone(), line.sid.clone(), line.follows.clone()))
             .collect();
         let visible = transact(&self.state, move |db| {
             // What each sound started is, if it is still there: whose, and, a voice, of which
@@ -239,15 +241,28 @@ impl TerminalAuthority {
                     (device, voice)
                 })
                 .collect();
-            let visible: Vec<(bool, Vec<String>, Vec<serde_json::Value>)> = asked
+            let visible: Vec<(bool, Vec<serde_json::Value>, Vec<serde_json::Value>)> = asked
                 .iter()
-                .map(|(key, follows)| {
+                .map(|(key, sid, follows)| {
                     let who = auth::identity(db, key.as_deref());
                     let gone = ended && key.is_some() && who.id == GUEST;
-                    let dirs = changed
-                        .iter()
-                        .filter(|dir| db.access(&who, dir, READ | EXEC).is_ok())
-                        .cloned()
+                    // What changed in the directories its session watches, those its account
+                    // may still list; a watch of one it may not, or that went, is told so.
+                    let watches = sid
+                        .as_deref()
+                        .map(|sid| db.watches_of(sid))
+                        .unwrap_or_default();
+                    let dirs = watches
+                        .into_iter()
+                        .filter(|(_, path)| changed.contains(path))
+                        .map(|(wd, path)| {
+                            let mask = if db.access(&who, &path, READ | EXEC).is_ok() {
+                                abi::IN_MODIFY
+                            } else {
+                                abi::IN_IGNORED
+                            };
+                            serde_json::json!({ "wd": wd, "mask": mask })
+                        })
                         .collect();
                     let presentations: Vec<db::Device> = follows
                         .iter()
@@ -324,7 +339,7 @@ impl TerminalAuthority {
                 let _ = ws.send_with_str(sound.to_string());
             }
             if !dirs.is_empty() {
-                let _ = ws.send_with_str(serde_json::json!({ "changed": dirs }).to_string());
+                let _ = ws.send_with_str(serde_json::json!({ "inotify": dirs }).to_string());
             }
         }
     }

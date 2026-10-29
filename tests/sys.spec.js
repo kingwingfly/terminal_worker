@@ -280,3 +280,25 @@ test('/proc: the session\'s descriptors as magic links, directory descriptors, a
   const fs = await ann.sys({ statfs: { path: base } });
   expect([fs.bsize, fs.namelen, fs.bavail > 0]).toEqual([4096, 255, true]);
 });
+
+test('inotify: a session watches directories it may list, each once, and at most 128', async () => {
+  await root.batch([{ mkdir: { path: base, mode: 0o777 } }, { mkdir: { path: base + '/closed', mode: 0o700 } }, { mknod: { path: base + '/file', mode: 0o644 } }]);
+  const [first, again, file, closed, missing] = await ann.batch([
+    { inotify_add_watch: { path: base } },
+    { inotify_add_watch: { path: base + '/' } },
+    { inotify_add_watch: { path: base + '/file' } },
+    { inotify_add_watch: { path: base + '/closed' } },
+    { inotify_add_watch: { path: base + '/missing' } },
+  ]);
+  expect(first.ok).toBeGreaterThan(0);
+  expect(again.ok).toBe(first.ok);
+  expect([file.err.errno, closed.err.errno, missing.err.errno]).toEqual(['ENOTDIR', 'EACCES', 'ENOENT']);
+  expect(await ann.sys({ inotify_rm_watch: { wd: first.ok } })).toBe(null);
+  expect(await ann.sys({ inotify_rm_watch: { wd: first.ok } })).toBe('EINVAL');
+  // As many as fs.inotify.max_user_watches allows, and no more.
+  const dirs = Array.from({ length: 129 }, (_, i) => `${base}/w${i}`);
+  await ann.batch(dirs.map(path => ({ mkdir: { path, mode: 0o755 } })));
+  const watched = await ann.batch(dirs.map(path => ({ inotify_add_watch: { path } })));
+  expect(watched.filter(result => 'ok' in result).length).toBe(128);
+  expect(watched.at(-1).err.errno).toBe('ENOSPC');
+});

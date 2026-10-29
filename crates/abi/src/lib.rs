@@ -271,6 +271,14 @@ pub const O_DIRECTORY: u32 = 0o200000;
 /// the one `arg` reads, shared, nothing copied (what `cp` does).
 pub const FICLONE: u32 = 0x4004_9409;
 
+/// inotify(7)'s events, as Linux numbers them. The kernel tells a watch of a directory that
+/// something in it changed (`IN_MODIFY`), not what: the watcher lists it again. `IN_IGNORED`:
+/// the watch is gone (its directory removed, or the watcher may no longer list it).
+pub const IN_MODIFY: u32 = 0x2;
+pub const IN_IGNORED: u32 = 0x8000;
+/// The most watches a session has, as fs.inotify.max_user_watches bounds a user's.
+pub const WATCHES_MAX: usize = 128;
+
 /// The requests of /dev/present's driver: show a file (`{path}`), on a descriptor that writes
 /// it; ask to speak (`{withdraw}` to withdraw), on one that reads it; answer an ask (`{id,
 /// allow}`), as its owner; speak (`{sdp, mid}`), on one that writes it, which an answer gave.
@@ -668,6 +676,19 @@ pub enum Call {
     Groupdel {
         name: String,
     },
+    /// inotify_add_watch(2): watch the directory `path`, which the caller may list: what
+    /// changes in it is told on this session's lines of the events socket, as `{"inotify":
+    /// [{"wd": N, "mask": IN_MODIFY}]}`, while its account may list it. The watch's number;
+    /// the same directory's again, watched twice. At most `WATCHES_MAX` (ENOSPC).
+    InotifyAddWatch {
+        path: String,
+        #[serde(default = "modify")]
+        mask: u32,
+    },
+    /// inotify_rm_watch(2).
+    InotifyRmWatch {
+        wd: u32,
+    },
     /// A process of the session's account (zip, unzip, tar, faststart), run as the caller
     /// (root under sudo), from `cwd`: its pid, and a descriptor of this session that writes its
     /// standard input (`stdin`), as a pipe would: unzip's answers to its question, `{"decisions":
@@ -703,6 +724,9 @@ fn root() -> String {
 }
 fn creation_mode() -> u16 {
     0o666
+}
+fn modify() -> u32 {
+    IN_MODIFY
 }
 
 /// The process a batch of calls runs for, and the calls.

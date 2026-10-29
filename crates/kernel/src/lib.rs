@@ -87,6 +87,8 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
         | Call::Pread { .. }
         | Call::Pwrite { .. }
         | Call::Statfs { .. }
+        | Call::InotifyAddWatch { .. }
+        | Call::InotifyRmWatch { .. }
         | Call::Ioctl { .. }
         | Call::Spawn { .. }
         | Call::Kill { .. }

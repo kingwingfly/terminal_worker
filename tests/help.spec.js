@@ -11,7 +11,8 @@ test('every command has side-effect-free help, including privileged and interact
   const requests = [];
   // Whatever changes something: a request other than a read, and system calls other than those
   // that only look (a listing the panel makes again is no side effect).
-  const looking = new Set(['getcreds', 'stat', 'lstat', 'getdents', 'access', 'readlink', 'getxattr', 'listxattr']);
+  // A watch of a directory listed (the page's cache) changes nothing either.
+  const looking = new Set(['getcreds', 'stat', 'lstat', 'getdents', 'access', 'readlink', 'getxattr', 'listxattr', 'inotify_add_watch', 'inotify_rm_watch']);
   const changes = request => {
     if (request.method() === 'GET' || request.method() === 'HEAD') return false;
     if (!request.url().endsWith('/api/sys')) return true;

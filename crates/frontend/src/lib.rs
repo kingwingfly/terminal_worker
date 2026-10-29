@@ -79,6 +79,11 @@ async fn enterable(path: &str) -> Result<(), abi::Error> {
     };
     userland::sys::done(&sys::HttpSys::default(), access).await
 }
+thread_local! {
+    /// Directories the kernel said changed, which tabs showing them have yet to list again.
+    static CHANGED: std::cell::RefCell<std::collections::BTreeSet<String>> = Default::default();
+}
+
 /// The entries of the directory `path`, as ls lists them: through system calls, as user space.
 async fn listing(path: &str) -> Result<Vec<Entry>, String> {
     userland::entries(&sys::HttpSys::default(), path, path)
@@ -386,6 +391,8 @@ fn App() -> impl IntoView {
     }
     let listener = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(
         move |e: web_sys::CustomEvent| {
+            // Its account changed, or its socket opened again: what the page knew may be old.
+            sys::forget(true);
             let before = account.username.get_untracked();
             // Why, if it changed from elsewhere (app.js `changed`).
             let reason = e.detail().as_string();
@@ -424,9 +431,20 @@ fn App() -> impl IntoView {
         .add_event_listener_with_callback("terminal:changed", listener.as_ref().unchecked_ref())
         .unwrap();
     listener.forget();
-    // Directories others changed, which tabs showing them list again.
-    let remote = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
-        let dirs: Vec<String> = serde_wasm_bindgen::from_value(e.detail()).unwrap_or_default();
+    // What the kernel told of the directories this page watches: their answers go at once,
+    // and, a burst of changes later, tabs showing one list it again.
+    let told = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
+        let events: Vec<serde_json::Value> =
+            serde_wasm_bindgen::from_value(e.detail()).unwrap_or_default();
+        let dirs = sys::heard(&events);
+        CHANGED.with(|changed| changed.borrow_mut().extend(dirs));
+    });
+    window
+        .add_event_listener_with_callback("terminal:inotify", told.as_ref().unchecked_ref())
+        .unwrap();
+    told.forget();
+    let remote = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_: web_sys::CustomEvent| {
+        let dirs = CHANGED.with(|changed| std::mem::take(&mut *changed.borrow_mut()));
         for shell in tabs.get_untracked() {
             if dirs.contains(&shell.cwd.get_untracked()) {
                 spawn_local(async move {
