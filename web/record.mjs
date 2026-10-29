@@ -4,9 +4,8 @@
 // keeps its descriptor as an upload's (upload.mjs), and writes each chunk in order as soon as
 // it is whole. Stopping writes the rest as the last, short, chunk and closes the file, which is
 // then complete. If the page goes, the kernel keeps what arrived (api::RECORDING_IDLE).
-import { O_APPEND, O_CREAT, O_EXCL, O_WRONLY, call, closeOnLeaving, pwrite, sys } from './http.mjs';
+import { O_APPEND, O_CREAT, O_EXCL, O_WRONLY, call, closeOnLeaving, hold, pwrite, sys } from './http.mjs';
 
-const LEASE = 5000;
 const RETRIES = 3;
 export const RECORDED = 'audio/webm;codecs=opus';
 
@@ -77,11 +76,9 @@ export async function record(destination, microphone, { acl = null, progress = (
   const started = performance.now();
   const say = () => progress(`● ${clock((performance.now() - started) / 1000)} · ${size(sent + pending.length)}`);
   const ticking = setInterval(say, 1000); say();
-  // Still here, while it records: the page keeps its descriptor.
-  const lease = setInterval(async () => {
-    try { await call('lease', { fd }); }
-    catch (error) { if (error.errno === 'EBADF') failure ??= Object.assign(error, { status: 409 }); }
-  }, LEASE);
+  // Still here, while it records: the page keeps its descriptor, and hears if it was closed
+  // elsewhere (jobs cancel).
+  const lease = hold(fd, () => { failure ??= Object.assign(new Error('closed elsewhere'), { errno: 'EBADF', status: 409 }); });
   try {
     recorder.start(1000);
     // Until stopped, here or by the recorder itself, or a chunk or the hold fails.
@@ -98,7 +95,7 @@ export async function record(destination, microphone, { acl = null, progress = (
     const done = await call('close', { fd });
     return { ...done, seconds: (performance.now() - started) / 1000, ...(full ? { stopped: 'it reached the largest a file may be (1 GB)' } : itself ? { stopped: 'the microphone stopped' } : {}) };
   } finally {
-    clearInterval(ticking); clearInterval(lease); removeEventListener('pagehide', leaving);
+    clearInterval(ticking); lease(); removeEventListener('pagehide', leaving);
     if (recorder.state !== 'inactive') recorder.stop();
   }
 }

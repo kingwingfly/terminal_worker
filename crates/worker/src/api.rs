@@ -154,6 +154,19 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
             let guest = auth::guest_key(req);
             run(state, move |db| {
                 let who = auth::identity(db, key.as_deref());
+                // /proc's files are written as they are read; /proc/self/fd/N names what the
+                // descriptor has open.
+                let sid = auth::sid(db, key.as_deref(), guest.as_deref());
+                let path = match crate::procfs::follow(db, sid.as_deref(), &path, true) {
+                    Ok(path) => path,
+                    Err(error) => return errno_reply(&error),
+                };
+                if crate::procfs::is(&path) {
+                    return match crate::procfs::read(db, sid.as_deref(), &who, &path) {
+                        Ok(text) => Reply::ok(json!({ "generated": text })),
+                        Err(error) => errno_reply(&error),
+                    };
+                }
                 let real = real!(db, &who, &path, true);
                 let node = acl!(db.access(&who, &real, READ), &who);
                 // /etc/passwd and /etc/group are the kernel's to write as they are read; a device's

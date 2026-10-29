@@ -51,5 +51,13 @@ pub async fn lstat(sys: &impl Sys, path: &str) -> Result<Stat, Error> {
 }
 
 pub async fn getdents(sys: &impl Sys, path: &str) -> Result<Vec<Dirent>, Error> {
-    call(sys, Call::Getdents { path: path.into() }).await
+    call(
+        sys,
+        Call::Getdents {
+            path: path.into(),
+            cookie: 0,
+            count: None,
+        },
+    )
+    .await
 }

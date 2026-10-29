@@ -1,5 +1,6 @@
 pub mod acl;
 pub mod archive;
+pub mod bin;
 pub mod cli;
 pub mod completion;
 pub mod devices;
@@ -44,6 +45,9 @@ pub struct Entry {
     /// A character device's driver (`present`, `snd`), for one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+    /// When its content last changed, in seconds since 1970, as ls -l shows it.
+    #[serde(default)]
+    pub mtime: u64,
     /// How many names it has, as ls -l counts them.
     #[serde(default)]
     pub links: u32,

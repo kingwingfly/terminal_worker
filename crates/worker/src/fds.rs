@@ -4,19 +4,19 @@
 //! (`close`); a recording (`O_APPEND`) grows from its end, readable as it grows. Uploads,
 //! saves, recordings and copies all go through them.
 //!
-//! A writer keeps its descriptor (`lease`) every few seconds while its page is there. One not
-//! kept for `LEASE` may be taken over: the same account opening the same unfinished file, of
-//! the same content, goes on with it, from any page, and the old descriptor writes no more
-//! (EBADF). One not kept for `IDLE` is closed.
+//! A session keeps its descriptors by being heard from: each batch it sends renews them all
+//! (`renew`), and a page holding one says something every few seconds. A writer whose session
+//! was not heard from for `LEASE` may be taken over: the same account opening the same
+//! unfinished file, of the same content, goes on with it, from any page, and the old
+//! descriptor writes no more (EBADF); its own session may always go on with it. One not kept
+//! for `IDLE` is closed.
 use crate::api::{
     RECORDING_CHUNK, RECORDING_IDLE, RECORDING_MAX, UPLOAD_TTL, chunk_key, chunk_of,
     finish_recording,
 };
 use crate::auth;
 use crate::db::{Db, File, fd_key};
-use abi::{
-    Call, Closed, Errno, Error, FICLONE, Fd, O_ACCMODE, O_APPEND, O_RDONLY, O_TRUNC, Opened,
-};
+use abi::{Call, Closed, Errno, Error, FICLONE, O_ACCMODE, O_APPEND, O_RDONLY, O_TRUNC, Opened};
 use kernel::{Fs, Opening, Process};
 use serde_json::{Value, json};
 use terminal_worker_core::permissions::{Identity, Node, Store, WRITE};
@@ -44,15 +44,17 @@ pub fn call(db: &mut Db, sid: Option<&str>, process: &Process, call: Call) -> Re
             sha256,
             version,
         } => open(db, sid, process, &path, flags, mode, size, sha256, version).map(|o| json!(o)),
-        Call::Close { fd } => close(db, sid, &process.cred, fd).map(|c| json!(c)),
-        Call::Lease { fd } => lease(db, sid, fd).map(|()| Value::Null),
-        Call::Fds => Ok(json!(fds(db, sid))),
-        Call::Ioctl { fd, request, arg } => match crate::dev::request(db, sid, fd)? {
+        Call::Close { fd } => close(db, sid, &process.cred, fd.number()).map(|c| json!(c)),
+        Call::Ioctl { fd, request, arg } => match crate::dev::request(db, sid, fd.number())? {
             Some(device) => crate::dev::ioctl(db, process, device, request, arg),
-            None if request == FICLONE => {
-                clone(db, sid, &process.cred, fd, arg.as_u64().unwrap_or(u64::MAX))
-                    .map(|()| Value::Null)
-            }
+            None if request == FICLONE => clone(
+                db,
+                sid,
+                &process.cred,
+                fd.number(),
+                arg.as_u64().unwrap_or(u64::MAX),
+            )
+            .map(|()| Value::Null),
             None => Err(Errno::ENOTTY.into()),
         },
         _ => Err(Errno::ENOSYS.into()),
@@ -103,6 +105,17 @@ fn open(
     {
         return crate::dev::open(db, sid, path, flags);
     }
+    // A directory opens to be read with getdents, or named from (/proc/self/fd/N/NAME).
+    if let Opening::Existing { path, node } = &opening
+        && node.directory
+    {
+        let fd = db.add_fd(sid, None, path, flags, false, now);
+        db.set_expiry("fd", &fd_key(sid, fd), now + IDLE);
+        return Ok(Opened {
+            fd,
+            ..Opened::default()
+        });
+    }
     if flags & O_ACCMODE == O_RDONLY {
         let (path, node) = match opening {
             Opening::Existing { path, node } => (path, node),
@@ -126,11 +139,9 @@ fn open(
         });
     }
     let append = flags & O_APPEND != 0;
-    let size = if append {
-        0
-    } else {
-        size.ok_or_else(|| Error::because(Errno::EINVAL, "a file is written whole: give its size"))?
-    };
+    // A writer that does not say the size writes in order, and the file grows as it does.
+    let growing = size.is_none() && !append;
+    let size = size.unwrap_or(0);
     if size > MAX_FILE {
         return Err(Errno::EFBIG.into());
     }
@@ -151,8 +162,9 @@ fn open(
                 // The same unfinished file, by the same account, to the same place: go on with
                 // it, from this page or another, unless one writes it now.
                 if !append
+                    && !growing
                     && sha256.is_some()
-                    && !file.recording()
+                    && !file.sequential()
                     && file.uploader == cred.id
                     && file.size == size
                     && file.sha256 == sha256
@@ -175,6 +187,28 @@ fn open(
                 .is_some_and(|v| Some(v) != node.file.as_deref().map(crate::db::etag).as_deref())
             {
                 return Err(Errno::ESTALE.into());
+            }
+            // Truncated as it opens, as O_TRUNC does on Linux: its new content shows as it is
+            // written, at every name of it.
+            if growing {
+                let id = db.create_file(0, CHUNK_SIZE, None, cred.id, &path, None, now);
+                db.grow_in_order(&id);
+                db.set_node(
+                    &path,
+                    &Node {
+                        file: Some(id.clone()),
+                        size: 0,
+                        ..node
+                    },
+                );
+                db.set_expiry("upload", &id, now + RECORDING_IDLE);
+                let fd = db.add_fd(sid, Some(&id), &path, flags, false, now);
+                db.set_expiry("fd", &fd_key(sid, fd), now + IDLE);
+                return Ok(Opened {
+                    fd,
+                    chunk_size: CHUNK_SIZE,
+                    ..Opened::default()
+                });
             }
             let base = node.file.clone();
             (path, node, Some(base))
@@ -206,6 +240,9 @@ fn open(
     if append {
         db.record_file(&id);
         db.set_expiry("upload", &id, now + RECORDING_IDLE);
+    } else if growing {
+        db.grow_in_order(&id);
+        db.set_expiry("upload", &id, now + RECORDING_IDLE);
     } else {
         db.set_expiry("upload", &id, now + UPLOAD_TTL);
     }
@@ -223,9 +260,11 @@ fn open(
 /// Go on with the unfinished `file`: unless its writer kept it lately, this session's new
 /// descriptor writes it, and that one no more.
 fn resume(db: &mut Db, sid: &str, path: &str, flags: u32, file: &File, now: u64) -> Result<Opened> {
+    // Its own session may go on with it, as a process with its own file; another, once that
+    // one has not been heard from for a while.
     if db
-        .writer(&file.id)
-        .is_some_and(|writer| now < writer.leased + LEASE)
+        .writing_session(&file.id)
+        .is_some_and(|(of, leased)| of != sid && now < leased + LEASE)
     {
         return Err(Error::because(
             Errno::EBUSY,
@@ -295,6 +334,11 @@ fn close(db: &mut Db, sid: &str, who: &Identity, fd: u32) -> Result<Closed> {
             None if found.path.starts_with("/dev/") => {
                 Err(Error::because(Errno::EBADF, "the device was hung up"))
             }
+            // A directory's, a file of /proc's, or a process's standard input.
+            None if !found.writes() || crate::procfs::is(&found.path) => Ok(Closed {
+                path: found.path,
+                ..Closed::default()
+            }),
             None => Err(Error::because(Errno::EBADF, ELSEWHERE)),
         };
     }
@@ -340,6 +384,11 @@ fn closing(db: &mut Db, who: &Identity, found: &crate::db::Fd) -> Result<Closed>
     if !found.writes() || file.complete() {
         return Ok(closed(found.path.clone(), &file));
     }
+    if file.growing() {
+        let path = db.showing(&file.id).pop().unwrap_or(found.path.clone());
+        db.finish_file(&file.id);
+        return Ok(closed(path, &file));
+    }
     if file.recording() {
         let path = db.showing(&file.id).pop().unwrap_or(found.path.clone());
         finish_recording(db, &file);
@@ -370,55 +419,22 @@ fn closing(db: &mut Db, who: &Identity, found: &crate::db::Fd) -> Result<Closed>
     Ok(closed(path, &file))
 }
 
-fn lease(db: &mut Db, sid: &str, fd: u32) -> Result<()> {
-    let now = auth::now();
-    if let Some(device) = crate::dev::request(db, sid, fd)? {
-        crate::dev::leased(db, sid, fd, &device.device.name);
-        db.lease_fd(sid, fd, now);
-        db.set_expiry("fd", &fd_key(sid, fd), now + IDLE);
-        return Ok(());
-    }
-    let (found, file) = descriptor(db, sid, fd)?;
-    if found.writes() {
-        let file = unfinished(db, &file)?;
-        // A recording lasts while its page is heard.
-        if file.recording() {
+/// Keep every descriptor of the session `sid`, as it was heard from `now`: a recording, and a
+/// file growing as it is written, last while their pages are there; a device hears so.
+pub fn renew(db: &mut Db, sid: &str, now: u64) {
+    for found in db.fds_of(sid) {
+        if let Some(device) = &found.device {
+            crate::dev::leased(db, sid, found.fd, device);
+        }
+        if found.writes()
+            && let Some(file) = found.file.as_deref().and_then(|file| db.file(file))
+            && file.sequential()
+        {
             db.set_expiry("upload", &file.id, now + RECORDING_IDLE);
         }
+        db.set_expiry("fd", &fd_key(sid, found.fd), now + IDLE);
     }
-    db.lease_fd(sid, fd, now);
-    db.set_expiry("fd", &fd_key(sid, fd), now + IDLE);
-    Ok(())
-}
-
-/// The descriptors of `sid` that still read or write something.
-fn fds(db: &Db, sid: &str) -> Vec<Fd> {
-    db.fds_of(sid)
-        .into_iter()
-        .filter_map(|found| {
-            if let Some(device) = &found.device {
-                return Some(Fd {
-                    fd: found.fd,
-                    path: device.clone(),
-                    flags: found.flags,
-                    ..Fd::default()
-                });
-            }
-            let file = db.file(found.file.as_deref()?)?;
-            Some(Fd {
-                fd: found.fd,
-                path: if found.writes() {
-                    db.showing(&file.id).pop().unwrap_or(file.target.clone())
-                } else {
-                    found.path.clone()
-                },
-                flags: found.flags,
-                size: file.size,
-                received: db.received(&file),
-                created: found.created,
-            })
-        })
-        .collect()
+    db.lease_fds(sid, now);
 }
 
 /// ioctl(fd, FICLONE, source): the file `fd` writes, nothing of it written yet, takes the
@@ -460,6 +476,128 @@ fn clone(db: &mut Db, sid: &str, who: &Identity, fd: u32, source: u64) -> Result
     Ok(())
 }
 
+/// What pread(2) reads: bytes the kernel has (a file it writes as it is read, a device's state),
+/// or those of R2 objects, each (key, offset, length); and the file's size, what may be read of
+/// it now.
+pub enum Read {
+    Bytes(Vec<u8>, u64),
+    Chunks(Vec<(String, u64, u64)>, u64),
+}
+
+/// pread(2) of `count` bytes from `offset`, through the descriptor `fd` of `sid`, or of the file
+/// at `path`, which `process` must be able to open for reading.
+pub fn pread(
+    db: &Db,
+    sid: Option<&str>,
+    process: &Process,
+    fd: Option<u32>,
+    path: Option<&str>,
+    offset: u64,
+    count: u64,
+) -> Result<Read> {
+    let state = |value: Option<Value>| {
+        let bytes = value.ok_or(Errno::ENXIO)?.to_string().into_bytes();
+        let size = bytes.len() as u64;
+        Ok(Read::Bytes(window(bytes, offset, count), size))
+    };
+    let content = match (fd, path) {
+        (Some(fd), None) => {
+            let sid = sid.ok_or(Errno::EBADF)?;
+            let found = db.fd(sid, fd).ok_or(Errno::EBADF)?;
+            if found.flags & O_ACCMODE == abi::O_WRONLY {
+                return Err(Errno::EBADF.into());
+            }
+            if found.device.is_some() {
+                return state(crate::dev::read(db, &process.cred, Some(sid), &found.path));
+            }
+            if let Some(text) = crate::sys::generated(db, &found.path) {
+                let size = text.len() as u64;
+                return Ok(Read::Bytes(window(text.into_bytes(), offset, count), size));
+            }
+            if found.file.is_none() && crate::procfs::is(&found.path) {
+                return proc(db, Some(sid), process, &found.path, offset, count);
+            }
+            if found.file.is_none() && !found.writes() {
+                return Err(Errno::EISDIR.into());
+            }
+            found
+                .file
+                .ok_or_else(|| Error::because(Errno::EBADF, ELSEWHERE))?
+        }
+        (None, Some(path)) => {
+            let path = &crate::procfs::follow(db, sid, path, true)?;
+            if crate::procfs::is(path) {
+                return proc(db, sid, process, path, offset, count);
+            }
+            let Opening::Existing { path, node } = kernel::open(db, process, path, O_RDONLY, 0)?
+            else {
+                return Err(Errno::ENOENT.into());
+            };
+            if let Some(text) = crate::sys::generated(db, &path) {
+                let size = text.len() as u64;
+                return Ok(Read::Bytes(window(text.into_bytes(), offset, count), size));
+            }
+            if node.is_device() {
+                return state(crate::dev::read(db, &process.cred, sid, &path));
+            }
+            node.file.ok_or(Errno::EISDIR)?
+        }
+        _ => {
+            return Err(Error::because(
+                Errno::EINVAL,
+                "pread reads a descriptor or a path",
+            ));
+        }
+    };
+    let file = db.file(&content).ok_or(Errno::EBADF)?;
+    let size = db.readable(&file);
+    let end = size.min(offset.saturating_add(count));
+    let mut parts = Vec::new();
+    if offset < end {
+        let keys: std::collections::HashMap<u64, String> = db
+            .chunks(&file.id)
+            .into_iter()
+            .map(|chunk| (chunk.idx, chunk.key))
+            .collect();
+        for index in offset / file.chunk_size..=(end - 1) / file.chunk_size {
+            let start = index * file.chunk_size;
+            let from = offset.max(start) - start;
+            let to = end.min(start + file.chunk_size) - start;
+            let key = keys.get(&index).ok_or(Errno::EIO)?;
+            parts.push((key.clone(), from, to - from));
+        }
+    }
+    Ok(Read::Chunks(parts, size))
+}
+/// pread(2) of a file of /proc.
+fn proc(
+    db: &Db,
+    sid: Option<&str>,
+    process: &Process,
+    path: &str,
+    offset: u64,
+    count: u64,
+) -> Result<Read> {
+    let text = crate::procfs::read(db, sid, &process.cred, path)?;
+    let size = text.len() as u64;
+    Ok(Read::Bytes(window(text.into_bytes(), offset, count), size))
+}
+/// `count` bytes of `bytes` from `offset`, or fewer at its end.
+fn window(bytes: Vec<u8>, offset: u64, count: u64) -> Vec<u8> {
+    let start = (offset as usize).min(bytes.len());
+    let end = start.saturating_add(count as usize).min(bytes.len());
+    bytes[start..end].to_vec()
+}
+
+/// The most a file written in order may grow to.
+fn most(file: &File) -> u64 {
+    if file.recording() {
+        RECORDING_MAX
+    } else {
+        MAX_FILE
+    }
+}
+
 /// What pwrite(2) of chunk `index`, `length` bytes, through the descriptor `fd` of `sid`, is
 /// written to: the R2 object for it, and the file's type. A file written whole takes each
 /// chunk at its index, of its length; a recording, its next, whole or, last, short.
@@ -476,20 +614,20 @@ pub fn pwrite(
         return Err(Errno::EBADF.into());
     }
     let file = unfinished(db, &file)?;
-    if file.recording() {
+    if file.sequential() {
         if index != file.chunk_count() || !file.size.is_multiple_of(file.chunk_size) {
             return Err(Error::because(
                 Errno::EINVAL,
-                "a recording takes its next chunk",
+                "a file written in order takes its next chunk",
             ));
         }
         if length == 0 || length > file.chunk_size {
             return Err(Error::because(
                 Errno::EINVAL,
-                format!("a recording's chunk is at most {} bytes", file.chunk_size),
+                format!("a chunk is at most {} bytes", file.chunk_size),
             ));
         }
-        if file.size + length > RECORDING_MAX {
+        if file.size + length > most(&file) {
             return Err(Errno::EFBIG.into());
         }
     } else {
@@ -541,8 +679,8 @@ pub fn written(
         return refused(db, error);
     }
     let now = auth::now();
-    if file.recording() {
-        if index != file.chunk_count() || file.size + length > RECORDING_MAX {
+    if file.sequential() {
+        if index != file.chunk_count() || file.size + length > most(&file) {
             return refused(db, Errno::EINVAL.into());
         }
         db.add_chunk(&file.id, index, key, sha256, now);

@@ -6,6 +6,7 @@ mod dev;
 mod fds;
 mod files;
 mod jobs;
+mod procfs;
 mod runner;
 mod store;
 mod streams;

@@ -49,6 +49,7 @@ fn setfacl(path: String, entries: String) -> js_sys::Promise {
             args: vec!["setfacl".into(), "-m".into(), entries, path],
             cwd: "/".into(),
             home: "/".into(),
+            now: (js_sys::Date::now() / 1000.0) as u64,
             stdin: None,
             out: String::new(),
             err: Vec::new(),

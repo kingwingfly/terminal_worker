@@ -3,7 +3,7 @@
 // makes one, open a descriptor that reads (follow, hear, ask) or writes (show, turn, speak,
 // send) it, and its driver's requests (ioctl) do the rest. Whether one may is the device's mode
 // and ACL's to say, checked by the kernel; the page asks, and is told.
-import { O_WRONLY, answered, call, sys } from './http.mjs';
+import { O_WRONLY, answered, call, hold, sys } from './http.mjs';
 
 export const PRESENT = '/dev/present', SOUND = '/dev/snd';
 // The drivers' requests (abi::PRESENT_*, abi::SND_*).
@@ -73,14 +73,13 @@ export async function ask(device, withdraw = false) { return once(device, O_RDON
 /** Answer the ask `id` in the presentation `device`, as its presenter. */
 export async function answer(device, id, allow) { return once(device, O_WRONLY, PRESENT_ANSWER, { id, allow }); }
 
-// A descriptor that writes a device, kept while it is used: its lease every half minute, and
-// closed when done, or when the page goes.
-const LEASE = 30000;
+// A descriptor that writes a device, kept while it is used (http.mjs hold), and closed when
+// done, or when the page goes.
 function kept(fd) {
-  const leasing = setInterval(() => { call('lease', { fd }).catch(error => { if (error.errno === 'EBADF') clearInterval(leasing); }); }, LEASE);
+  const release = hold(fd);
   const leaving = () => navigator.sendBeacon('/api/sys', new Blob([JSON.stringify({ calls: [{ close: { fd } }] })], { type: 'application/json' }));
   addEventListener('pagehide', leaving);
-  return async () => { clearInterval(leasing); removeEventListener('pagehide', leaving); await sys([{ close: { fd } }]).catch(() => {}); };
+  return async () => { release(); removeEventListener('pagehide', leaving); await sys([{ close: { fd } }]).catch(() => {}); };
 }
 
 /** Send what `offer` describes (an SDP and its track's mid) as the sound /dev/snd/NAME, made

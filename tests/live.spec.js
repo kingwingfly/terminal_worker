@@ -1,6 +1,6 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
-import { api, call, entry, errno, mkdirp, names, program, put, rmrf, sys } from './sys.js';
+import { api, call, descriptors, entry, errno, mkdirp, names, program, put, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const vars = await readFile('.dev.vars', 'utf8');
 const rootPassword = vars.match(/^ADMIN_PASSWORD=(.+)$/m)[1];
@@ -119,7 +119,7 @@ test('a presentation is a character device: ls -l and cat tell of it; chmod deci
     await laptop.page.getByRole('button', { name: 'Close preview' }).click();
     // Its presenter's, made as a file is, with the file's mode.
     await run(guest.page, `ls -l ${device_}`);
-    await expect(transcript(guest.page)).toContainText(new RegExp(`crw-r--r-- +1 ${name}:${name} +0 ${device_}`));
+    await expect(transcript(guest.page)).toContainText(new RegExp(`crw-r--r-- +1 ${name}:${name} +0 [A-Z][a-z]{2} [ \\d]\\d [ \\d:]{5} ${device_}`));
     await run(guest.page, `cat ${device_}`);
     await expect(transcript(guest.page)).toContainText(`"path":"${path}"`);
     // Its mode says who follows it: chmod 600, and guests may not.
@@ -254,7 +254,7 @@ test('a listener asks to speak; allowed, everyone following hears them, until th
     // Two guest browsers are one account, two sessions: the one allowed writes the
     // presentation through the descriptor passed to it; the other may not.
     expect(await errno(other.context.request, { open: { path: `/dev/present/${stem}`, flags: 1 } })).toBe('EACCES');
-    expect((await call(asker.context.request, 'fds')).filter(fd => fd.path === `/dev/present/${stem}` && fd.flags & 1)).toHaveLength(1);
+    expect((await descriptors(asker.context.request)).filter(fd => fd.path === `/dev/present/${stem}` && fd.flags & 1)).toHaveLength(1);
     // Ended by the presenter, the bars shown again by the pointer: the listener's microphone
     // stops, and the others hear it no more.
     await laptop.page.mouse.move(400, 300); await laptop.page.mouse.move(410, 310);

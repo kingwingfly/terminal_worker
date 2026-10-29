@@ -3,6 +3,7 @@ import { uploadFile, Cancelled } from './upload.mjs';
 import { record, clock } from './record.mjs';
 import { speak, listen as hearLive } from './sound.mjs';
 import * as dev from './dev.mjs';
+import { exec } from './wasi/exec.mjs';
 import { answered as resultOf, call, sys } from './http.mjs';
 
 let configuration;
@@ -275,6 +276,7 @@ async function accountCommand(args, cwd) {
   if (args[0] === 'man') {
     if (args.length > 2) throw new Error('Usage: man [COMMAND]');
     const text = args[1] ? window.terminalManual.page(args[1]) : window.terminalManual.index();
+    if ((text === undefined || text === null) && window.terminalManual.bin(args[1])) throw new Error(`${args[1]} is /bin's (uutils): ${args[1]} --help says how to use it`);
     if (text === undefined || text === null) throw new Error(`No manual entry for ${args[1]}. Enter man for the index.`);
     const version = await cleanupViewer(); if (version !== viewerVersion) return {};
     trail.length = 0; showTrail();
@@ -922,7 +924,7 @@ if (window.visualViewport) {
   };
   viewport.addEventListener('resize', fit); viewport.addEventListener('scroll', fit); fit();
 }
-window.terminal = { config: () => configuration.branding, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
+window.terminal = { config: () => configuration.branding, exec, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]')) return;

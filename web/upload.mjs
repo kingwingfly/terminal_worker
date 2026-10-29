@@ -1,15 +1,14 @@
-// Chunked, resumable uploads, through a file descriptor (system calls: open, pwrite, lease,
-// close). A file is hashed first: its SHA-256 and size, opened at its destination, go on with
-// the chunks the kernel already has of it, so choosing the same file again, on this device or
-// another signed in to the same account, resumes it. One descriptor writes a file at a time: its
-// page keeps it (lease) every few seconds, and no other page goes on with it until it has not
-// for a while (fds::LEASE). Each chunk carries its own SHA-256, which R2 checks. Others can read
-// a file while it uploads.
-import { O_CREAT, O_WRONLY, call, closeOnLeaving, sys } from './http.mjs';
+// Chunked, resumable uploads, through a file descriptor (system calls: open, pwrite, close). A
+// file is hashed first: its SHA-256 and size, opened at its destination, go on with the chunks
+// the kernel already has of it, so choosing the same file again, on this device or another
+// signed in to the same account, resumes it. One descriptor writes a file at a time: its page
+// keeps it (http.mjs hold), and no other session goes on with it until this one has not been
+// heard from for a while (fds::LEASE). Each chunk carries its own SHA-256, which R2 checks.
+// Others can read a file while it uploads.
+import { O_CREAT, O_WRONLY, call, closeOnLeaving, hold, sys } from './http.mjs';
 
 const PARALLEL = 3;
 const RETRIES = 3;
-const LEASE = 5000;
 
 // The descriptors this page writes, closed as it goes, so that another may go on with them.
 const writing = new Set();
@@ -95,12 +94,9 @@ export async function uploadFile(file, destination, { progress = () => {}, signa
   const requests = new Set(), abort = () => { halted = true; requests.forEach(xhr => xhr.abort()); };
   signal.addEventListener('abort', abort, { once: true });
   writing.add(fd);
-  // Still here, while it sends: the page keeps its descriptor, or stops once another page went
-  // on with the file, or it was removed.
-  const lease = setInterval(async () => {
-    try { await call('lease', { fd }); }
-    catch (error) { if (error.errno === 'EBADF') { failure ??= error; abort(); } }
-  }, LEASE);
+  // Still here, while it sends: the page keeps its descriptor; another page going on with the
+  // file, or its removal, stops the next chunk (EBADF).
+  const lease = hold(fd);
   try {
     await Promise.all(Array.from({ length: Math.min(PARALLEL, pending.length) }, async () => {
       while (pending.length && !halted) {
@@ -117,7 +113,7 @@ export async function uploadFile(file, destination, { progress = () => {}, signa
     // The lease may stop the upload between chunks, when none is in flight to fail.
     if (failure) throw failure;
   } catch (error) {
-    clearInterval(lease); abort();
+    lease(); abort();
     // Only Cancel cancels the upload, and only while this page writes it: a file it made goes.
     if (signal.aborted || (error instanceof Cancelled && !failure)) {
       const [closed] = await sys([{ close: { fd } }]).catch(() => [{}]);
@@ -131,7 +127,7 @@ export async function uploadFile(file, destination, { progress = () => {}, signa
     const reason = failure || error;
     if (reason.errno === 'EBADF') throw new Error('stopped: ' + (/another tab or device/.test(reason.message) ? reason.message : 'the file was removed, or its upload cancelled, elsewhere'));
     throw new Error(reason.message + '; choose the same file again to resume');
-  } finally { clearInterval(lease); writing.delete(fd); signal.removeEventListener('abort', abort); }
+  } finally { lease(); writing.delete(fd); signal.removeEventListener('abort', abort); }
   const done = await call('close', { fd });
   return { ...done, resumed };
 }

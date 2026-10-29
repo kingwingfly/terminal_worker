@@ -1,5 +1,5 @@
 use super::*;
-use abi::{ACL_ACCESS, ACL_DEFAULT, O_TRUNC, O_WRONLY, XATTR_CREATE};
+use abi::{ACL_ACCESS, ACL_DEFAULT, O_DIRECTORY, O_TRUNC, O_WRONLY, XATTR_CREATE};
 use std::collections::BTreeSet;
 use terminal_worker_core::acl::Entries;
 
@@ -218,7 +218,17 @@ fn open_follows_a_link_to_what_it_names_and_checks_as_linux_does() {
     );
     let excl = O_WRONLY | O_CREAT | O_EXCL;
     assert_eq!(errno(open(&fs, &ann, "/d/r", excl, 0o666)), Errno::EEXIST);
-    assert_eq!(errno(open(&fs, &ann, "/d", O_RDONLY, 0)), Errno::EISDIR);
+    // A directory opens to read, as Linux's does, and only to read; O_DIRECTORY opens nothing
+    // else.
+    assert!(matches!(
+        open(&fs, &ann, "/d", O_RDONLY, 0),
+        Ok(Opening::Existing { .. })
+    ));
+    assert_eq!(errno(open(&fs, &ann, "/d", O_WRONLY, 0)), Errno::EISDIR);
+    assert_eq!(
+        errno(open(&fs, &ann, "/d/missing", O_DIRECTORY, 0)),
+        Errno::ENOENT
+    );
     assert_eq!(
         errno(open(&fs, &ann, "/d/none", O_WRONLY, 0)),
         Errno::ENOENT
@@ -369,12 +379,28 @@ fn modes_and_owners_change_as_their_owner_or_root_may() {
     let plain = Node::file(0, 0, 0o644, "x".into(), 0);
     assert!(!permission(&Identity::root(), &plain, EXEC));
     assert!(permission(&Identity::root(), &plain, READ | WRITE));
-    // Its times are its owner's, root's, or a writer's to set.
+    // Its times are its owner's, root's, or a writer's to set to now; a time given, its owner's
+    // or root's only.
+    let now =
+        |fs: &mut MemStore, who: &Identity| utimens(fs, who, "/w/f", Time::Now, Time::Now, true);
+    assert_eq!(errno(now(&mut fs, &user(1002, &[]))), Errno::EACCES);
+    now(&mut fs, &bob).unwrap();
+    let given = Time::At { sec: 1, nsec: 0 };
     assert_eq!(
-        errno(utimens(&mut fs, &user(1002, &[]), "/w/f")),
-        Errno::EACCES
+        errno(utimens(&mut fs, &ann, "/w/f", given, Time::Omit, true)),
+        Errno::EPERM
     );
-    utimens(&mut fs, &bob, "/w/f").unwrap();
+    utimens(&mut fs, &bob, "/w/f", Time::Omit, given, true).unwrap();
+    // Leaving both is nothing to ask.
+    utimens(
+        &mut fs,
+        &user(1002, &[]),
+        "/w/f",
+        Time::Omit,
+        Time::Omit,
+        true,
+    )
+    .unwrap();
 }
 
 #[test]

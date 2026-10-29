@@ -484,6 +484,7 @@ pub fn call(
     db: &mut Db,
     owner: u32,
     home: &str,
+    sid: Option<&str>,
     process: &kernel::Process,
     call: abi::Call,
 ) -> std::result::Result<Value, abi::Error> {
@@ -520,19 +521,14 @@ pub fn call(
                 home: Some(home.to_string()),
             };
             let started = start(db, &process.cred, owner, &command).map_err(refused)?;
-            Ok(json!({ "pid": started["job"], "kind": started["kind"] }))
+            let pid = started["job"].as_str().unwrap_or_default().to_string();
+            // Its standard input, a descriptor of the session that writes it, as a pipe.
+            let sid = sid.ok_or(Errno::EBADF)?;
+            let now = crate::auth::now();
+            let stdin = db.add_fd(sid, None, &stdin_of(&pid), abi::O_WRONLY, false, now);
+            db.set_expiry("fd", &crate::db::fd_key(sid, stdin), now + crate::fds::IDLE);
+            Ok(json!({ "pid": pid, "kind": started["kind"], "stdin": stdin }))
         }
-        Call::Ps => Ok(json!(
-            db.jobs_of(owner, 20)
-                .iter()
-                .map(|job| {
-                    let mut view = view(db, job, u64::MAX);
-                    view["pid"] = json!(job.id);
-                    view["command"] = Spec::of(job).map(|s| json!(s.command)).unwrap_or_default();
-                    view
-                })
-                .collect::<Vec<_>>()
-        )),
         Call::Kill { pid } => {
             let job = theirs(db, &pid)?;
             if !job.finished() {
@@ -544,28 +540,53 @@ pub fn call(
             let job = theirs(db, &pid)?;
             Ok(view(db, &job, since))
         }
-        Call::Write { pid, data } => {
-            let job = theirs(db, &pid)?;
-            if job.state != "question" {
-                return Err(Error::because(
-                    Errno::EAGAIN,
-                    "the process is not waiting for an answer",
-                ));
-            }
-            let mut spec = Spec::of(&job).map_err(|why| Error::because(Errno::EIO, why))?;
-            spec.decisions = serde_json::from_value(data["decisions"].clone()).ok();
-            if spec.decisions.is_none() {
-                return Err(Error::because(
-                    Errno::EINVAL,
-                    "answer with {\"decisions\": {PATH: true|false}}",
-                ));
-            }
-            db.set_job(&pid, JobColumn::Spec, Some(&json!(spec).to_string()));
-            db.set_job(&pid, JobColumn::Question, None);
-            db.set_job(&pid, JobColumn::State, Some("queued"));
-            db.set_expiry("job", &pid, crate::auth::now() + WAITING);
-            Ok(json!({ "pid": pid, "state": "queued" }))
-        }
         _ => Err(Errno::ENOSYS.into()),
     }
+}
+
+/// Where a process's standard input is, as its descriptor names it.
+pub fn stdin_of(pid: &str) -> String {
+    format!("/proc/{pid}/fd/0")
+}
+
+/// The process whose standard input `path` is, if it is one's.
+pub fn stdin_pid(path: &str) -> Option<&str> {
+    path.strip_prefix("/proc/")?.strip_suffix("/fd/0")
+}
+
+/// Write `data` to the standard input of the process `pid`, the account `owner`'s (or anyone's
+/// as root): unzip's answers to its question, `{"decisions": {PATH: true|false}}`.
+pub fn answer(
+    db: &mut Db,
+    owner: u32,
+    process: &kernel::Process,
+    pid: &str,
+    data: &[u8],
+) -> std::result::Result<Value, abi::Error> {
+    use crate::db::JobColumn;
+    use abi::{Errno, Error};
+    let job = db.job(pid).ok_or(Errno::EPIPE)?;
+    if job.owner != owner && process.cred.id != 0 {
+        return Err(Errno::EPERM.into());
+    }
+    if job.state != "question" {
+        return Err(Error::because(
+            Errno::EAGAIN,
+            "the process is not waiting for an answer",
+        ));
+    }
+    let data: Value = serde_json::from_slice(data).unwrap_or_default();
+    let mut spec = Spec::of(&job).map_err(|why| Error::because(Errno::EIO, why))?;
+    spec.decisions = serde_json::from_value(data["decisions"].clone()).ok();
+    if spec.decisions.is_none() {
+        return Err(Error::because(
+            Errno::EINVAL,
+            "answer with {\"decisions\": {PATH: true|false}}",
+        ));
+    }
+    db.set_job(pid, JobColumn::Spec, Some(&json!(spec).to_string()));
+    db.set_job(pid, JobColumn::Question, None);
+    db.set_job(pid, JobColumn::State, Some("queued"));
+    db.set_expiry("job", pid, crate::auth::now() + WAITING);
+    Ok(json!({ "pid": pid, "state": "queued" }))
 }

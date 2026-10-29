@@ -509,7 +509,9 @@ impl Copier {
                             ));
                             self.status = 1;
                             if let Ok(writing) = writing {
-                                closing.push(Call::Close { fd: writing.fd });
+                                closing.push(Call::Close {
+                                    fd: writing.fd.into(),
+                                });
                                 if writing.created {
                                     closing.push(Call::Unlink {
                                         path: item.to.clone(),
@@ -518,7 +520,9 @@ impl Copier {
                             }
                         }
                         (Ok(reading), Err(error)) => {
-                            closing.push(Call::Close { fd: reading.fd });
+                            closing.push(Call::Close {
+                                fd: reading.fd.into(),
+                            });
                             // -f: a file that cannot be written is removed, and made anew.
                             if *replace
                                 && self.options.force
@@ -569,7 +573,7 @@ impl Copier {
                             quote(&item.shown_to)
                         ));
                         self.status = 1;
-                        closing.extend(reading.ok().map(|r| Call::Close { fd: r.fd }));
+                        closing.extend(reading.ok().map(|r| Call::Close { fd: r.fd.into() }));
                     }
                     (_, reading, writing) => {
                         let error = writing
@@ -579,8 +583,8 @@ impl Copier {
                             .cloned()
                             .unwrap_or_else(|| Errno::EIO.into());
                         self.cannot_create(io, item, &error);
-                        closing.extend(reading.ok().map(|r| Call::Close { fd: r.fd }));
-                        closing.extend(writing.ok().map(|w| Call::Close { fd: w.fd }));
+                        closing.extend(reading.ok().map(|r| Call::Close { fd: r.fd.into() }));
+                        closing.extend(writing.ok().map(|w| Call::Close { fd: w.fd.into() }));
                     }
                 }
             }
@@ -595,12 +599,12 @@ impl Copier {
             let (reading, writing, _) = fds[index].expect("opened");
             clones.extend([
                 Call::Ioctl {
-                    fd: writing,
+                    fd: writing.into(),
                     request: FICLONE,
                     arg: reading.into(),
                 },
-                Call::Close { fd: writing },
-                Call::Close { fd: reading },
+                Call::Close { fd: writing.into() },
+                Call::Close { fd: reading.into() },
             ]);
         }
         let mut results = calls::<Value>(sys, clones).await.into_iter();
@@ -698,8 +702,9 @@ impl Copier {
     }
 
     /// Give `items` their sources' owner and group, as far as the copier may, then their mode,
-    /// without setuid or setgid if they could not keep both, and their ACLs; with -a, their
-    /// other extended attributes too. What cannot be kept is left, as GNU's cp -p leaves it.
+    /// without setuid or setgid if they could not keep both, their ACLs (with -a, their other
+    /// extended attributes too), and their times. What cannot be kept is left, as GNU's cp -p
+    /// leaves it.
     async fn keep(&mut self, sys: &impl Sys, items: &[Item]) {
         if items.is_empty() {
             return;
@@ -752,7 +757,7 @@ impl Copier {
                 }
             }
         }
-        let values = calls::<Vec<u8>>(
+        let values = calls::<abi::Bytes>(
             sys,
             wanted
                 .iter()
@@ -774,6 +779,21 @@ impl Copier {
                     nofollow: true,
                 });
             }
+        }
+        // And their times, last, as nothing after it changes them.
+        for item in items {
+            later.push(Call::Utimens {
+                path: item.to.clone(),
+                atime: abi::Time::At {
+                    sec: item.stat.atime,
+                    nsec: item.stat.atime_nsec,
+                },
+                mtime: abi::Time::At {
+                    sec: item.stat.mtime,
+                    nsec: item.stat.mtime_nsec,
+                },
+                nofollow: true,
+            });
         }
         calls::<Value>(sys, later).await;
     }

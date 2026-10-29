@@ -13,8 +13,9 @@ mod find;
 pub mod io;
 mod names;
 mod perms;
-mod procs;
+pub mod procs;
 pub mod sys;
+pub mod time;
 pub mod walk;
 
 pub use io::{Ask, Io, View};
@@ -23,7 +24,7 @@ pub use sys::Sys;
 
 /// The programs of user space.
 pub const PROGRAMS: &[&str] = &[
-    "ls", "stat", "mkdir", "rmdir", "rm", "mv", "cp", "ln", "readlink", "realpath", "touch",
+    "ls", "stat", "mkdir", "rmdir", "rm", "mv", "cp", "ln", "readlink", "realpath", "touch", "df",
     "chmod", "chown", "chgrp", "getfacl", "setfacl", "getfattr", "setfattr", "fd", "ps", "kill",
     "whoami", "id", "groups", "users", "useradd", "usermod", "userdel", "groupadd", "groupmod",
     "groupdel",
@@ -45,6 +46,7 @@ pub async fn run(sys: &impl Sys, io: &mut Io<'_>) -> Option<i32> {
         "readlink" => files::readlink(sys, io, false).await,
         "realpath" => files::readlink(sys, io, true).await,
         "touch" => files::touch(sys, io).await,
+        "df" => files::df(sys, io).await,
         "chmod" => perms::chmod(sys, io).await,
         "chown" => perms::chown(sys, io, false).await,
         "chgrp" => perms::chown(sys, io, true).await,

@@ -45,3 +45,23 @@ export async function pwrite(fd, index, body, sha256) {
   if (!response.ok) { const error = new Error(reply.error || `Write failed (${response.status})`); error.status = response.status; error.errno = reply.errno; throw error; }
   return reply;
 }
+
+// Descriptors the page holds. The kernel keeps a session's descriptors while it hears from it:
+// each batch renews them all. While the page holds any, it says so every few seconds, asking of
+// each (`/proc/self/fd/N`) whether it is still open; `gone` hears of one closed elsewhere (jobs
+// cancel in another tab). `hold` gives what lets go of it.
+const HEARTBEAT = 8000;
+const held = new Map();
+let beating = null;
+export function hold(fd, gone = () => {}) {
+  held.set(fd, gone);
+  beating ??= setInterval(async () => {
+    const fds = [...held.keys()];
+    const results = await sys(fds.map(fd => ({ readlink: { path: `/proc/self/fd/${fd}` } }))).catch(() => null);
+    results?.forEach((result, i) => { if (result.err?.errno === 'ENOENT') held.get(fds[i])?.(); });
+  }, HEARTBEAT);
+  return () => {
+    held.delete(fd);
+    if (!held.size) { clearInterval(beating); beating = null; }
+  };
+}

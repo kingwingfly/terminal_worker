@@ -71,13 +71,16 @@ impl Mem {
                     .get(&(arg.as_u64().unwrap_or(u64::MAX) as u32))
                     .ok_or(Errno::EBADF)?;
                 let (file, size) = (source.file.clone(), source.size);
-                let target = fds.get(&fd).filter(|f| f.write).ok_or(Errno::EBADF)?;
+                let target = fds
+                    .get(&fd.number())
+                    .filter(|f| f.write)
+                    .ok_or(Errno::EBADF)?;
                 let node = fs.node(&target.path).ok_or(Errno::ENOENT)?;
                 fs.set_node(&target.path, &Node { file, size, ..node });
                 Ok(Value::Null)
             }
             Call::Close { fd } => {
-                let closed = fds.remove(&fd).ok_or(Errno::EBADF)?;
+                let closed = fds.remove(&fd.number()).ok_or(Errno::EBADF)?;
                 Ok(json!(Closed {
                     path: closed.path,
                     created: closed.created,
@@ -202,6 +205,7 @@ fn sh_answering(mem: &Mem, cwd: &str, line: &str, answer: &'static str) -> Ran {
         args: line.split_whitespace().map(String::from).collect(),
         cwd: cwd.into(),
         home: "/home/ann".into(),
+        now: 1_793_291_641,
         stdin: None,
         out: String::new(),
         err: Vec::new(),

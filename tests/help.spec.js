@@ -20,7 +20,8 @@ test('every command has side-effect-free help, including privileged and interact
   page.on('request', request => { if (changes(request)) requests.push(request.url()); });
   for (const command of commands) {
     await expect(page.locator('.busy')).toHaveText('↵');
-    await input.fill(command + ' -h'); await input.press('Enter');
+    // df -h is df's own (human sizes), as in GNU's df: its help is --help.
+    await input.fill(command + (command === 'df' ? ' --help' : ' -h')); await input.press('Enter');
     await expect(page.locator('.transcript pre').last()).toContainText('Usage: ');
     await expect(page.locator('.transcript pre').last()).toContainText('man ' + command);
     await expect(page.locator('#auth')).not.toBeVisible();

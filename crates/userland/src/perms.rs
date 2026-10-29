@@ -202,7 +202,7 @@ pub async fn chown(sys: &impl Sys, io: &mut Io<'_>, group_only: bool) -> i32 {
 /// A node's ACLs, as its extended attributes say: its access ACL, its mode's if it has none
 /// beyond it; and a directory's default ACL, if it has one.
 async fn acls(sys: &impl Sys, found: &[Target]) -> Vec<(Entries, Option<Entries>)> {
-    let read = calls::<Vec<u8>>(
+    let read = calls::<abi::Bytes>(
         sys,
         found
             .iter()
@@ -227,7 +227,7 @@ async fn acls(sys: &impl Sys, found: &[Target]) -> Vec<(Entries, Option<Entries>
     found
         .iter()
         .map(|target| {
-            let parse = |value: Option<Result<Vec<u8>, Error>>| {
+            let parse = |value: Option<Result<abi::Bytes, Error>>| {
                 value
                     .and_then(Result::ok)
                     .and_then(|bytes| serde_json::from_slice::<Entries>(&bytes).ok())
@@ -436,7 +436,7 @@ pub async fn setfacl(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
             writes.push(Call::Setxattr {
                 path: target.abs.clone(),
                 name: ACL_ACCESS.into(),
-                value: bytes(&access),
+                value: bytes(&access).into(),
                 flags: 0,
                 nofollow: false,
             });
@@ -445,7 +445,7 @@ pub async fn setfacl(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
                 writes.push(Call::Setxattr {
                     path: target.abs.clone(),
                     name: ACL_DEFAULT.into(),
-                    value: bytes(&new_default),
+                    value: bytes(&new_default).into(),
                     flags: 0,
                     nofollow: false,
                 });
@@ -535,7 +535,7 @@ pub async fn getfattr(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
                     getfattr.name.is_some() || matcher.as_ref().is_none_or(|m| m.is_match(name))
                 })
                 .collect();
-            let values = calls::<Vec<u8>>(
+            let values = calls::<abi::Bytes>(
                 sys,
                 names
                     .iter()
@@ -605,7 +605,7 @@ pub async fn setfattr(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
                 Some(value) => Call::Setxattr {
                     path,
                     name: name.clone(),
-                    value: value.clone(),
+                    value: value.clone().into(),
                     flags: 0,
                     nofollow: setfattr.no_dereference,
                 },

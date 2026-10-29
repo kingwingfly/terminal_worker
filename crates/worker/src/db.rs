@@ -45,8 +45,10 @@ const SCHEMA: [&str; 25] = [
     "CREATE INDEX IF NOT EXISTS nodes_parent ON nodes(parent)",
     "CREATE INDEX IF NOT EXISTS nodes_ino ON nodes(ino)",
     // An inode: a directory, a file showing content, or a symbolic link to `link`; its ACLs as
-    // JSON (crate::acl); when its content (a directory's entries) last changed, and it at all.
-    "CREATE TABLE IF NOT EXISTS inodes(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, grp INTEGER NOT NULL, mode INTEGER NOT NULL, directory INTEGER NOT NULL, file TEXT, size INTEGER NOT NULL, link TEXT, acl TEXT, default_acl TEXT, mtime INTEGER NOT NULL DEFAULT 0, ctime INTEGER NOT NULL DEFAULT 0, rdev TEXT)",
+    // JSON (crate::acl); when its content (a directory's entries) last changed, when it did at
+    // all, and when it was last read as far as anything says (reading does not: noatime), each
+    // in seconds and the nanoseconds past them.
+    "CREATE TABLE IF NOT EXISTS inodes(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, grp INTEGER NOT NULL, mode INTEGER NOT NULL, directory INTEGER NOT NULL, file TEXT, size INTEGER NOT NULL, link TEXT, acl TEXT, default_acl TEXT, mtime INTEGER NOT NULL DEFAULT 0, ctime INTEGER NOT NULL DEFAULT 0, rdev TEXT, mtime_ns INTEGER NOT NULL DEFAULT 0, ctime_ns INTEGER NOT NULL DEFAULT 0, atime INTEGER NOT NULL DEFAULT 0, atime_ns INTEGER NOT NULL DEFAULT 0)",
     "CREATE INDEX IF NOT EXISTS inodes_file ON inodes(file)",
     // Extended attributes, their values in hexadecimal.
     "CREATE TABLE IF NOT EXISTS xattrs(ino INTEGER NOT NULL, name TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(ino, name))",
@@ -194,6 +196,15 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     // Inodes made before they had times get them, as of 1970.
     if sql.exec("SELECT mtime FROM inodes LIMIT 0", None).is_err() {
         for column in ["mtime", "ctime"] {
+            sql.exec(
+                &format!("ALTER TABLE inodes ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
+                None,
+            )?;
+        }
+    }
+    // Inodes made before times had nanoseconds and an access time get them, as of 1970.
+    if sql.exec("SELECT atime FROM inodes LIMIT 0", None).is_err() {
+        for column in ["mtime_ns", "ctime_ns", "atime", "atime_ns"] {
             sql.exec(
                 &format!("ALTER TABLE inodes ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
                 None,
@@ -383,6 +394,15 @@ impl File {
     pub fn recording(&self) -> bool {
         self.state == "recording"
     }
+    /// Whether it is written in order by a writer that did not say its size (a program's
+    /// output): it has what was written, readable as it grows, and is whole once closed.
+    pub fn growing(&self) -> bool {
+        self.state == "growing"
+    }
+    /// Whether its chunks come in order, each the next: a recording's, or a growing file's.
+    pub fn sequential(&self) -> bool {
+        self.recording() || self.growing()
+    }
     /// How many chunks the whole file has.
     pub fn chunk_count(&self) -> u64 {
         self.size.div_ceil(self.chunk_size)
@@ -411,7 +431,6 @@ pub struct Fd {
     pub flags: u32,
     #[serde(deserialize_with = "flag")]
     pub created: bool,
-    pub leased: u64,
 }
 impl Fd {
     pub fn writes(&self) -> bool {
@@ -571,6 +590,18 @@ impl Db {
             .map(|chunk| file.chunk_len(chunk.idx))
             .sum()
     }
+    /// What the store holds: the bytes of its complete files, and its inodes.
+    pub fn usage(&self) -> (u64, u64) {
+        #[derive(Deserialize)]
+        struct Count {
+            n: u64,
+        }
+        let count = |query: &str| self.rows::<Count>(query, vec![]).pop().map_or(0, |c| c.n);
+        (
+            count("SELECT COALESCE(SUM(size), 0) AS n FROM files WHERE state = 'complete'"),
+            count("SELECT COUNT(*) AS n FROM inodes"),
+        )
+    }
     /// The descriptor `fd` of the session `sid`.
     pub fn fd(&self, sid: &str, fd: u32) -> Option<Fd> {
         self.rows(
@@ -593,6 +624,27 @@ impl Db {
             vec![text(file)],
         )
         .pop()
+    }
+    /// The session that writes `file`, if one does, and when it was last heard from.
+    pub fn writing_session(&self, file: &str) -> Option<(String, u64)> {
+        #[derive(Deserialize)]
+        struct Writer {
+            sid: String,
+            leased: u64,
+        }
+        self.rows::<Writer>(
+            "SELECT sid, leased FROM fds WHERE file = ? AND flags & 3 != 0",
+            vec![text(file)],
+        )
+        .pop()
+        .map(|writer| (writer.sid, writer.leased))
+    }
+    /// Keep every descriptor of the session `sid`, as of `now`.
+    pub fn lease_fds(&mut self, sid: &str, now: u64) {
+        self.run(
+            "UPDATE fds SET leased = ? WHERE sid = ?",
+            vec![int(now), text(sid)],
+        );
     }
     /// A new descriptor of the session `sid`, the lowest number free from 3, as open(2) gives
     /// the lowest; it is kept from `now`.
@@ -713,6 +765,13 @@ impl Db {
     pub fn record_file(&mut self, file: &str) {
         self.run(
             "UPDATE files SET state = 'recording' WHERE id = ?",
+            vec![text(file)],
+        );
+    }
+    /// Make `file` one written in order, as it grows (File::growing).
+    pub fn grow_in_order(&mut self, file: &str) {
+        self.run(
+            "UPDATE files SET state = 'growing' WHERE id = ?",
             vec![text(file)],
         );
     }
@@ -1240,13 +1299,14 @@ const USER: &str = "SELECT id, name, gid, groups, home, locked, salt, hash FROM 
 
 impl Db {
     /// The entries of the directory holding `path` changed: its times are now.
-    fn entries_changed(&mut self, path: &str, now: u64) {
+    fn entries_changed(&mut self, path: &str) {
         if path == "/" {
             return;
         }
+        let (now, nanos) = crate::auth::clock();
         self.run(
-            "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE id = (SELECT ino FROM nodes WHERE path = ?2)",
-            vec![int(now), text(terminal_worker_core::parent(path))],
+            "UPDATE inodes SET mtime = ?1, mtime_ns = ?2, ctime = ?1, ctime_ns = ?2 WHERE id = (SELECT ino FROM nodes WHERE path = ?3)",
+            vec![int(now), int(nanos), text(terminal_worker_core::parent(path))],
         );
     }
 }
@@ -1254,27 +1314,42 @@ impl Db {
 /// What the kernel's file system keeps beyond names: the time, inodes' times, empty content,
 /// and what has arrived of content still being written.
 impl kernel::Fs for Db {
-    fn now(&self) -> u64 {
-        crate::auth::now()
+    fn now(&self) -> (u64, u32) {
+        crate::auth::clock()
     }
-    fn times(&self, ino: u64) -> (u64, u64) {
+    fn times(&self, ino: u64) -> kernel::Times {
         #[derive(Deserialize)]
         struct Times {
+            atime: u64,
+            atime_ns: u32,
             mtime: u64,
+            mtime_ns: u32,
             ctime: u64,
+            ctime_ns: u32,
         }
         self.rows::<Times>(
-            "SELECT mtime, ctime FROM inodes WHERE id = ?",
+            "SELECT atime, atime_ns, mtime, mtime_ns, ctime, ctime_ns FROM inodes WHERE id = ?",
             vec![int(ino)],
         )
         .pop()
-        .map_or((0, 0), |times| (times.mtime, times.ctime))
+        .map_or_else(kernel::Times::default, |t| kernel::Times {
+            atime: (t.atime, t.atime_ns),
+            mtime: (t.mtime, t.mtime_ns),
+            ctime: (t.ctime, t.ctime_ns),
+        })
     }
-    fn touch(&mut self, ino: u64) {
-        let now = crate::auth::now();
+    fn set_times(&mut self, ino: u64, atime: Option<(u64, u32)>, mtime: Option<(u64, u32)>) {
+        let (now, nanos) = crate::auth::clock();
+        let given = |time: Option<(u64, u32)>| match time {
+            Some((sec, nsec)) => [int(sec), int(nsec)],
+            None => [SqlStorageValue::Null, SqlStorageValue::Null],
+        };
+        let mut values = given(atime).to_vec();
+        values.extend(given(mtime));
+        values.extend([int(now), int(nanos), int(ino)]);
         self.run(
-            "UPDATE inodes SET mtime = ?1, ctime = ?1 WHERE id = ?2",
-            vec![int(now), int(ino)],
+            "UPDATE inodes SET atime = COALESCE(?1, atime), atime_ns = COALESCE(?2, atime_ns), mtime = COALESCE(?3, mtime), mtime_ns = COALESCE(?4, mtime_ns), ctime = ?5, ctime_ns = ?6 WHERE id = ?7",
+            values,
         );
         for name in self.names(ino) {
             changes(&name);
@@ -1338,9 +1413,10 @@ impl Store for Db {
         struct Shown {
             file: Option<String>,
             mtime: u64,
+            mtime_ns: u32,
         }
         changes(path);
-        let now = crate::auth::now();
+        let (now, nanos) = crate::auth::clock();
         let json = |value: Option<String>| -> SqlStorageValue { value.into() };
         let values = vec![
             int(node.owner),
@@ -1360,9 +1436,9 @@ impl Store for Db {
         ];
         let ino = if node.ino == 0 {
             let mut values = values;
-            values.extend([int(now), int(now)]);
+            values.extend([int(now), int(nanos)]);
             self.rows::<Id>(
-                "INSERT INTO inodes(owner, grp, mode, directory, file, size, link, rdev, acl, default_acl, mtime, ctime) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                "INSERT INTO inodes(owner, grp, mode, directory, file, size, link, rdev, acl, default_acl, mtime, mtime_ns, ctime, ctime_ns, atime, atime_ns) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?11, ?12, ?11, ?12, ?11, ?12) RETURNING id",
                 values,
             )
             .pop()
@@ -1370,18 +1446,28 @@ impl Store for Db {
         } else {
             let shown = self
                 .rows::<Shown>(
-                    "SELECT file, mtime FROM inodes WHERE id = ?",
+                    "SELECT file, mtime, mtime_ns FROM inodes WHERE id = ?",
                     vec![int(node.ino)],
                 )
                 .pop();
-            let (before, mtime) = shown.map_or((None, 0), |s| (s.file, s.mtime));
+            let (before, mtime) = shown.map_or((None, (0, 0)), |s| (s.file, (s.mtime, s.mtime_ns)));
             // Its content changed (an upload completed over it): its mtime too; anything, its
             // ctime.
-            let mtime = if before != node.file { now } else { mtime };
+            let mtime = if before != node.file {
+                (now, nanos)
+            } else {
+                mtime
+            };
             let mut values = values;
-            values.extend([int(mtime), int(now), int(node.ino)]);
+            values.extend([
+                int(mtime.0),
+                int(mtime.1),
+                int(now),
+                int(nanos),
+                int(node.ino),
+            ]);
             self.run(
-                "UPDATE inodes SET owner = ?, grp = ?, mode = ?, directory = ?, file = ?, size = ?, link = ?, rdev = ?, acl = ?, default_acl = ?, mtime = ?, ctime = ? WHERE id = ?",
+                "UPDATE inodes SET owner = ?, grp = ?, mode = ?, directory = ?, file = ?, size = ?, link = ?, rdev = ?, acl = ?, default_acl = ?, mtime = ?, mtime_ns = ?, ctime = ?, ctime_ns = ? WHERE id = ?",
                 values,
             );
             // Every name of it shows the change.
@@ -1402,7 +1488,7 @@ impl Store for Db {
             vec![text(path), text(parent_of(path)), int(ino)],
         );
         if old != Some(ino) {
-            self.entries_changed(path, now);
+            self.entries_changed(path);
         }
         if let Some(old) = old
             && old != ino
@@ -1417,7 +1503,7 @@ impl Store for Db {
             .pop()
             .map(|r| r.ino);
         self.run("DELETE FROM nodes WHERE path = ?", vec![text(path)]);
-        self.entries_changed(path, crate::auth::now());
+        self.entries_changed(path);
         if let Some(old) = old {
             self.forget(old);
         }

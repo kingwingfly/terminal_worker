@@ -2,7 +2,7 @@
 //! GNU's are.
 use crate::io::{Io, View, basename, joined, quote};
 use crate::sys::{Sys, call, calls, done, getdents, lstat, stat};
-use crate::walk;
+use crate::{time, walk};
 use abi::{Call, Errno, Error, MAXSYMLINKS, R_OK, Stat, X_OK};
 use serde_json::Value;
 use terminal_worker_core::cli::{files as args, parse};
@@ -67,6 +67,7 @@ fn entry(
         link: lstat.link.clone(),
         device: lstat.rdev.clone(),
         links: lstat.nlink,
+        mtime: lstat.mtime,
         acl: lstat.acl,
         denied,
     }
@@ -151,6 +152,15 @@ pub async fn ls(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
                 if !ls.all {
                     list.retain(|entry| !entry.name.starts_with('.'));
                 }
+                // -t and -S sort by time or size alone, as GNU's ls does, names breaking ties.
+                if ls.time {
+                    list.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.name.cmp(&b.name)));
+                } else if ls.size {
+                    list.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+                }
+                if ls.reverse {
+                    list.reverse();
+                }
                 io.view = Some(View::Listing {
                     entries: list,
                     long: ls.long,
@@ -199,27 +209,6 @@ pub async fn ls(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
     0
 }
 
-/// `seconds` since 1970 as a date and time in UTC, as stat shows them.
-fn datetime(seconds: u64) -> String {
-    let (days, rest) = ((seconds / 86_400) as i64, seconds % 86_400);
-    // Howard Hinnant's days-to-civil.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} +0000",
-        rest / 3600,
-        rest % 3600 / 60,
-        rest % 60
-    )
-}
-
 pub async fn stat_program(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
     let stat = parsed!(io, args::Stat);
     let mut status = 0;
@@ -238,42 +227,140 @@ pub async fn stat_program(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
                 continue;
             }
         };
-        let what = match () {
-            _ if node.is_dir() => "directory",
-            _ if node.is_link() => "symbolic link",
-            _ if node.is_device() => "character special file",
-            _ if node.size == 0 => "regular empty file",
-            _ => "regular file",
-        };
-        let name = match &node.link {
-            Some(target) => format!("{} -> {}", quote(typed), quote(target)),
-            None => quote(typed),
-        };
-        let kind = if node.is_dir() {
-            'd'
-        } else if node.is_link() {
-            'l'
-        } else if node.is_device() {
-            'c'
-        } else {
-            '-'
-        };
-        io.say(format!("  File: {name}"));
-        io.say(format!("  Size: {:<15} {what}", node.size));
-        io.say(format!(" Inode: {:<15} Links: {}", node.ino, node.nlink));
-        io.say(format!(
+        match stat.printf.as_ref().or(stat.format.as_ref()) {
+            Some(format) => {
+                let text = formatted(format, typed, &node, stat.printf.is_some());
+                io.out.push_str(&text);
+                if stat.printf.is_none() {
+                    io.out.push('\n');
+                }
+            }
+            None => {
+                for line in described(typed, &node) {
+                    io.say(line);
+                }
+            }
+        }
+    }
+    status
+}
+
+/// What a node is, as stat's %F says.
+fn file_type(node: &Stat) -> &'static str {
+    match () {
+        _ if node.is_dir() => "directory",
+        _ if node.is_link() => "symbolic link",
+        _ if node.is_device() => "character special file",
+        _ if node.size == 0 => "regular empty file",
+        _ => "regular file",
+    }
+}
+
+/// Its type letter, as ls -l and stat's %A begin with.
+fn type_letter(node: &Stat) -> char {
+    if node.is_dir() {
+        'd'
+    } else if node.is_link() {
+        'l'
+    } else if node.is_device() {
+        'c'
+    } else {
+        '-'
+    }
+}
+
+/// stat's default lines for `node`, named `typed`, as GNU's are.
+fn described(typed: &str, node: &Stat) -> Vec<String> {
+    let name = match &node.link {
+        Some(target) => format!("{} -> {}", quote(typed), quote(target)),
+        None => quote(typed),
+    };
+    vec![
+        format!("  File: {name}"),
+        format!(
+            "  Size: {:<15} Blocks: {:<10} IO Block: 4096   {}",
+            node.size,
+            node.size.div_ceil(512),
+            file_type(node)
+        ),
+        format!("Device: 0,0\tInode: {:<11} Links: {}", node.ino, node.nlink),
+        format!(
             "Access: ({:04o}/{})  Uid: ({:>5}/{:>8})   Gid: ({:>5}/{:>8})",
             node.perm(),
-            type_mode_text(node.perm(), kind),
+            type_mode_text(node.perm(), type_letter(node)),
             node.uid,
             node.user,
             node.gid,
             node.group
-        ));
-        io.say(format!("Modify: {}", datetime(node.mtime)));
-        io.say(format!("Change: {}", datetime(node.ctime)));
+        ),
+        format!("Access: {}", time::datetime(node.atime, node.atime_nsec)),
+        format!("Modify: {}", time::datetime(node.mtime, node.mtime_nsec)),
+        format!("Change: {}", time::datetime(node.ctime, node.ctime_nsec)),
+        " Birth: -".to_string(),
+    ]
+}
+
+/// stat -c FORMAT (or --printf, whose backslash escapes are read too) for `node`, named `typed`.
+pub fn formatted(format: &str, typed: &str, node: &Stat, escapes: bool) -> String {
+    let mut out = String::new();
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '%' => {
+                let Some(spec) = chars.next() else {
+                    out.push('%');
+                    break;
+                };
+                match spec {
+                    'a' => out.push_str(&format!("{:o}", node.perm())),
+                    'A' => out.push_str(&type_mode_text(node.perm(), type_letter(node))),
+                    'b' => out.push_str(&node.size.div_ceil(512).to_string()),
+                    'B' => out.push_str("512"),
+                    'f' => out.push_str(&format!("{:x}", node.mode)),
+                    'F' => out.push_str(file_type(node)),
+                    'g' => out.push_str(&node.gid.to_string()),
+                    'G' => out.push_str(&node.group),
+                    'h' => out.push_str(&node.nlink.to_string()),
+                    'i' => out.push_str(&node.ino.to_string()),
+                    'n' => out.push_str(typed),
+                    'N' => out.push_str(&match &node.link {
+                        Some(target) => format!("{} -> {}", quote(typed), quote(target)),
+                        None => quote(typed),
+                    }),
+                    'o' => out.push_str("4096"),
+                    's' => out.push_str(&node.size.to_string()),
+                    'u' => out.push_str(&node.uid.to_string()),
+                    'U' => out.push_str(&node.user),
+                    'w' => out.push('-'),
+                    'W' => out.push('0'),
+                    'x' => out.push_str(&time::datetime(node.atime, node.atime_nsec)),
+                    'X' => out.push_str(&node.atime.to_string()),
+                    'y' => out.push_str(&time::datetime(node.mtime, node.mtime_nsec)),
+                    'Y' => out.push_str(&node.mtime.to_string()),
+                    'z' => out.push_str(&time::datetime(node.ctime, node.ctime_nsec)),
+                    'Z' => out.push_str(&node.ctime.to_string()),
+                    '%' => out.push('%'),
+                    other => {
+                        out.push('%');
+                        out.push(other);
+                    }
+                }
+            }
+            '\\' if escapes => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            },
+            c => out.push(c),
+        }
     }
-    status
+    out
 }
 
 async fn stat_of(sys: &impl Sys, path: &str, follow: bool) -> Result<Stat, Error> {
@@ -855,22 +942,60 @@ pub async fn readlink(sys: &impl Sys, io: &mut Io<'_>, real: bool) -> i32 {
 
 pub async fn touch(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
     let touch = parsed!(io, args::Touch);
+    // The times to set: now, or what -d, -t or -r say; -a or -m alone sets that one only.
+    let given = if let Some(date) = &touch.date {
+        time::parse_date(date, io.now).map(|t| Some((t, t)))
+    } else if let Some(stamp) = &touch.stamp {
+        time::parse_stamp(stamp, io.now).map(|t| Some((t, t)))
+    } else if let Some(reference) = &touch.reference {
+        match stat(sys, &io.path(reference)).await {
+            Ok(found) => Ok(Some((
+                (found.atime, found.atime_nsec),
+                (found.mtime, found.mtime_nsec),
+            ))),
+            Err(error) => Err(format!(
+                "failed to get attributes of {}: {error}",
+                quote(reference)
+            )),
+        }
+    } else {
+        Ok(None)
+    };
+    let given = match given {
+        Ok(given) => given,
+        Err(why) => {
+            io.fail(format!("touch: {why}"));
+            return 1;
+        }
+    };
+    let at = |time: (u64, u32)| abi::Time::At {
+        sec: time.0,
+        nsec: time.1,
+    };
+    let (mut atime, mut mtime) =
+        given.map_or((abi::Time::Now, abi::Time::Now), |(a, m)| (at(a), at(m)));
+    if touch.access && !touch.modification {
+        mtime = abi::Time::Omit;
+    }
+    if touch.modification && !touch.access {
+        atime = abi::Time::Omit;
+    }
+    let times = |path: &String| Call::Utimens {
+        path: path.clone(),
+        atime,
+        mtime,
+        nofollow: touch.no_dereference,
+    };
     let paths: Vec<String> = touch.files.iter().map(|typed| io.path(typed)).collect();
-    // Its times, now; or, not there, a new empty file.
-    let touched = calls::<Value>(
-        sys,
-        paths
-            .iter()
-            .map(|path| Call::Utimens { path: path.clone() })
-            .collect(),
-    )
-    .await;
+    let touched = calls::<Value>(sys, paths.iter().map(times).collect()).await;
     let mut status = 0;
     let mut making = Vec::new();
     for ((typed, path), result) in touch.files.iter().zip(&paths).zip(touched) {
         match result {
             Ok(_) => {}
-            Err(error) if error.errno == Errno::ENOENT && touch.no_create => {}
+            // What is not there is made, unless -c or -h says not to.
+            Err(error)
+                if error.errno == Errno::ENOENT && (touch.no_create || touch.no_dereference) => {}
             Err(error) if error.errno == Errno::ENOENT => making.push((typed, path)),
             Err(error) => {
                 io.fail(format!("touch: cannot touch {}: {error}", quote(typed)));
@@ -878,23 +1003,131 @@ pub async fn touch(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
             }
         }
     }
-    let made = calls::<Value>(
-        sys,
-        making
-            .iter()
-            .map(|(_, path)| Call::Mknod {
-                path: (*path).clone(),
-                mode: 0o666,
-                rdev: None,
-            })
-            .collect(),
-    )
-    .await;
-    for ((typed, _), result) in making.iter().zip(made) {
-        if let Err(error) = result {
+    // Made empty, and then given the times asked for, if they are not now.
+    let mut made_calls = Vec::new();
+    for (_, path) in &making {
+        made_calls.push(Call::Mknod {
+            path: (*path).clone(),
+            mode: 0o666,
+            rdev: None,
+        });
+        if given.is_some() {
+            made_calls.push(times(path));
+        }
+    }
+    let made = calls::<Value>(sys, made_calls).await;
+    let step = if given.is_some() { 2 } else { 1 };
+    for (index, (typed, _)) in making.iter().enumerate() {
+        if let Some(Err(error)) = made.get(index * step) {
             io.fail(format!("touch: cannot touch {}: {error}", quote(typed)));
             status = 1;
         }
     }
     status
+}
+
+/// df: the file systems FILEs are on (the store, /, by default; /proc, procfs), their sizes in
+/// 1K blocks, or with -h in powers of 1024.
+pub async fn df(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
+    let df = parsed!(io, args::Df);
+    let typed = if df.files.is_empty() {
+        vec!["/".to_string()]
+    } else {
+        df.files.clone()
+    };
+    let paths: Vec<String> = typed.iter().map(|t| io.path(t)).collect();
+    let found = calls::<abi::StatFs>(
+        sys,
+        paths
+            .iter()
+            .map(|path| Call::Statfs { path: path.clone() })
+            .collect(),
+    )
+    .await;
+    let size = |bytes: u64| {
+        if df.human {
+            human(bytes)
+        } else {
+            bytes.div_ceil(1024).to_string()
+        }
+    };
+    let mut rows = vec![[
+        "Filesystem".to_string(),
+        if df.human { "Size" } else { "1K-blocks" }.to_string(),
+        "Used".to_string(),
+        if df.human { "Avail" } else { "Available" }.to_string(),
+        "Use%".to_string(),
+        "Mounted on".to_string(),
+    ]];
+    let mut status = 0;
+    for ((typed, path), found) in typed.iter().zip(&paths).zip(found) {
+        let fs = match found {
+            Ok(fs) => fs,
+            Err(error) => {
+                io.fail(format!("df: {}: {error}", quote(typed)));
+                status = 1;
+                continue;
+            }
+        };
+        let (name, mounted) = if path == "/proc" || path.starts_with("/proc/") {
+            ("proc", "/proc")
+        } else {
+            ("r2", "/")
+        };
+        let used = (fs.blocks - fs.bfree) * fs.bsize;
+        let percent = if fs.blocks == 0 {
+            "-".to_string()
+        } else {
+            format!(
+                "{}%",
+                (used * 100).div_ceil((used + fs.bavail * fs.bsize).max(1))
+            )
+        };
+        rows.push([
+            name.to_string(),
+            size(fs.blocks * fs.bsize),
+            size(used),
+            size(fs.bavail * fs.bsize),
+            percent,
+            mounted.to_string(),
+        ]);
+    }
+    let widths: Vec<usize> = (0..6)
+        .map(|i| rows.iter().map(|row| row[i].len()).max().unwrap_or(0))
+        .collect();
+    for row in &rows {
+        io.say(format!(
+            "{:<w0$} {:>w1$} {:>w2$} {:>w3$} {:>w4$} {}",
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            row[5],
+            w0 = widths[0],
+            w1 = widths[1],
+            w2 = widths[2],
+            w3 = widths[3],
+            w4 = widths[4],
+        ));
+    }
+    status
+}
+
+/// `bytes` as df -h shows them: in the largest power of 1024 under it, with a decimal below ten.
+fn human(bytes: u64) -> String {
+    let units = ["", "K", "M", "G", "T", "P", "E"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < units.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}")
+    } else if value < 10.0 {
+        format!("{:.1}{}", (value * 10.0).ceil() / 10.0, units[unit])
+    } else {
+        format!("{}{}", value.ceil(), units[unit])
+    }
 }

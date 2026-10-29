@@ -43,8 +43,8 @@ test('ln makes symbolic and hard links that behave as on Linux', async ({ page, 
   // ls -l shows where a link points, and how many names a file has.
   // Piped, a listing is text, a line an entry.
   const long = await output(page, 'ls -l | cat');
-  expect(long).toMatch(/^lrwxrwxrwx +1 root root +9 link\.md -> docs\/b\.md$/m);
-  expect(long).toMatch(/^-rw-r--r-- +2 root root +6 a-too\.md$/m);
+  expect(long).toMatch(/^lrwxrwxrwx +1 root root +9 [A-Z][a-z]{2} [ \d]\d [ \d:]{5} link\.md -> docs\/b\.md$/m);
+  expect(long).toMatch(/^-rw-r--r-- +2 root root +6 [A-Z][a-z]{2} [ \d]\d [ \d:]{5} a-too\.md$/m);
   expect(await output(page, 'cat link.md')).toBe('beta');
   expect(await output(page, 'readlink link.md')).toBe('docs/b.md');
   expect(await output(page, 'readlink -f link.md')).toBe(base + '/docs/b.md');

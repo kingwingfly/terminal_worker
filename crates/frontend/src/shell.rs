@@ -6,16 +6,19 @@
 
 mod commands;
 
+use abi::Call;
 use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
 use futures::{FutureExt, StreamExt};
 use leptos::prelude::*;
 use serde_json::{Value, json};
+use terminal_worker_core::bin as cli_bin;
 use terminal_worker_core::completion::{self, Candidate, Query};
 use terminal_worker_core::glob::{self, Part};
 use terminal_worker_core::shell::{self as grammar, Delimiter, Word};
 use terminal_worker_core::{Entry, cli, find, resolve, split_command, text};
 use wasm_bindgen::JsValue;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::{
@@ -212,12 +215,13 @@ fn listing_text(entries: &[Entry], long: bool) -> String {
         .map(|e| {
             if long {
                 format!(
-                    "{} {:>2} {} {} {:>8} {}{}\n",
+                    "{} {:>2} {} {} {:>8} {} {}{}\n",
                     e.mode_line(),
                     e.links,
                     e.owner,
                     e.group,
                     e.size,
+                    crate::listed(e.mtime),
                     e.name,
                     e.link
                         .as_ref()
@@ -437,7 +441,11 @@ impl Shell {
                 .await
                 .map_err(|error| error.to_string())?;
             let pid = spawned["pid"].as_str().unwrap_or_default().to_string();
-            return self.follow(&pid, piped).await;
+            let stdin = spawned["stdin"].as_u64().unwrap_or(u64::from(u32::MAX)) as u32;
+            let followed = self.follow(&pid, stdin, piped).await;
+            // Its standard input is let go of as it ends, or as this tab stops following it.
+            userland::sys::calls::<Value>(&sys, vec![Call::Close { fd: stdin.into() }]).await;
+            return followed;
         }
         let value = self.call(args).await?;
         // Not one of web/app.js's dialogs: a program of user space.
@@ -450,8 +458,7 @@ impl Shell {
     }
     /// Follow the process `id` to its end: write its lines as they come, answer its question in
     /// this tab (its stdin), and signal it on Ctrl+C.
-    async fn follow(self, id: &str, piped: bool) -> Result<Output, String> {
-        use abi::Call;
+    async fn follow(self, id: &str, stdin: u32, piped: bool) -> Result<Output, String> {
         let sys = crate::sys::HttpSys::default();
         let mut out = Output::default();
         let mut since = 0;
@@ -507,9 +514,14 @@ impl Shell {
                     if self.cancelled() {
                         continue;
                     }
-                    let answer = Call::Write {
-                        pid: id.into(),
-                        data: json!({ "decisions": decisions }),
+                    // Its answer goes to its standard input.
+                    let answer = Call::Pwrite {
+                        fd: stdin.into(),
+                        index: 0,
+                        data: json!({ "decisions": decisions })
+                            .to_string()
+                            .into_bytes()
+                            .into(),
                     };
                     userland::sys::call::<Value>(&sys, answer)
                         .await
@@ -564,34 +576,28 @@ impl Shell {
     /// descriptor (`fdN`), closed, which completes a recording with what arrived and leaves an
     /// upload, removed if it was making the file.
     async fn jobs(self, cancel: Option<&str>) -> Result<Output, String> {
-        use abi::{Call, Fd, O_APPEND};
+        use abi::O_APPEND;
+        use userland::procs::{Descriptor, descriptors, processes};
         let sys = crate::sys::HttpSys::default();
-        let jobs: Vec<Value> = userland::sys::call(&sys, Call::Ps)
+        let jobs = processes(&sys).await.unwrap_or_default();
+        let fds: Vec<Descriptor> = descriptors(&sys)
             .await
-            .unwrap_or_default();
-        let fds: Vec<Fd> = userland::sys::call(&sys, Call::Fds)
-            .await
-            .unwrap_or_default();
-        let fds: Vec<Fd> = fds.into_iter().filter(|fd| fd.flags & 3 != 0).collect();
-        let recording = |fd: &Fd| fd.flags & O_APPEND != 0;
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|fd| fd.flags & 3 != 0)
+            .collect();
+        let recording = |fd: &Descriptor| fd.flags & O_APPEND != 0;
         match cancel {
             None => {
                 let mut text = String::new();
                 for job in &jobs {
-                    let command = &job["command"];
-                    let archive = command["archive"]
-                        .as_str()
-                        .or(command["file"].as_str())
-                        .unwrap_or_default();
-                    let progress = &job["progress"];
                     text.push_str(&format!(
-                        "{}  {:<10} {} {}  {}/{}\n",
-                        &job["id"].as_str().unwrap_or_default()[..8],
-                        job["state"].as_str().unwrap_or_default(),
-                        job["kind"].as_str().unwrap_or_default(),
-                        archive,
-                        progress["done"].as_u64().unwrap_or(0),
-                        progress["total"].as_u64().unwrap_or(0),
+                        "{}  {:<10} {}  {}/{}\n",
+                        job.pid.get(..8).unwrap_or(&job.pid),
+                        job.state,
+                        job.command(),
+                        job.done,
+                        job.total,
                     ));
                 }
                 for fd in &fds {
@@ -617,15 +623,21 @@ impl Shell {
                 Ok(Output::text(text))
             }
             Some(wanted) => {
-                let starts = |v: &Value| v["id"].as_str().is_some_and(|id| id.starts_with(wanted));
-                if let Some(job) = jobs.iter().find(|j| starts(j)) {
-                    let id = job["id"].as_str().unwrap_or_default();
-                    userland::sys::call::<Value>(&sys, Call::Kill { pid: id.into() })
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(Output::text(format!("Cancelling job {}\n", &id[..8])))
+                if let Some(job) = jobs.iter().find(|job| job.pid.starts_with(wanted)) {
+                    userland::sys::call::<Value>(
+                        &sys,
+                        Call::Kill {
+                            pid: job.pid.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    Ok(Output::text(format!(
+                        "Cancelling job {}\n",
+                        job.pid.get(..8).unwrap_or(&job.pid)
+                    )))
                 } else if let Some(fd) = fds.iter().find(|fd| format!("fd{}", fd.fd) == wanted) {
-                    let mut calls = vec![Call::Close { fd: fd.fd }];
+                    let mut calls = vec![Call::Close { fd: fd.fd.into() }];
                     if fd.created && !recording(fd) {
                         calls.push(Call::Unlink {
                             path: fd.path.clone(),
@@ -833,6 +845,7 @@ impl Shell {
             args,
             cwd: self.cwd.get_untracked(),
             home: self.account.home.get_untracked(),
+            now: (js_sys::Date::now() / 1000.0) as u64,
             stdin,
             out: String::new(),
             err: Vec::new(),
@@ -853,6 +866,67 @@ impl Shell {
             view: io.view,
             found: io.found,
         }
+    }
+    /// Run the program of /bin `args[0]` (`/bin/NAME`, or a name the shell has no command of its
+    /// own for), as a process of its own: what it writes goes on, its errors to the transcript.
+    /// Ctrl+C kills it.
+    pub async fn bin(
+        self,
+        mut args: Vec<String>,
+        stdin: Option<String>,
+        piped: bool,
+        sudo: bool,
+    ) -> Result<Output, String> {
+        let name = cli_bin::program(&args[0]).unwrap_or_default();
+        args[0] = name.to_string();
+        let set = |options: &js_sys::Object, key: &str, value: JsValue| {
+            let _ = js_sys::Reflect::set(options, &JsValue::from_str(key), &value);
+        };
+        let options = js_sys::Object::new();
+        set(&options, "cwd", self.cwd.get_untracked().into());
+        set(&options, "home", self.account.home.get_untracked().into());
+        set(
+            &options,
+            "user",
+            self.account.username.get_untracked().into(),
+        );
+        set(
+            &options,
+            "stdin",
+            stdin.map_or(JsValue::NULL, JsValue::from),
+        );
+        set(&options, "sudo", sudo.into());
+        set(&options, "tty", (!piped).into());
+        let cancelled = Closure::<dyn Fn() -> bool>::new(move || self.cancelled());
+        set(&options, "cancelled", cancelled.as_ref().clone());
+        let exited = JsFuture::from(crate::exec(args, &options.into()))
+            .await
+            .map_err(js_message)?;
+        drop(cancelled);
+        let field = |key: &str| js_sys::Reflect::get(&exited, &JsValue::from_str(key)).ok();
+        let status = field("status").and_then(|v| v.as_f64()).unwrap_or(1.0) as i32;
+        let stdout = field("stdout")
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        let stderr = field("stderr")
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+        for line in stderr.lines() {
+            self.error(line);
+        }
+        if field("truncated").and_then(|v| v.as_bool()) == Some(true) {
+            self.error(format!(
+                "{name}: output larger than 10 MB was cut short, and {name} stopped"
+            ));
+        }
+        if cli_bin::writes(name) {
+            self.refresh().await?;
+        }
+        Ok(Output {
+            stdout,
+            failed: status != 0,
+            ..Default::default()
+        })
     }
     /// Run the program of user space `args[0]` as a stage: its errors go to the transcript, and
     /// its listing as a view of its own unless piped.
@@ -899,11 +973,16 @@ impl Shell {
         stdin: Option<String>,
         piped: bool,
     ) -> Result<Output, String> {
-        let allowed = JsFuture::from(sudo()).await.map_err(js_message)?;
-        if allowed.as_bool() != Some(true) {
+        if !self.authenticated().await? {
             return Err("sudo canceled".into());
         }
         self.program(args, stdin, piped, true).await
+    }
+    /// Whether the account may act as root now: sudo's password, asked for if it has not been
+    /// lately.
+    pub async fn authenticated(self) -> Result<bool, String> {
+        let allowed = JsFuture::from(sudo()).await.map_err(js_message)?;
+        Ok(allowed.as_bool() == Some(true))
     }
     /// What fd finds, as `args` say: whether it failed, and its results, by path.
     async fn find(self, args: &[String]) -> (Output, Vec<String>) {
@@ -949,6 +1028,30 @@ impl Shell {
                 && !DIALOGS.contains(&name.as_str())
             {
                 return self.program(args, stdin, piped, false).await;
+            }
+            // A path to /bin's program, or a name the shell has nothing of its own for, runs
+            // /bin's, as a shell runs what its PATH finds.
+            if name.starts_with("/bin/") && cli_bin::program(&name).is_some()
+                || cli_bin::program(&name).is_some()
+                    && commands::find(&name).is_none()
+                    && cli::definition(&name).is_none()
+                    && !userland::PROGRAMS.contains(&name.as_str())
+            {
+                return self.bin(args, stdin, piped, false).await;
+            }
+            if name == "coreutils" {
+                let mut args = args;
+                args.remove(0);
+                if args.is_empty() {
+                    return Ok(Output::text(format!(
+                        "coreutils (uutils): {}\n",
+                        cli_bin::PROGRAMS.join(" ")
+                    )));
+                }
+                if cli_bin::program(&args[0]).is_none() {
+                    return Err(format!("coreutils: {}: no such utility", args[0]));
+                }
+                return self.bin(args, stdin, piped, false).await;
             }
             match commands::find(&name) {
                 Some(command) => command.run(self, args, stdin, piped).await,

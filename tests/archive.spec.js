@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { crc32 } from 'node:zlib';
-import { api, call, errno, listing, mkdirp, program, put, rmrf } from './sys.js';
+import { api, call, errno, listing, mkdirp, processes, program, put, rmrf } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -105,13 +105,17 @@ test('a job is a process: spawned, waited for, listed by ps, asked on its stdin,
   };
   expect((await finished()).state).toBe('done');
   expect((await ls(request, base)).map(entry => entry.name)).toContain('docs.zip');
-  expect((await call(request, 'ps')).map(process => process.pid)).toContain(pid);
+  expect((await processes(request)).map(process => process.pid)).toContain(pid);
   // A question goes to its stdin: unzip asks before replacing what is there.
-  const asking = (await call(request, { spawn: { argv: ['unzip', 'docs.zip'], ...O } })).pid;
+  const { pid: asking, stdin } = await call(request, { spawn: { argv: ['unzip', 'docs.zip'], ...O } });
   await expect.poll(async () => (await call(request, { wait: { pid: asking } })).state, { timeout: 120_000 }).toBe('question');
   const { question } = await call(request, { wait: { pid: asking } });
   const decisions = Object.fromEntries(question.replace.map(path => [path, false]));
-  expect((await call(request, { write: { pid: asking, data: { decisions } } })).state).toBe('queued');
+  // Its standard input is a descriptor of the session, written as a pipe is.
+  expect(await call(request, { readlink: { path: `/proc/self/fd/${stdin}` } })).toBe(`/proc/${asking}/fd/0`);
+  const answer = Buffer.from(JSON.stringify({ decisions })).toString('base64');
+  expect((await call(request, { pwrite: { fd: stdin, index: 0, data: answer } })).state).toBe('queued');
+  expect((await call(request, { close: { fd: stdin } })).path).toBe(`/proc/${asking}/fd/0`);
   await expect.poll(async () => (await call(request, { wait: { pid: asking } })).state, { timeout: 120_000 }).toBe('done');
   // Only programs are spawned; signals go to what is there, and its owner's (or root's).
   expect(await errno(request, { spawn: { argv: ['sh', '-c', 'true'], ...O } })).toBe('ENOENT');

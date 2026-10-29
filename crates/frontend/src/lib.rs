@@ -55,6 +55,10 @@ extern "C" {
     fn focus_input();
     #[wasm_bindgen(js_namespace = terminal, js_name = completionFocus)]
     fn completion_focus(value: &str, inside_quote: bool);
+    /// exec(2) of a program of /bin, as a process of its own (web/wasi/exec.mjs): its exit
+    /// status, and what it wrote.
+    #[wasm_bindgen(js_namespace = terminal)]
+    fn exec(argv: Vec<String>, options: &JsValue) -> js_sys::Promise;
 }
 
 fn endpoint(api: &str, path: &str) -> String {
@@ -124,6 +128,10 @@ fn upload_progress(entry: &Entry) -> Option<String> {
         (uploaded * 100).checked_div(entry.size).unwrap_or(100)
     ))
 }
+/// When an entry's content changed, as ls -l shows it, as of now.
+pub(crate) fn listed(mtime: u64) -> String {
+    userland::time::listed(mtime, (js_sys::Date::now() / 1000.0) as u64)
+}
 fn render_line(line: LogLine) -> AnyView {
     match line {
         LogLine::Text(text) => view! { <pre class="output-line">{text}</pre> }.into_any(),
@@ -137,7 +145,7 @@ fn render_line(line: LogLine) -> AnyView {
                 {entries.into_iter().map(|entry| {
                     let class = if entry.link.is_some() { "listing-entry entry-link" } else if entry.directory { "listing-entry entry-directory" } else if entry.mode & 0o111 != 0 { "listing-entry entry-executable" } else { "listing-entry entry-file" };
                     let class = if entry.denied { format!("{class} entry-denied") } else { class.to_string() };
-                    let meta = if long { format!("{} {:>2} {}:{} {:>6} ", entry.mode_line(), entry.links, entry.owner, entry.group, entry.size) } else { String::new() };
+                    let meta = if long { format!("{} {:>2} {}:{} {:>6} {} ", entry.mode_line(), entry.links, entry.owner, entry.group, entry.size, listed(entry.mtime)) } else { String::new() };
                     let uploading = upload_progress(&entry).map(|p| format!(" {p}"));
                     let suffix = entry.suffix();
                     view! { <span class=class>{file_icon(&entry.kind, entry.directory)}<span class="ls-meta">{meta}</span><span class="ls-name">{entry.name}{suffix}</span><span class="ls-uploading">{uploading}</span></span> }

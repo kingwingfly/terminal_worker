@@ -22,6 +22,11 @@ extern "C" {
 pub fn now() -> u64 {
     Date::now().as_millis() / 1000
 }
+/// Seconds since 1970 and nanoseconds past them, to the millisecond the clock gives.
+pub fn clock() -> (u64, u32) {
+    let ms = Date::now().as_millis();
+    (ms / 1000, (ms % 1000) as u32 * 1_000_000)
+}
 /// The token of the cookie `name` the request carries, if it is one (64 hexadecimal digits).
 pub fn cookie_token(req: &Request, name: &str) -> Option<String> {
     let cookies = req.headers().get("Cookie").ok()??;

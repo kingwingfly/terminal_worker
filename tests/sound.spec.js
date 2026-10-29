@@ -67,8 +67,10 @@ test('stream records the microphone into a file that grows as it is heard, and i
     await run(other, 'jobs');
     await expect(transcript(other)).toContainText(new RegExp(`recording  ${recording}  [\\d.]+ KB`));
     await other.close();
-    // A file written whole, not a recording, says how big it will be.
-    expect(await errno(root, { open: { path: home + '/sizeless.bin', flags: 0o101 } })).toBe('EINVAL');
+    // A writer that says no size, not appending, writes in order too: a file that is what it wrote.
+    const sizeless = await call(root, { open: { path: home + '/sizeless.bin', flags: 0o101 } });
+    expect([sizeless.size, sizeless.chunk_size]).toEqual([0, 8 << 20]);
+    expect((await call(root, { close: { fd: sizeless.fd } })).size).toBe(0);
     // What arrived may be read meanwhile, from its start.
     const partial = await (await root.get(file(recording), { headers: { 'Accept-Encoding': 'identity' } })).body();
     expect(partial.length).toBeGreaterThanOrEqual(grown);
@@ -233,7 +235,7 @@ test('stream -m gives the recording its ACL as it is made; entries it cannot tak
     await expect.poll(() => entry(root, home + '/refused.weba')).toBe(null);
     await run(page, 'stream -m g:guest:r,o::- shared.weba');
     await expect(transcript(page)).toContainText(/● \d\d:\d\d/);
-    const acl = JSON.parse(Buffer.from(await call(root, { getxattr: { path: recording, name: 'system.posix_acl_access' } })).toString());
+    const acl = JSON.parse(Buffer.from(await call(root, { getxattr: { path: recording, name: 'system.posix_acl_access' } }), 'base64').toString());
     expect([acl.groups[65534], acl.other]).toEqual([4, 0]);
     await page.locator('#command').press('Control+c');
     await expect(transcript(page)).toContainText(`✓ ${recording}`, { timeout: 30_000 });

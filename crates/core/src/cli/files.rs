@@ -7,16 +7,28 @@ use super::{Manual, Section};
 /// list a directory, or show one file
 ///
 /// Lists what the directory PATH, or the working directory, holds: directories in green with a
-/// slash, executables in amber, links in cyan with where they point.
+/// slash, executables in amber, links in cyan with where they point. Directories come first,
+/// then by name; -t sorts by when content changed, newest first, -S by size, largest first, and
+/// -r the other way.
 ///
 /// A file is shown by itself. A link to a directory lists that directory, but with -l or -d the
-/// link itself is shown; a trailing slash (ls -l link/) follows it.
+/// link itself is shown; a trailing slash (ls -l link/) follows it. Times are UTC: the month,
+/// day and time for what changed within half a year, the year for older.
 #[derive(Parser, Debug)]
 #[command(name = "ls")]
 pub struct Ls {
-    /// long format: type and mode (+ marks an ACL), names (links), owner, group, size
+    /// long format: type and mode (+ marks an ACL), names (links), owner, group, size, time
     #[arg(short = 'l')]
     pub long: bool,
+    /// by when content changed, newest first
+    #[arg(short = 't', overrides_with = "size")]
+    pub time: bool,
+    /// by size, largest first
+    #[arg(short = 'S', overrides_with = "time")]
+    pub size: bool,
+    /// in the other order
+    #[arg(short = 'r', long = "reverse")]
+    pub reverse: bool,
     /// show a directory itself, not what it holds
     #[arg(short = 'd', long = "directory")]
     pub directory: bool,
@@ -239,19 +251,43 @@ impl Manual for Mkdir {
     const SEE: &'static [&'static str] = &["rm", "chmod", "setfacl"];
 }
 
-/// make empty files
+/// make empty files, or set their times
 ///
-/// Makes each FILE that does not exist, empty, owned by you, with mode 644 (666 less the umask
-/// 022), or what the directory's default ACL gives. A file that exists keeps its content and
-/// mode: this terminal keeps no times. Through a link, the file it points to is made.
+/// Sets each FILE's access and modification times to now, or makes it, empty, owned by you,
+/// with mode 644 (666 less the umask 022), or what the directory's default ACL gives. Through a
+/// link, the file it points to is touched, unless -h, which touches the link and makes nothing.
 ///
+/// -d DATE, -t STAMP and -r FILE set another time than now: DATE as `2026-10-29`, `2026-10-29
+/// 14:30[:05[.5]]`, with `Z` or `+01:00`, `@SECONDS`, or `now`; STAMP as `[[CC]YY]MMDDhhmm[.ss]`;
+/// FILE's own times. Times are UTC unless DATE says otherwise. -a or -m sets only the access or
+/// the modification time.
+///
+/// Now is yours to set if you own the file or may write it; another time, only if you own it.
 /// Use -- before a name that starts with a hyphen.
 #[derive(Parser, Debug)]
 #[command(name = "touch")]
 pub struct Touch {
-    /// make nothing; only check those that exist
+    /// make nothing; only touch those that exist
     #[arg(short = 'c', long = "no-create")]
     pub no_create: bool,
+    /// set only the access time
+    #[arg(short = 'a')]
+    pub access: bool,
+    /// set only the modification time
+    #[arg(short = 'm')]
+    pub modification: bool,
+    /// set DATE rather than now
+    #[arg(short = 'd', long = "date", value_name = "DATE", conflicts_with_all = ["stamp", "reference"])]
+    pub date: Option<String>,
+    /// set STAMP rather than now
+    #[arg(short = 't', value_name = "STAMP", conflicts_with_all = ["date", "reference"])]
+    pub stamp: Option<String>,
+    /// set FILE's times rather than now
+    #[arg(value_hint = ValueHint::AnyPath, short = 'r', long = "reference", value_name = "FILE", conflicts_with_all = ["date", "stamp"])]
+    pub reference: Option<String>,
+    /// touch a link itself, not what it leads to
+    #[arg(short = 'h', long = "no-dereference")]
+    pub no_dereference: bool,
     #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "FILE")]
     pub files: Vec<String>,
 }
@@ -261,9 +297,11 @@ impl Manual for Touch {
         "w and x on the directory a new file goes in; w on a file that exists.";
     const EXAMPLES: &'static [(&'static str, &'static str)] = &[
         ("touch notes.md main.rs README", "three files"),
+        ("touch -d '2026-01-01 09:00' notes.md", "as of a date"),
+        ("touch -r notes.md copy.md", "as another is"),
         ("touch -- -h", "a file named -h"),
     ];
-    const SEE: &'static [&'static str] = &["vim", "mkdir"];
+    const SEE: &'static [&'static str] = &["vim", "mkdir", "stat"];
 }
 
 /// remove files and directories
@@ -347,7 +385,7 @@ impl Manual for Mv {
 /// once, and editing either later leaves the other as it was.
 ///
 /// A new copy is yours, with the source's mode less the umask (022), or what the directory's
-/// default ACL gives; -p keeps the mode, ACLs and, as far as you may, owner and group. A file that
+/// default ACL gives; -p keeps the mode, ACLs, times and, as far as you may, owner and group. A file that
 /// exists is written as it is, keeping its owner, mode and other names; -f removes one you may
 /// not write and copies anew.
 ///
@@ -367,7 +405,7 @@ pub struct Cp {
     /// copy links as links, and keep a file's names together
     #[arg(short = 'd')]
     pub links: bool,
-    /// keep mode, ACLs, owner and group
+    /// keep mode, ACLs, times, owner and group
     #[arg(short = 'p')]
     pub preserve: bool,
     /// follow every link
@@ -528,22 +566,60 @@ impl Manual for Realpath {
 
 /// show what a file is
 ///
-/// Shows what each FILE is: its type, size, inode and links, its mode, owner and group, and when
-/// its content and it last changed (UTC). A link is shown as itself, unless -L.
+/// Shows what each FILE is: its type, size, inode and links, its mode, owner and group, and
+/// when it was last read, its content changed, and it changed at all, to the nanosecond (UTC).
+/// Reading a file does not change its access time: the store is mounted noatime, so it is when
+/// the file was made, or what touch set. A link is shown as itself, unless -L.
+///
+/// -c FORMAT shows what FORMAT says instead, a line a file, as GNU's: %n name, %N name with
+/// where a link leads, %s size, %b blocks of %B bytes, %a mode in octal, %A as ls shows it, %F
+/// type, %u %U owner, %g %G group, %h links, %i inode, %x %y %z the access, modify and change
+/// times (%X %Y %Z in seconds), %w %W birth (unknown), %% a %. --printf takes \n and \t too,
+/// and ends no line of its own.
 #[derive(Parser, Debug)]
 #[command(name = "stat")]
 pub struct Stat {
     /// what a link leads to, not the link
     #[arg(short = 'L', long = "dereference")]
     pub dereference: bool,
+    /// show FORMAT, and a newline
+    #[arg(short = 'c', long = "format", value_name = "FORMAT")]
+    pub format: Option<String>,
+    /// show FORMAT, its backslash escapes read, and no newline
+    #[arg(long = "printf", value_name = "FORMAT")]
+    pub printf: Option<String>,
     #[arg(value_hint = ValueHint::AnyPath, required = true, value_name = "FILE")]
     pub files: Vec<String>,
 }
 impl Manual for Stat {
     const SECTION: Section = Section::Files;
     const NEEDS: &'static str = "x on the directories on the way.";
-    const EXAMPLES: &'static [(&'static str, &'static str)] = &[("stat notes.md", "what it is")];
-    const SEE: &'static [&'static str] = &["ls", "chmod"];
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[
+        ("stat notes.md", "what it is"),
+        ("stat -c '%A %U %s %n' *.md", "one line each"),
+    ];
+    const SEE: &'static [&'static str] = &["ls", "chmod", "touch"];
+}
+
+/// show how much the file system holds
+///
+/// Shows the file system each FILE is on, or /'s: its size, what is used and what is free, in
+/// 1K blocks, or with -h in K, M, G and the like. The store is R2's, which holds as much as it
+/// is given: what is free is a petabyte. /proc is the kernel's own, and takes no space.
+#[derive(Parser, Debug)]
+#[command(name = "df")]
+pub struct Df {
+    /// sizes in powers of 1024 (1.5G)
+    #[arg(short = 'h', long = "human-readable")]
+    pub human: bool,
+    #[arg(value_hint = ValueHint::AnyPath, value_name = "FILE")]
+    pub files: Vec<String>,
+}
+impl Manual for Df {
+    const SECTION: Section = Section::Files;
+    const NEEDS: &'static str = "x on the directories on the way.";
+    const EXAMPLES: &'static [(&'static str, &'static str)] = &[("df -h", "how much is stored")];
+    const SEE: &'static [&'static str] = &["ls", "stat"];
 }
 
 /// remove empty directories

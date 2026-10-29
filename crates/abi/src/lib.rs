@@ -6,7 +6,9 @@
 //! The calls go in batches (`Batch`), one request for many, as io_uring takes many: each runs
 //! on its own, in order, and has its own result. A batch carries the process it runs for: its
 //! umask, and whether it runs under sudo.
-use serde::{Deserialize, Serialize};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 /// Why a call failed, as Linux's errno says.
@@ -36,6 +38,7 @@ pub enum Errno {
     ENOSPC,
     EROFS,
     EMLINK,
+    EPIPE,
     ERANGE,
     ENAMETOOLONG,
     ENOSYS,
@@ -75,6 +78,7 @@ impl Errno {
             ENOSPC => "No space left on device",
             EROFS => "Read-only file system",
             EMLINK => "Too many links",
+            EPIPE => "Broken pipe",
             ERANGE => "Numerical result out of range",
             ENAMETOOLONG => "File name too long",
             ENOSYS => "Function not implemented",
@@ -161,9 +165,19 @@ pub struct Stat {
     pub group: String,
     pub size: u64,
     /// When its content, or a directory's entries, last changed, and when it last changed at
-    /// all, in seconds since 1970.
+    /// all, in seconds since 1970, and the nanoseconds past them.
     pub mtime: u64,
     pub ctime: u64,
+    #[serde(default, skip_serializing_if = "is_zero32")]
+    pub mtime_nsec: u32,
+    #[serde(default, skip_serializing_if = "is_zero32")]
+    pub ctime_nsec: u32,
+    /// When it was last read, as far as anything says: reading does not say so (the store is
+    /// mounted `noatime`); making it, and utimensat, do.
+    #[serde(default)]
+    pub atime: u64,
+    #[serde(default, skip_serializing_if = "is_zero32")]
+    pub atime_nsec: u32,
     /// A symbolic link's target, as written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
@@ -250,6 +264,9 @@ pub const O_CREAT: u32 = 0o100;
 pub const O_EXCL: u32 = 0o200;
 pub const O_TRUNC: u32 = 0o1000;
 pub const O_APPEND: u32 = 0o2000;
+/// A directory, to read with getdents or name others from (`/proc/self/fd/N/NAME`, as openat
+/// would): fails with ENOTDIR on anything else.
+pub const O_DIRECTORY: u32 = 0o200000;
 /// ioctl(2)'s FICLONE, as Linux numbers it: the file the descriptor writes takes the content of
 /// the one `arg` reads, shared, nothing copied (what `cp` does).
 pub const FICLONE: u32 = 0x4004_9409;
@@ -286,6 +303,9 @@ pub struct Opened {
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
+fn is_zero32(n: &u32) -> bool {
+    *n == 0
+}
 /// What close(2) of a descriptor that wrote gave: where the file is, its size and version.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Closed {
@@ -297,17 +317,101 @@ pub struct Closed {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub created: bool,
 }
-/// A descriptor its session has open, as /proc/self/fd lists them.
+/// Bytes, as a call takes or gives them: base64 in JSON, a third more than they are, where a
+/// list of numbers would be four times.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Bytes(pub Vec<u8>);
+impl Serialize for Bytes {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(&self.0))
+    }
+}
+impl<'de> Deserialize<'de> for Bytes {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        STANDARD
+            .decode(text)
+            .map(Bytes)
+            .map_err(serde::de::Error::custom)
+    }
+}
+impl From<Vec<u8>> for Bytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+impl std::ops::Deref for Bytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// The most bytes `pread` and `pwrite` carry in a batch; more stream on the Worker (`GET
+/// /api/file`, `PUT /api/pwrite`).
+pub const INLINE_MAX: u64 = 256 * 1024;
+
+/// What `pread` read: its bytes, and the file's size.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct Fd {
-    pub fd: u32,
-    pub path: String,
-    pub flags: u32,
+pub struct Data {
+    pub data: Bytes,
     pub size: u64,
-    /// What has arrived of a file it writes.
-    pub received: u64,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub created: bool,
+}
+
+/// A time utimensat(2) sets: now (`UTIME_NOW`), unchanged (`UTIME_OMIT`), or the time given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Time {
+    #[default]
+    Now,
+    Omit,
+    #[serde(untagged)]
+    At {
+        sec: u64,
+        nsec: u32,
+    },
+}
+
+/// What statfs(2) tells of the file system a path is on.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StatFs {
+    /// Its block size, and how many blocks it has, has free, and has free to anyone.
+    pub bsize: u64,
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    /// How many inodes it has, and has free.
+    pub files: u64,
+    pub ffree: u64,
+    /// The longest name it takes.
+    pub namelen: u64,
+}
+
+/// The descriptor a call works on: its number, or `{"ref": i}`, the one call `i` of the same
+/// batch opened (its result's `fd`), as NFSv4's COMPOUND passes a filehandle on. A call naming a
+/// call that failed fails as it did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FdRef {
+    Fd(u32),
+    Ref {
+        #[serde(rename = "ref")]
+        call: usize,
+    },
+}
+impl From<u32> for FdRef {
+    fn from(fd: u32) -> Self {
+        Self::Fd(fd)
+    }
+}
+impl FdRef {
+    /// Its number, once the batch has made it one.
+    pub fn number(self) -> u32 {
+        match self {
+            Self::Fd(fd) => fd,
+            Self::Ref { .. } => u32::MAX,
+        }
+    }
 }
 
 /// A system call. Paths are absolute, as user space makes them from its working directory;
@@ -323,9 +427,14 @@ pub enum Call {
     Lstat {
         path: String,
     },
-    /// The entries of a directory, each with its lstat.
+    /// The entries of a directory, each with its lstat: from the `cookie`th, at most `count` of
+    /// them (all, by default), as getdents(2) reads a directory a buffer at a time.
     Getdents {
         path: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        cookie: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        count: Option<u64>,
     },
     Access {
         path: String,
@@ -386,9 +495,20 @@ pub enum Call {
         #[serde(default)]
         nofollow: bool,
     },
-    /// Set its times to now, as utimensat(2) with UTIME_NOW does (what touch does to one that
-    /// exists).
+    /// utimensat(2): set its access and modification times, each now, unchanged or as given
+    /// (now, by default, as touch does). Now needs the owner, root, or write permission; a time
+    /// given, the owner or root.
     Utimens {
+        path: String,
+        #[serde(default)]
+        atime: Time,
+        #[serde(default)]
+        mtime: Time,
+        #[serde(default)]
+        nofollow: bool,
+    },
+    /// statfs(2): the file system `path` is on.
+    Statfs {
         path: String,
     },
     Getxattr {
@@ -400,7 +520,7 @@ pub enum Call {
     Setxattr {
         path: String,
         name: String,
-        value: Vec<u8>,
+        value: Bytes,
         #[serde(default)]
         flags: u8,
         #[serde(default)]
@@ -417,10 +537,13 @@ pub enum Call {
         #[serde(default)]
         nofollow: bool,
     },
-    /// A descriptor of the file at `path`, for this session (each browser is one): to read, or,
-    /// for writing, `size` bytes (none for `O_APPEND`, which grows). A writer naming an
+    /// A descriptor of the file at `path`, for this session (each browser is one): to read, or
+    /// to write. A writer that gives the file's `size` may send its chunks in any order, and
+    /// what it replaces shows until it is whole (an upload); one that does not writes them in
+    /// order, and the file is what it wrote, growing as it does, readable meanwhile, and whole
+    /// when it closes (a program's output, or, with `O_APPEND`, a recording). A writer naming an
     /// unfinished file of its own account with the same `size` and `sha256` goes on with it,
-    /// once no other descriptor has written it lately (`lease`). `version`, given to replace a
+    /// once no other session has made a call lately. `version`, given to replace a
     /// file, must be the one it has (ESTALE otherwise), as an editor's save needs.
     Open {
         path: String,
@@ -438,15 +561,27 @@ pub enum Call {
     /// not, the descriptor goes all the same, with EIO, and the file waits, unfinished, for a
     /// writer to go on with it. A recording is complete with what arrived.
     Close {
-        fd: u32,
+        fd: FdRef,
     },
-    /// Keep a descriptor: one not kept for a while may be taken over by another writer (see
-    /// `open`), and, after longer, closed.
-    Lease {
-        fd: u32,
+    /// pread(2): at most `count` bytes (`INLINE_MAX`), from `offset`, of the file the
+    /// descriptor `fd` reads, or that `path` names, which needs read permission as open does: a
+    /// short read at its end, or at what has arrived of a file still being written.
+    Pread {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fd: Option<FdRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default)]
+        offset: u64,
+        count: u64,
     },
-    /// The session's descriptors.
-    Fds,
+    /// pwrite(2) of chunk `index` of the file `fd` writes, with its bytes: at most
+    /// `INLINE_MAX`, so a small file whole, or the short end of a large one.
+    Pwrite {
+        fd: FdRef,
+        index: u64,
+        data: Bytes,
+    },
     /// Sign this session in as `username`, its password said (none needed by root, or under
     /// sudo): the session is a new one, its cookie the reply's. Rate-limited.
     Login {
@@ -534,14 +669,14 @@ pub enum Call {
         name: String,
     },
     /// A process of the session's account (zip, unzip, tar, faststart), run as the caller
-    /// (root under sudo), from `cwd`: its pid. Its work is done apart (a container), reading
+    /// (root under sudo), from `cwd`: its pid, and a descriptor of this session that writes its
+    /// standard input (`stdin`), as a pipe would: unzip's answers to its question, `{"decisions":
+    /// {PATH: true|false}}`, go through pwrite. Its work is done apart (a container), reading
     /// and writing as it.
     Spawn {
         argv: Vec<String>,
         cwd: String,
     },
-    /// The account's processes, the latest first.
-    Ps,
     /// Signal the process `pid`: it stops, between steps (SIGTERM).
     Kill {
         pid: String,
@@ -554,15 +689,10 @@ pub enum Call {
         #[serde(default)]
         since: u64,
     },
-    /// Write to the process `pid`'s standard input: unzip's answers to its question.
-    Write {
-        pid: String,
-        data: serde_json::Value,
-    },
     /// A request of the file or device `fd` reads or writes, about `arg`: FICLONE's the
     /// descriptor cloned from; a driver's, what its request takes.
     Ioctl {
-        fd: u32,
+        fd: FdRef,
         request: u32,
         #[serde(default)]
         arg: serde_json::Value,
@@ -647,6 +777,46 @@ mod tests {
             r#"{"err":{"errno":"ENOENT"}}"#
         );
         assert_eq!(Errno::ENOTEMPTY.text(), "Directory not empty");
+        let later: Vec<Call> = serde_json::from_str(
+            r#"[{"close":{"fd":3}},{"pwrite":{"fd":{"ref":0},"index":0,"data":"aGk="}}]"#,
+        )
+        .unwrap();
+        assert_eq!(later[0], Call::Close { fd: 3.into() });
+        assert_eq!(
+            later[1],
+            Call::Pwrite {
+                fd: FdRef::Ref { call: 0 },
+                index: 0,
+                data: b"hi".to_vec().into(),
+            }
+        );
+        let touched: Call = serde_json::from_str(
+            r#"{"utimens":{"path":"/a","atime":"omit","mtime":{"sec":5,"nsec":6}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            touched,
+            Call::Utimens {
+                path: "/a".into(),
+                atime: Time::Omit,
+                mtime: Time::At { sec: 5, nsec: 6 },
+                nofollow: false,
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<Call>(r#"{"utimens":{"path":"/a"}}"#).unwrap(),
+            Call::Utimens {
+                path: "/a".into(),
+                atime: Time::Now,
+                mtime: Time::Now,
+                nofollow: false,
+            }
+        );
+        assert_eq!(serde_json::to_string(&Time::Now).unwrap(), r#""now""#);
+        assert_eq!(
+            serde_json::to_string(&later[1]).unwrap(),
+            r#"{"pwrite":{"fd":{"ref":0},"index":0,"data":"aGk="}}"#
+        );
         assert_eq!(
             Error::because(Errno::EACCES, "/guest/ann is another account's home").to_string(),
             "/guest/ann is another account's home"

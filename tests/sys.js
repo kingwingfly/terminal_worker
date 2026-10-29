@@ -92,6 +92,26 @@ export async function call(request, call, options) {
 }
 
 // mkdir -p: `path` and each directory above it that is not there.
+// The session's descriptors, as /proc/self/fd and /proc/self/fdinfo tell of them.
+export async function descriptors(request, options) {
+  const links = await call(request, { getdents: { path: '/proc/self/fd' } }, options);
+  const infos = await sys(request, links.map(link => ({ pread: { path: '/proc/self/fdinfo/' + link.name, count: 4096 } })), options);
+  return links.map((link, i) => {
+    const info = Object.fromEntries(Buffer.from(infos[i].ok?.data ?? '', 'base64').toString().split('\n').filter(Boolean).map(line => line.split(':\t')));
+    return { fd: Number(link.name), path: link.stat.link, flags: parseInt(info.flags, 8), size: Number(info.size), received: Number(info.received), created: info.created === '1' };
+  });
+}
+
+// The account's processes, as /proc tells of them: PID, state and command line.
+export async function processes(request, options) {
+  const pids = (await call(request, { getdents: { path: '/proc' } }, options)).map(entry => entry.name).filter(name => name !== 'self');
+  const read = await sys(request, pids.flatMap(pid => [{ pread: { path: `/proc/${pid}/status`, count: 4096 } }, { pread: { path: `/proc/${pid}/cmdline`, count: 4096 } }]), options);
+  return pids.map((pid, i) => {
+    const status = Object.fromEntries(Buffer.from(read[2 * i].ok?.data ?? '', 'base64').toString().split('\n').filter(Boolean).map(line => line.split(':\t')));
+    return { pid, state: status.State, name: status.Name, cmdline: Buffer.from(read[2 * i + 1].ok?.data ?? '', 'base64').toString().split('\0').filter(Boolean) };
+  });
+}
+
 export async function mkdirp(request, path, mode = 0o777) {
   const parts = path.split('/').filter(Boolean);
   const results = await sys(request, parts.map((_, i) => ({ mkdir: { path: '/' + parts.slice(0, i + 1).join('/'), mode } })));
@@ -305,7 +325,7 @@ export async function program(request, args, { cwd = '/', sudo = false, ...extra
         const [found, current] = await sys(request, [{ stat: { path } }, { getxattr: { path, name: 'system.posix_acl_access' } }], options);
         if (found.err) { failure ??= found.err.errno; continue; }
         const mode = found.ok.mode;
-        const entries = current.ok ? JSON.parse(Buffer.from(current.ok).toString()) : { user: mode >> 6 & 7, group: mode >> 3 & 7, other: mode & 7, mask: null, users: {}, groups: {} };
+        const entries = current.ok ? JSON.parse(Buffer.from(current.ok, 'base64').toString()) : { user: mode >> 6 & 7, group: mode >> 3 & 7, other: mode & 7, mask: null, users: {}, groups: {} };
         entries.users ??= {}; entries.groups ??= {};
         let masked = false;
         for (const entry of spec.split(',')) {
@@ -317,7 +337,7 @@ export async function program(request, args, { cwd = '/', sudo = false, ...extra
           else entries.other = bits;
         }
         if (!masked) entries.mask = [entries.group, ...Object.values(entries.users), ...Object.values(entries.groups)].reduce((a, b) => a | b, 0);
-        await run({ setxattr: { path, name: 'system.posix_acl_access', value: [...Buffer.from(JSON.stringify(entries))] } });
+        await run({ setxattr: { path, name: 'system.posix_acl_access', value: Buffer.from(JSON.stringify(entries)).toString('base64') } });
       }
       break;
     }

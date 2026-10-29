@@ -6,9 +6,10 @@
 use crate::api::Reply;
 use crate::auth;
 use crate::db::{Db, transact};
-use abi::{BATCH_MAX, Batch, Call, Creds, Errno, Error, Results, Return};
+use abi::{BATCH_MAX, Batch, Call, Creds, Data, Errno, Error, FdRef, INLINE_MAX, Results, Return};
 use kernel::Process;
 use serde_json::json;
+use std::rc::Rc;
 use terminal_worker_core::permissions::*;
 use worker::*;
 
@@ -42,9 +43,38 @@ pub async fn handle(
     }
     let (sudo, umask) = (batch.sudo, batch.umask & 0o777);
     let guest = auth::guest_key(req);
+    // The session was heard from: its descriptors are kept.
+    let (renewing, guest_renewing) = (key.clone(), guest.clone());
+    transact(state, move |db| {
+        if let Some(sid) = auth::sid(db, renewing.as_deref(), guest_renewing.as_deref())
+            && heard(&sid)
+        {
+            crate::fds::renew(db, &sid, auth::now());
+            return ((), true);
+        }
+        ((), false)
+    })?;
     let mut results = Vec::with_capacity(batch.calls.len());
-    for call in batch.calls {
+    for mut call in batch.calls {
+        if let Err(error) = resolve(&mut call, &results) {
+            results.push(Return::Err(error));
+            continue;
+        }
         let (key, guest) = (key.clone(), guest.clone());
+        // Bytes that go with the call move to or from R2 outside a transaction.
+        if matches!(call, Call::Pread { .. } | Call::Pwrite { .. }) {
+            let process = Session {
+                key,
+                guest,
+                sudo,
+                umask,
+            };
+            results.push(match bytes(env, state, process, call).await {
+                Ok(value) => Return::Ok(value),
+                Err(error) => Return::Err(error),
+            });
+            continue;
+        }
         // What takes a password (its KDF, and a rate limit) waits outside a transaction too,
         // and may give the session a new cookie.
         if let Some(asked) = passworded(&call, sudo) {
@@ -64,7 +94,7 @@ pub async fn handle(
                 guest,
                 sudo,
                 umask,
-                fd: *fd,
+                fd: fd.number(),
                 op: *request,
                 arg: arg.clone(),
             };
@@ -75,9 +105,9 @@ pub async fn handle(
             continue;
         }
         let logout = matches!(call, Call::Logout);
-        // A process spawned, signalled or answered: its runner wakes.
+        // A process spawned or signalled: its runner wakes.
         let wakes = match &call {
-            Call::Kill { pid } | Call::Write { pid, .. } => Some(pid.clone()),
+            Call::Kill { pid } => Some(pid.clone()),
             Call::Spawn { .. } => Some(String::new()),
             _ => None,
         };
@@ -85,7 +115,7 @@ pub async fn handle(
             // A descriptor call stands as it ends, failed or not: a close that fails closes.
             let descriptors = matches!(
                 call,
-                Call::Open { .. } | Call::Close { .. } | Call::Lease { .. } | Call::Ioctl { .. }
+                Call::Open { .. } | Call::Close { .. } | Call::Ioctl { .. }
             );
             let sid = auth::sid(db, key.as_deref(), guest.as_deref());
             let result = run(db, key.as_deref(), sid.as_deref(), sudo, umask, call);
@@ -114,6 +144,196 @@ pub async fn handle(
 
 /// The most a batch's request may be.
 const BATCH_BYTES: u64 = 4 << 20;
+
+thread_local! {
+    /// When each session's descriptors were last kept, by this instance.
+    static HEARD: std::cell::RefCell<std::collections::HashMap<String, u64>> = Default::default();
+}
+/// Whether the session `sid`'s descriptors are to be kept now: at most every few seconds, as a
+/// page that holds some says something every few.
+fn heard(sid: &str) -> bool {
+    const EVERY: u64 = 5;
+    let now = auth::now();
+    HEARD.with(|heard| {
+        let mut heard = heard.borrow_mut();
+        if heard.get(sid).is_some_and(|at| now < at + EVERY) {
+            return false;
+        }
+        if heard.len() > 4096 {
+            heard.retain(|_, at| now < *at + EVERY);
+        }
+        heard.insert(sid.to_string(), now);
+        true
+    })
+}
+
+/// Make the descriptors `call` names by reference (`{"ref": i}`) those the calls before it
+/// opened: a reference to one that failed fails as it did.
+fn resolve(call: &mut Call, results: &[Return]) -> std::result::Result<(), Error> {
+    let fd = match call {
+        Call::Close { fd }
+        | Call::Ioctl { fd, .. }
+        | Call::Pwrite { fd, .. }
+        | Call::Pread { fd: Some(fd), .. } => fd,
+        _ => return Ok(()),
+    };
+    if let FdRef::Ref { call: index } = *fd {
+        let opened = match results.get(index) {
+            Some(Return::Ok(value)) => value["fd"]
+                .as_u64()
+                .and_then(|fd| u32::try_from(fd).ok())
+                .ok_or(Errno::EBADF)?,
+            Some(Return::Err(error)) => return Err(error.clone()),
+            None => {
+                return Err(Error::because(
+                    Errno::EINVAL,
+                    "a call refers only to those before it",
+                ));
+            }
+        };
+        *fd = FdRef::Fd(opened);
+    }
+    Ok(())
+}
+
+/// The process a batch runs as, before a transaction finds its account.
+struct Session {
+    key: Option<String>,
+    guest: Option<String>,
+    sudo: bool,
+    umask: u16,
+}
+impl Session {
+    /// Its process and session id, as the store `db` knows them.
+    fn of(&self, db: &Db) -> std::result::Result<(Process, Option<String>), Error> {
+        let process = process(db, self.key.as_deref(), self.sudo, self.umask)?;
+        let sid = auth::sid(db, self.key.as_deref(), self.guest.as_deref());
+        Ok((process, sid))
+    }
+}
+
+/// pread and pwrite of bytes a batch carries: decided in a transaction, moved to or from R2
+/// outside one, and, written, recorded in another.
+async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<serde_json::Value> {
+    let io = |e: worker::Error| Error::because(Errno::EIO, e.to_string());
+    let too_many = || {
+        Error::because(
+            Errno::EINVAL,
+            format!("a batch carries at most {INLINE_MAX} bytes a call"),
+        )
+    };
+    let session = Rc::new(session);
+    match call {
+        Call::Pread {
+            fd,
+            path,
+            offset,
+            count,
+        } => {
+            if count > INLINE_MAX {
+                return Err(too_many());
+            }
+            let asking = session.clone();
+            let read = transact(state, move |db| {
+                let read = asking.of(db).and_then(|(process, sid)| {
+                    crate::fds::pread(
+                        db,
+                        sid.as_deref(),
+                        &process,
+                        fd.map(FdRef::number),
+                        path.as_deref(),
+                        offset,
+                        count,
+                    )
+                });
+                (read, false)
+            })
+            .map_err(io)??;
+            let (data, size) = match read {
+                crate::fds::Read::Bytes(data, size) => (data, size),
+                crate::fds::Read::Chunks(parts, size) => {
+                    let bucket = env.bucket("FILES").map_err(io)?;
+                    let mut data = Vec::new();
+                    for (key, offset, length) in parts {
+                        let object = bucket
+                            .get(&key)
+                            .range(Range::OffsetWithLength { offset, length })
+                            .execute()
+                            .await
+                            .map_err(io)?
+                            .ok_or(Errno::EIO)?;
+                        let body = object.body().ok_or(Errno::EIO)?;
+                        data.extend(body.bytes().await.map_err(io)?);
+                    }
+                    (data, size)
+                }
+            };
+            Ok(json!(Data {
+                data: data.into(),
+                size
+            }))
+        }
+        Call::Pwrite { fd, index, data } => {
+            let length = data.len() as u64;
+            if length > INLINE_MAX {
+                return Err(too_many());
+            }
+            let fd = fd.number();
+            // A process's standard input: what it is written goes to it, and it wakes.
+            let asking = session.clone();
+            let bytes = data.0.clone();
+            let piped = transact(state, move |db| {
+                let piped = asking.of(db).and_then(|(process, sid)| {
+                    let sid = sid.ok_or(Errno::EBADF)?;
+                    let Some(found) = db.fd(&sid, fd) else {
+                        return Ok(None);
+                    };
+                    let Some(pid) = crate::jobs::stdin_pid(&found.path).map(str::to_string) else {
+                        return Ok(None);
+                    };
+                    let owner = auth::identity(db, asking.key.as_deref()).id;
+                    crate::jobs::answer(db, owner, &process, &pid, &bytes).map(|v| Some((pid, v)))
+                });
+                let commit = piped.is_ok();
+                (piped, commit)
+            })
+            .map_err(io)??;
+            if let Some((pid, value)) = piped {
+                crate::api::kick(env, &json!({ "job": pid })).await;
+                return Ok(value);
+            }
+            let asking = session.clone();
+            let (object, mime) = transact(state, move |db| {
+                let target = asking.of(db).and_then(|(process, sid)| {
+                    let sid = sid.ok_or(Errno::EBADF)?;
+                    crate::fds::pwrite(db, &sid, &process.cred, fd, index, length)
+                });
+                let commit = target.is_ok();
+                (target, commit)
+            })
+            .map_err(io)??;
+            env.bucket("FILES")
+                .map_err(io)?
+                .put(&object, data.0)
+                .http_metadata(HttpMetadata {
+                    content_type: Some(mime),
+                    ..Default::default()
+                })
+                .execute()
+                .await
+                .map_err(io)?;
+            transact(state, move |db| {
+                let written = session.of(db).and_then(|(process, sid)| {
+                    let sid = sid.ok_or(Errno::EBADF)?;
+                    crate::fds::written(db, &sid, &process.cred, fd, index, &object, None, length)
+                });
+                (written, true)
+            })
+            .map_err(io)?
+        }
+        _ => Err(Errno::ENOSYS.into()),
+    }
+}
 
 /// A call that takes a password, as the kernel's handlers of them take it (api.rs).
 enum Passworded {
@@ -234,7 +454,21 @@ fn run(
     call: Call,
 ) -> std::result::Result<serde_json::Value, Error> {
     let process = process(db, key, sudo, umask)?;
+    // /proc/self/fd/N names what the descriptor has open; /proc is procfs's.
+    let mut call = call;
+    let mut proc = false;
+    for (path, follow) in paths(&mut call) {
+        *path = crate::procfs::follow(db, sid, path, follow)?;
+        proc |= crate::procfs::is(path);
+    }
+    if proc {
+        return crate::procfs::call(db, sid, &process.cred, call);
+    }
     match call {
+        Call::Statfs { path } => {
+            kernel::stat(db, &process.cred, &path, true)?;
+            Ok(json!(statfs(db)))
+        }
         Call::Mknod {
             path,
             mode,
@@ -253,24 +487,73 @@ fn run(
         | Call::Groupmod { .. }
         | Call::Groupdel { .. }) => account(db, &process.cred, call),
         Call::Getcreds => Ok(json!(creds(db, key, &process.cred))),
-        call @ (Call::Spawn { .. }
-        | Call::Ps
-        | Call::Kill { .. }
-        | Call::Wait { .. }
-        | Call::Write { .. }) => {
+        call @ (Call::Spawn { .. } | Call::Kill { .. } | Call::Wait { .. }) => {
             let account = auth::identity(db, key);
             let home = db
                 .user_by_id(account.id)
                 .map(|(_, user)| user.home)
                 .unwrap_or_else(|| "/".into());
-            crate::jobs::call(db, account.id, &home, &process, call)
+            crate::jobs::call(db, account.id, &home, sid, &process, call)
         }
-        call @ (Call::Open { .. }
-        | Call::Close { .. }
-        | Call::Lease { .. }
-        | Call::Fds
-        | Call::Ioctl { .. }) => crate::fds::call(db, sid, &process, call),
+        call @ (Call::Open { .. } | Call::Close { .. } | Call::Ioctl { .. }) => {
+            crate::fds::call(db, sid, &process, call)
+        }
         call => kernel::call(db, &process, call),
+    }
+}
+
+/// The paths `call` names, each with whether it follows a link at its end.
+fn paths(call: &mut Call) -> Vec<(&mut String, bool)> {
+    match call {
+        Call::Stat { path }
+        | Call::Getdents { path, .. }
+        | Call::Access { path, .. }
+        | Call::Chmod { path, .. }
+        | Call::Open { path, .. }
+        | Call::Statfs { path }
+        | Call::Pread {
+            path: Some(path), ..
+        }
+        | Call::Spawn { cwd: path, .. } => vec![(path, true)],
+        Call::Lstat { path }
+        | Call::Readlink { path }
+        | Call::Mkdir { path, .. }
+        | Call::Mknod { path, .. }
+        | Call::Rmdir { path }
+        | Call::Unlink { path }
+        | Call::Symlink { path, .. } => vec![(path, false)],
+        Call::Rename { from, to, .. } => vec![(from, false), (to, false)],
+        Call::Link { from, to, follow } => {
+            let follow = *follow;
+            vec![(from, follow), (to, false)]
+        }
+        Call::Chown { path, nofollow, .. }
+        | Call::Utimens { path, nofollow, .. }
+        | Call::Getxattr { path, nofollow, .. }
+        | Call::Setxattr { path, nofollow, .. }
+        | Call::Listxattr { path, nofollow }
+        | Call::Removexattr { path, nofollow, .. } => {
+            let follow = !*nofollow;
+            vec![(path, follow)]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// What statfs(2) tells of the store: blocks of 4 KiB, as many used as its files take, and, as
+/// R2 holds as much as it is given, a petabyte free.
+fn statfs(db: &Db) -> abi::StatFs {
+    const BLOCK: u64 = 4096;
+    const FREE: u64 = (1 << 50) / BLOCK;
+    let (used, inodes) = db.usage();
+    abi::StatFs {
+        bsize: BLOCK,
+        blocks: used.div_ceil(BLOCK) + FREE,
+        bfree: FREE,
+        bavail: FREE,
+        files: inodes + FREE,
+        ffree: FREE,
+        namelen: abi::NAME_MAX as u64,
     }
 }
 
@@ -312,10 +595,14 @@ pub fn generated(db: &Db, path: &str) -> Option<String> {
     }
 }
 
-/// Make /etc and the files the kernel writes in it, root's, where they are not.
+/// Make /etc and the files the kernel writes in it, root's, where they are not; and /proc, where
+/// procfs answers.
 pub fn ensure(db: &mut Db) {
     if db.node("/etc").is_none() {
         db.set_node("/etc", &Node::directory(0, 0, 0o755));
+    }
+    if db.node("/proc").is_none() {
+        db.set_node("/proc", &Node::directory(0, 0, 0o555));
     }
     for path in ["/etc/passwd", "/etc/group"] {
         if db.node(path).is_none() {

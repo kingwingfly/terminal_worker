@@ -22,6 +22,8 @@ pub struct Io<'a> {
     pub cwd: String,
     /// The account's home, which `~` names.
     pub home: String,
+    /// The time it started, in seconds since 1970, which touch -d now and ls -l reckon from.
+    pub now: u64,
     pub stdin: Option<String>,
     /// What it writes, ...
     pub out: String,

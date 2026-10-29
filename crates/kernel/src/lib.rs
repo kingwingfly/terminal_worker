@@ -8,7 +8,9 @@
 mod namei;
 mod xattr;
 
-use abi::{Call, Dirent, Errno, Error, O_ACCMODE, O_CREAT, O_EXCL, O_RDONLY, Stat};
+use abi::{
+    Call, Dirent, Errno, Error, O_ACCMODE, O_CREAT, O_DIRECTORY, O_EXCL, O_RDONLY, Stat, Time,
+};
 use serde_json::{Value, json};
 use terminal_worker_core::parent;
 use terminal_worker_core::permissions::*;
@@ -18,13 +20,13 @@ pub use namei::namei;
 /// What a store keeps beyond names and inodes: the time, an inode's times, empty content for a
 /// new file, and what has arrived of content still being written.
 pub trait Fs: Store {
-    /// Seconds since 1970.
-    fn now(&self) -> u64;
-    /// When the inode `ino`'s content, or a directory's entries, last changed, and when anything
-    /// of it did.
-    fn times(&self, ino: u64) -> (u64, u64);
-    /// Its times, now, as utimensat(2) with UTIME_NOW sets them.
-    fn touch(&mut self, ino: u64);
+    /// Seconds since 1970, and nanoseconds past them.
+    fn now(&self) -> (u64, u32);
+    /// The inode `ino`'s times.
+    fn times(&self, ino: u64) -> Times;
+    /// Set its access and modification times, those given, as utimensat(2) does; its change
+    /// time is now.
+    fn set_times(&mut self, ino: u64, atime: Option<(u64, u32)>, mtime: Option<(u64, u32)>);
     /// New content, empty and whole, for a file `owner` makes at `path`: its id.
     fn empty(&mut self, owner: u32, path: &str) -> String;
     /// What has arrived of the content `file`, if it is still being written, and whether it is
@@ -40,19 +42,28 @@ pub trait Fs: Store {
 /// The store in memory, for tests and tools: no clock, no times, every file whole but those
 /// marked `incomplete`, of which nothing has arrived.
 impl Fs for MemStore {
-    fn now(&self) -> u64 {
-        0
-    }
-    fn times(&self, _ino: u64) -> (u64, u64) {
+    fn now(&self) -> (u64, u32) {
         (0, 0)
     }
-    fn touch(&mut self, _ino: u64) {}
+    fn times(&self, _ino: u64) -> Times {
+        Times::default()
+    }
+    fn set_times(&mut self, _ino: u64, _atime: Option<(u64, u32)>, _mtime: Option<(u64, u32)>) {}
     fn empty(&mut self, _owner: u32, path: &str) -> String {
         format!("empty:{path}")
     }
     fn writing(&self, file: &str) -> Option<(u64, bool)> {
         self.incomplete.contains(file).then_some((0, false))
     }
+}
+
+/// An inode's times, each seconds since 1970 and nanoseconds past them: when it was last read
+/// (as far as anything says), when its content changed, and when anything of it did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Times {
+    pub atime: (u64, u32),
+    pub mtime: (u64, u32),
+    pub ctime: (u64, u32),
 }
 
 /// What a call runs as: an account (root under sudo), and the process's umask.
@@ -73,14 +84,13 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
         Call::Getcreds
         | Call::Open { .. }
         | Call::Close { .. }
-        | Call::Lease { .. }
-        | Call::Fds
+        | Call::Pread { .. }
+        | Call::Pwrite { .. }
+        | Call::Statfs { .. }
         | Call::Ioctl { .. }
         | Call::Spawn { .. }
-        | Call::Ps
         | Call::Kill { .. }
         | Call::Wait { .. }
-        | Call::Write { .. }
         | Call::Login { .. }
         | Call::Logout
         | Call::Sudo { .. }
@@ -93,7 +103,18 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
         | Call::Groupdel { .. } => Err(Errno::ENOSYS.into()),
         Call::Stat { path } => stat(fs, cred, &path, true).map(|stat| json!(stat)),
         Call::Lstat { path } => stat(fs, cred, &path, false).map(|stat| json!(stat)),
-        Call::Getdents { path } => getdents(fs, cred, &path).map(|entries| json!(entries)),
+        Call::Getdents {
+            path,
+            cookie,
+            count,
+        } => getdents(fs, cred, &path).map(|entries| {
+            let entries = entries.into_iter().skip(cookie as usize);
+            json!(
+                entries
+                    .take(count.unwrap_or(u64::MAX) as usize)
+                    .collect::<Vec<_>>()
+            )
+        }),
         Call::Access { path, mode } => access(fs, cred, &path, mode).map(|()| Value::Null),
         Call::Readlink { path } => readlink(fs, cred, &path).map(Value::String),
         Call::Mkdir { path, mode } => mkdir(fs, process, &path, mode).map(|()| Value::Null),
@@ -116,12 +137,17 @@ pub fn call(fs: &mut impl Fs, process: &Process, call: Call) -> Result<Value> {
             gid,
             nofollow,
         } => chown(fs, cred, &path, uid, gid, !nofollow).map(|()| Value::Null),
-        Call::Utimens { path } => utimens(fs, cred, &path).map(|()| Value::Null),
+        Call::Utimens {
+            path,
+            atime,
+            mtime,
+            nofollow,
+        } => utimens(fs, cred, &path, atime, mtime, !nofollow).map(|()| Value::Null),
         Call::Getxattr {
             path,
             name,
             nofollow,
-        } => xattr::get(fs, cred, &path, &name, !nofollow).map(|value| json!(value)),
+        } => xattr::get(fs, cred, &path, &name, !nofollow).map(|value| json!(abi::Bytes(value))),
         Call::Setxattr {
             path,
             name,
@@ -168,7 +194,7 @@ pub fn stat_of(fs: &impl Fs, node: &Node) -> Stat {
     } else {
         abi::S_IFREG
     };
-    let (mtime, ctime) = fs.times(node.ino);
+    let times = fs.times(node.ino);
     let writing =
         node.file
             .as_deref()
@@ -186,8 +212,12 @@ pub fn stat_of(fs: &impl Fs, node: &Node) -> Stat {
         user: fs.username(node.owner),
         group: fs.groupname(node.group),
         size: node.size,
-        mtime,
-        ctime,
+        mtime: times.mtime.0,
+        mtime_nsec: times.mtime.1,
+        ctime: times.ctime.0,
+        ctime_nsec: times.ctime.1,
+        atime: times.atime.0,
+        atime_nsec: times.atime.1,
         link: node.link.clone(),
         rdev: node.rdev.clone(),
         acl: node.acl.is_some(),
@@ -297,9 +327,10 @@ pub enum Opening {
     New { path: String, node: Node },
 }
 /// open(2)'s checks: a link at the end is followed, and one leading nowhere makes what it
-/// names, except with `O_CREAT | O_EXCL`, which fails on anything there; a directory is not
-/// opened (EISDIR); what is there must be readable, or writable, as `flags` ask. What it makes
-/// has `mode` less the umask, as mknod does.
+/// names, except with `O_CREAT | O_EXCL`, which fails on anything there; a directory is opened
+/// only to read (EISDIR otherwise), and `O_DIRECTORY` opens nothing else (ENOTDIR); what is
+/// there must be readable, or writable, as `flags` ask. What it makes has `mode` less the
+/// umask, as mknod does.
 pub fn open(fs: &impl Fs, process: &Process, path: &str, flags: u32, mode: u16) -> Result<Opening> {
     let cred = &process.cred;
     let write = flags & O_ACCMODE != O_RDONLY;
@@ -307,7 +338,9 @@ pub fn open(fs: &impl Fs, process: &Process, path: &str, flags: u32, mode: u16) 
     let name = namei(fs, cred, path, !exclusive)?;
     match name.node {
         Some(_) if exclusive => Err(Errno::EEXIST.into()),
-        Some(node) if node.directory => Err(Errno::EISDIR.into()),
+        Some(node) if flags & O_DIRECTORY != 0 && !node.directory => Err(Errno::ENOTDIR.into()),
+        Some(node) if node.directory && write => Err(Errno::EISDIR.into()),
+        None if flags & O_DIRECTORY != 0 => Err(Errno::ENOENT.into()),
         Some(node) => {
             require(cred, &node, if write { WRITE } else { READ })?;
             Ok(Opening::Existing {
@@ -589,13 +622,35 @@ pub fn chown(
     Ok(())
 }
 
-/// utimensat(2) with UTIME_NOW: its owner, root, or whoever may write it.
-pub fn utimens(fs: &mut impl Fs, cred: &Identity, path: &str) -> Result<()> {
-    let (_, node) = existing(fs, cred, path, true)?;
-    if cred.id != 0 && cred.id != node.owner && !permission(cred, &node, WRITE) {
+/// utimensat(2): times set to now need the owner, root, or whoever may write it; a time given,
+/// the owner or root, as Linux's setattr asks.
+pub fn utimens(
+    fs: &mut impl Fs,
+    cred: &Identity,
+    path: &str,
+    atime: Time,
+    mtime: Time,
+    follow: bool,
+) -> Result<()> {
+    let (_, node) = existing(fs, cred, path, follow)?;
+    if atime == Time::Omit && mtime == Time::Omit {
+        return Ok(());
+    }
+    let owner = cred.id == 0 || cred.id == node.owner;
+    let given = |time| matches!(time, Time::At { .. });
+    if (given(atime) || given(mtime)) && !owner {
+        return Err(Errno::EPERM.into());
+    }
+    if !owner && !permission(cred, &node, WRITE) {
         return Err(Errno::EACCES.into());
     }
-    fs.touch(node.ino);
+    let now = fs.now();
+    let at = |time| match time {
+        Time::Now => Some(now),
+        Time::Omit => None,
+        Time::At { sec, nsec } => Some((sec, nsec.min(999_999_999))),
+    };
+    fs.set_times(node.ino, at(atime), at(mtime));
     Ok(())
 }
 

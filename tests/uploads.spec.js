@@ -1,7 +1,7 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { api, call, errno, listing, mkdirp, rmrf, sys } from './sys.js';
+import { api, call, descriptors, errno, listing, mkdirp, rmrf, sys } from './sys.js';
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const CHUNK = 8 * 1024 * 1024;
@@ -59,7 +59,7 @@ test('a file is written in chunks through a descriptor, each checked, readable a
     const foreign = await chunk(other, fd, 1, parts[1]);
     expect([foreign.status(), (await foreign.json()).errno]).toEqual([409, 'EBADF']);
     // The session lists what it writes, with what has arrived.
-    expect(await call(admin, 'fds')).toEqual([expect.objectContaining({ fd, path, size: bytes.length, received: CHUNK, created: true })]);
+    expect(await descriptors(admin)).toEqual([expect.objectContaining({ fd, path, size: bytes.length, received: CHUNK, created: true })]);
     // The file is listed while it is written, with what has arrived so far.
     const entry = (await listing(reader, base))[0];
     expect(entry.name).toBe('data.bin'); expect(entry.uploaded).toBe(CHUNK);
@@ -72,9 +72,9 @@ test('a file is written in chunks through a descriptor, each checked, readable a
     // ... and a whole download follows the file as it is written.
     const whole = reader.get(file(path), { headers: { 'Accept-Encoding': 'identity' }, timeout: 60_000 });
     await new Promise(r => setTimeout(r, 1500));
-    // One descriptor writes a file at a time: while this one is kept, the same file opened in
-    // another session is refused.
-    expect(await errno(admin, { lease: { fd } })).toBe(null);
+    // One descriptor writes a file at a time: while its session is heard from (any batch keeps
+    // its descriptors), the same file opened in another session is refused.
+    await sys(admin, []);
     const refused = await open(other);
     expect(refused.err.errno).toBe('EBUSY'); expect(refused.err.detail).toContain('another tab or device');
     // Closed, as a page closes it when it goes, the file waits unfinished (EIO), and another
@@ -103,7 +103,7 @@ test('a file is written in chunks through a descriptor, each checked, readable a
     expect(Buffer.compare(await downloaded.body(), bytes)).toBe(0);
     expect(Buffer.compare(await (await reader.get(file(path), { headers: { 'Accept-Encoding': 'identity' } })).body(), bytes)).toBe(0);
     expect((await reader.head(file(path))).headers()['x-upload-state']).toBeUndefined();
-    expect(await call(other, 'fds')).toEqual([]);
+    expect(await descriptors(other)).toEqual([]);
     // A file being made goes once removed, from any session that may remove it, and its
     // descriptor writes no more.
     const gone = (await sys(admin, [{ open: { path: base + '/gone.bin', flags: O_WRONLY | O_CREAT, mode: 0o666, size: 10 } }]))[0].ok;

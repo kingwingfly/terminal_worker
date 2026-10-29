@@ -81,7 +81,7 @@ test('ACLs are extended attributes, set by the owner, that decide as setfacl\'s 
   const creds = await ann.sys('getcreds');
   expect([creds.user, creds.signed_in, creds.uid]).toEqual([name, true, creds.uid]);
   const entries = { user: 6, group: 0, other: 0, mask: 4, users: { [creds.uid]: 4 }, groups: {} };
-  const value = [...Buffer.from(JSON.stringify(entries))];
+  const value = Buffer.from(JSON.stringify(entries)).toString('base64');
   expect(await ann.sys({ setxattr: { path: dir + '/secret', name: 'system.posix_acl_access', value } })).toBe('EPERM');
   expect(await root.sys({ setxattr: { path: dir + '/secret', name: 'system.posix_acl_access', value } })).toBe(null);
   expect(await ann.sys({ access: { path: dir + '/secret', mode: 4 } })).toBe(null);
@@ -89,11 +89,11 @@ test('ACLs are extended attributes, set by the owner, that decide as setfacl\'s 
   const stat = await ann.sys({ stat: { path: dir + '/secret' } });
   expect([stat.acl, stat.mode]).toEqual([true, 0o100640]);
   expect(await ann.sys({ listxattr: { path: dir + '/secret' } })).toEqual(['system.posix_acl_access']);
-  const read = JSON.parse(Buffer.from(await ann.sys({ getxattr: { path: dir + '/secret', name: 'system.posix_acl_access' } })).toString());
+  const read = JSON.parse(Buffer.from(await ann.sys({ getxattr: { path: dir + '/secret', name: 'system.posix_acl_access' } }), 'base64').toString());
   expect(read.users[creds.uid]).toBe(4);
   // user.* on what may be written; trusted.* root's, unseen by others.
-  expect(await ann.sys({ setxattr: { path: dir + '/secret', name: 'user.note', value: [104, 105] } })).toBe('EACCES');
-  expect(await root.sys({ setxattr: { path: dir + '/secret', name: 'trusted.mark', value: [49] } })).toBe(null);
+  expect(await ann.sys({ setxattr: { path: dir + '/secret', name: 'user.note', value: 'aGk=' } })).toBe('EACCES');
+  expect(await root.sys({ setxattr: { path: dir + '/secret', name: 'trusted.mark', value: 'MQ==' } })).toBe(null);
   expect(await ann.sys({ getxattr: { path: dir + '/secret', name: 'trusted.mark' } })).toBe('ENODATA');
   await root.batch([{ removexattr: { path: dir + '/secret', name: 'system.posix_acl_access' } }]);
   expect(await ann.sys({ access: { path: dir + '/secret', mode: 4 } })).toBe('EACCES');
@@ -129,7 +129,9 @@ test('descriptors are their session\'s, a browser signed out its own; a clone sh
     const first = await one.sys({ open: { path: dir + '/one.txt', flags: O_WRONLY | O_CREAT, mode: 0o644, size: 3 } });
     const second = await two.sys({ open: { path: dir + '/two.txt', flags: O_WRONLY | O_CREAT, mode: 0o644, size: 3 } });
     expect([first.fd, second.fd]).toEqual([3, 3]);
-    expect((await two.sys('fds')).map(fd => fd.path)).toEqual([dir + '/two.txt']);
+    // /proc/self/fd lists the session's own, each a link to what it has open.
+    const links = await two.sys({ getdents: { path: '/proc/self/fd' } });
+    expect(links.map(link => [link.name, link.stat.link, link.stat.mode])).toEqual([['3', dir + '/two.txt', 0o120700]]);
     expect((await two.context.put(`/api/pwrite?fd=3&index=0`, { data: 'two' })).ok()).toBe(true);
     expect((await one.context.put(`/api/pwrite?fd=3&index=0`, { data: 'one' })).ok()).toBe(true);
     expect((await one.sys({ close: { fd: 3 } })).path).toBe(dir + '/one.txt');
@@ -168,4 +170,113 @@ test('a batch has a limit, and what is not a batch is refused', async () => {
   expect(response.status()).toBe(400);
   const invalid = await root.context.post('/api/sys', { data: { calls: [{ frobnicate: {} }] } });
   expect(invalid.status()).toBe(400);
+});
+
+test('a batch passes a descriptor on, and carries small reads and writes', async () => {
+  const O_WRONLY = 1, O_CREAT = 0o100, O_TRUNC = 0o1000;
+  await root.batch([{ mkdir: { path: base, mode: 0o777 } }]);
+  const path = base + '/small.txt';
+  const text = 'written in one round trip\n';
+  // open, write and close in one request: each later call takes the descriptor the first made.
+  const [opened, wrote, closed] = await ann.batch([
+    { open: { path, flags: O_WRONLY | O_CREAT | O_TRUNC, mode: 0o644 } },
+    { pwrite: { fd: { ref: 0 }, index: 0, data: Buffer.from(text).toString('base64') } },
+    { close: { fd: { ref: 0 } } },
+  ]);
+  expect(opened.ok.fd).toBeGreaterThanOrEqual(3);
+  expect(wrote).toEqual({ ok: { committed: 0 } });
+  expect([closed.ok.path, closed.ok.size]).toEqual([path, text.length]);
+  const read = await ann.sys({ pread: { path, offset: 8, count: 6 } });
+  expect([Buffer.from(read.data, 'base64').toString(), read.size]).toEqual(['in one', text.length]);
+  expect(await (await ann.context.get('/api/file?path=' + encodeURIComponent(path))).text()).toBe(text);
+  // Opened and read in one request, through the descriptor.
+  const [, through] = await ann.batch([{ open: { path, flags: 0 } }, { pread: { fd: { ref: 0 }, count: 1024 } }, { close: { fd: { ref: 0 } } }]);
+  expect(Buffer.from(through.ok.data, 'base64').toString()).toBe(text);
+  // What refers to a call that failed fails as it did.
+  const refused = await ann.batch([
+    { open: { path: '/root/nope', flags: O_WRONLY | O_CREAT, mode: 0o644 } },
+    { pwrite: { fd: { ref: 0 }, index: 0, data: '' } },
+    { close: { fd: { ref: 2 } } },
+  ]);
+  expect(refused.map(result => result.err?.errno)).toEqual(['EACCES', 'EACCES', 'EINVAL']);
+  // A writer that gives no size writes in order: a short chunk is the last.
+  const [grown, short, after] = await ann.batch([
+    { open: { path, flags: O_WRONLY | O_TRUNC } },
+    { pwrite: { fd: { ref: 0 }, index: 0, data: Buffer.from('new').toString('base64') } },
+    { pwrite: { fd: { ref: 0 }, index: 1, data: Buffer.from('more').toString('base64') } },
+  ]);
+  expect([grown.ok.created, short.ok, after.err.errno]).toEqual([undefined, { committed: 0 }, 'EINVAL']);
+  // Truncated as it opened: the file is what was written, readable before it closes.
+  expect(Buffer.from((await ann.sys({ pread: { path, count: 100 } })).data, 'base64').toString()).toBe('new');
+  expect((await ann.sys({ close: { fd: grown.ok.fd } })).size).toBe(3);
+  // An empty file is a file: opened, written nothing, closed.
+  const empty = base + '/empty';
+  const [made] = await ann.batch([{ open: { path: empty, flags: O_WRONLY | O_CREAT | O_TRUNC, mode: 0o600 } }, { close: { fd: { ref: 0 } } }]);
+  expect(made.ok.created).toBe(true);
+  const stat = await ann.sys({ stat: { path: empty } });
+  expect([stat.size, stat.mode, stat.writing]).toEqual([0, 0o100600, undefined]);
+  // The kernel's own files read too, and a batch carries no more than 256 KiB a call.
+  expect(Buffer.from((await ann.sys({ pread: { path: '/etc/passwd', count: 5 } })).data, 'base64').toString()).toBe('root:');
+  expect(await ann.sys({ pread: { path, count: 256 * 1024 + 1 } })).toBe('EINVAL');
+  expect(await ann.sys({ pread: { path: base, count: 1 } })).toBe('EISDIR');
+});
+
+test('times: nanoseconds, an access time reading leaves, and utimensat as Linux allows it', async () => {
+  const O_WRONLY = 1, O_CREAT = 0o100, O_TRUNC = 0o1000;
+  await root.batch([{ mkdir: { path: base, mode: 0o777 } }]);
+  const path = base + '/timed.txt';
+  await ann.batch([{ open: { path, flags: O_WRONLY | O_CREAT | O_TRUNC, mode: 0o666 } }, { pwrite: { fd: { ref: 0 }, index: 0, data: 'eA==' } }, { close: { fd: { ref: 0 } } }]);
+  const made = await ann.sys({ stat: { path } });
+  expect(made.atime).toBe(made.mtime);
+  expect(made.mtime_nsec ?? 0).toBeLessThan(1e9);
+  // Reading says nothing of it: the store is noatime.
+  await ann.sys({ pread: { path, count: 1 } });
+  expect((await ann.sys({ stat: { path } })).atime).toBe(made.atime);
+  // A time given is its owner's (or root's) to set; now, a writer's too.
+  const given = { sec: 1700000000, nsec: 123456789 };
+  expect(await root.sys({ chmod: { path, mode: 0o666 } })).toBe(null);
+  expect(await root.sys({ chown: { path, uid: 0 } })).toBe(null);
+  expect(await ann.sys({ utimens: { path, atime: 'omit', mtime: given } })).toBe('EPERM');
+  expect(await ann.sys({ utimens: { path } })).toBe(null);
+  expect(await root.sys({ utimens: { path, atime: given, mtime: 'omit' } })).toBe(null);
+  const set = await ann.sys({ stat: { path } });
+  expect([set.atime, set.atime_nsec]).toEqual([given.sec, given.nsec]);
+  expect(set.mtime).toBeGreaterThan(given.sec);
+  expect(set.ctime).toBeGreaterThanOrEqual(set.mtime);
+});
+
+test('/proc: the session\'s descriptors as magic links, directory descriptors, and nothing to change', async () => {
+  const O_DIRECTORY = 0o200000;
+  await root.batch([{ mkdir: { path: base, mode: 0o777 } }]);
+  await ann.batch([{ mkdir: { path: base + '/dir', mode: 0o755 } }, { mknod: { path: base + '/dir/a', mode: 0o644 } }, { mknod: { path: base + '/dir/b', mode: 0o644 } }, { mknod: { path: base + '/dir/c', mode: 0o644 } }]);
+  // A directory opens to read; a path through its descriptor names what is in it, as openat does.
+  const dir = (await ann.sys({ open: { path: base + '/dir', flags: O_DIRECTORY } })).fd;
+  const through = `/proc/self/fd/${dir}`;
+  expect((await ann.sys({ getdents: { path: through } })).map(entry => entry.name)).toEqual(['a', 'b', 'c']);
+  expect((await ann.sys({ stat: { path: through + '/b' } })).mode).toBe(0o100644);
+  expect(await ann.sys({ chmod: { path: through + '/b', mode: 0o600 } })).toBe(null);
+  expect((await ann.sys({ stat: { path: base + '/dir/b' } })).mode).toBe(0o100600);
+  // The link itself: lstat and readlink see it, stat what it names.
+  expect(await ann.sys({ readlink: { path: through } })).toBe(base + '/dir');
+  expect((await ann.sys({ lstat: { path: through } })).mode).toBe(0o120700);
+  expect((await ann.sys({ stat: { path: through } })).mode).toBe(0o40755);
+  const info = Buffer.from((await ann.sys({ pread: { path: `/proc/self/fdinfo/${dir}`, count: 4096 } })).data, 'base64').toString();
+  expect(info).toContain(`flags:\t0${O_DIRECTORY.toString(8)}`);
+  expect(await (await ann.context.get(`/api/file?path=${encodeURIComponent('/proc/self/fdinfo/' + dir)}`)).text()).toBe(info);
+  // Another session has descriptors of its own: the same number is another's, or none.
+  expect(await root.sys({ readlink: { path: through } })).not.toBe(base + '/dir');
+  // Paged, as getdents reads a buffer at a time.
+  expect((await ann.sys({ getdents: { path: base + '/dir', cookie: 1, count: 1 } })).map(entry => entry.name)).toEqual(['b']);
+  // /proc is read, not changed; O_DIRECTORY opens only directories, and a directory opens only to read.
+  expect((await ann.sys({ getdents: { path: '/proc' } })).map(entry => entry.name)).toContain('self');
+  expect(await ann.sys({ mkdir: { path: '/proc/x', mode: 0o755 } })).toBe('EACCES');
+  expect(await ann.sys({ unlink: { path: through } })).toBe('EACCES');
+  expect(await ann.sys({ open: { path: base + '/dir/a', flags: O_DIRECTORY } })).toBe('ENOTDIR');
+  expect(await ann.sys({ open: { path: base + '/dir', flags: 1 } })).toBe('EISDIR');
+  expect(await ann.sys({ pread: { fd: dir, count: 1 } })).toBe('EISDIR');
+  expect((await ann.sys({ close: { fd: dir } })).path).toBe(base + '/dir');
+  expect(await ann.sys({ stat: { path: through } })).toBe('ENOENT');
+  // statfs: the store's blocks, its names at most 255 bytes.
+  const fs = await ann.sys({ statfs: { path: base } });
+  expect([fs.bsize, fs.namelen, fs.bavail > 0]).toEqual([4096, 255, true]);
 });

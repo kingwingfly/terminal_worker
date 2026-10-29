@@ -86,6 +86,9 @@ impl DurableObject for TerminalAuthority {
                     ("upload", Some(file), _) if file.recording() => {
                         api::finish_recording(db, &file)
                     }
+                    // A file whose writer went is what it wrote, as one a process that died
+                    // was writing.
+                    ("upload", Some(file), _) if file.growing() => db.finish_file(&file.id),
                     ("upload", Some(file), _) => api::cancel(db, &file),
                     ("job", _, Some(job)) if !job.finished() => {
                         let why = if job.state == "question" {
