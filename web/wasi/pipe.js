@@ -32,13 +32,14 @@ export class Pipe {
     for (;;) {
       const seen = Atomics.load(this.state, CHANGES), queued = this.queued;
       if (queued > 0) return this.take(Math.min(count, queued));
-      if (Atomics.load(this.state, EOF) > 0) { Atomics.sub(this.state, EOF, 1); return new Uint8Array(0); }
+      if (this.ending) { Atomics.sub(this.state, EOF, 1); return new Uint8Array(0); }
       if (this.writerGone) return new Uint8Array(0);
       Atomics.wait(this.state, CHANGES, seen);
     }
   }
-  // Whether a read would wait.
-  get empty() { return this.queued === 0 && Atomics.load(this.state, EOF) === 0 && !this.writerGone; }
+  // Whether a read would wait; whether one is to end with nothing (Ctrl+D) before more is read.
+  get empty() { return this.queued === 0 && !this.ending && !this.writerGone; }
+  get ending() { return Atomics.load(this.state, EOF) > 0; }
   take(count) {
     const out = new Uint8Array(count), read = Atomics.load(this.state, READ), at = (read >>> 0) % this.data.length;
     const first = Math.min(count, this.data.length - at);

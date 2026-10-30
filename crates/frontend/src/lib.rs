@@ -143,11 +143,11 @@ pub(crate) fn listed(mtime: u64) -> String {
     userland::time::listed(mtime, (js_sys::Date::now() / 1000.0) as u64)
 }
 /// What programs write for a terminal: colours, styles and links show as they mean them.
-fn styled(text: &str) -> AnyView {
-    if !terminal_worker_core::ansi::escaped(text) {
-        return text.to_string().into_any();
+fn styled(text: String) -> AnyView {
+    if !terminal_worker_core::ansi::escaped(&text) {
+        return text.into_any();
     }
-    terminal_worker_core::ansi::parse(text)
+    terminal_worker_core::ansi::parse(&text)
         .into_iter()
         .map(|run| {
             let style = run.style.css();
@@ -162,9 +162,9 @@ fn styled(text: &str) -> AnyView {
 
 fn render_line(line: LogLine) -> AnyView {
     match line {
-        LogLine::Text(text) => view! { <pre class="output-line">{styled(&text)}</pre> }.into_any(),
+        LogLine::Text(text) => view! { <pre class="output-line">{styled(text)}</pre> }.into_any(),
         // A program's output as it writes it, its last line ended or not.
-        LogLine::Live(text) => view! { <pre class="output-line">{move || text.with(|text| styled(text.trim_end_matches('\n')))}</pre> }.into_any(),
+        LogLine::Live(text) => view! { <pre class="output-line">{move || text.with(|text| styled(text.trim_end_matches('\n').to_string()))}</pre> }.into_any(),
         LogLine::Command { user, cwd, command } => {
             let symbol = if user == "root" { " # " } else { " $ " };
             view! { <pre class="command-echo"><span class="prompt-user">{user}</span><span class="prompt-separator">":"</span><span class="prompt-path">{cwd}</span><span class="prompt-symbol">{symbol}</span><span class="prompt-command">{command}</span></pre> }.into_any()
@@ -275,7 +275,7 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
                 </div>
             </div>
         </Show>
-        <form class="command-line" on:submit=move |event| { event.prevent_default(); shell.run(shell.input.get_untracked()); }>
+        <form class="command-line" on:submit=move |event| { event.prevent_default(); shell.enter(shell.input.get_untracked()); }>
             <label for=move || current().then_some("command")><span class="prompt-user">{move || shell.account.username.get()}</span><span class="prompt-separator">":"</span><span class="prompt-path">{move || shell.cwd.get()}</span><span class="prompt-symbol">{move || if shell.asking.get() { " ?" } else if shell.account.username.get() == "root" { " #" } else { " $" }}</span></label>
             <input id=move || current().then_some("command") class="command-input" aria-label="Terminal command" autocomplete="off" spellcheck="false" autocapitalize="off" enterkeyhint="go" prop:value=move || shell.input.get()
                 role="combobox" aria-autocomplete="list" aria-controls=move || current().then_some("completions")
@@ -312,6 +312,7 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
             <button type="button" aria-label="Tab: complete" on:click=move |_| { focus_input(); shell.complete(false); }>"Tab"</button>
             <button type="button" aria-label="Previous command" on:click=move |_| { focus_input(); if shell.completion.get_untracked().is_some() { shell.complete(true) } else { shell.recall(true) } }>"↑"</button>
             <button type="button" aria-label="Next command" on:click=move |_| { focus_input(); if shell.completion.get_untracked().is_some() { shell.complete(false) } else { shell.recall(false) } }>"↓"</button>
+            <button type="button" aria-label="Ctrl+D: end of input" on:click=move |_| { focus_input(); shell.end_of_input(); }>"^D"</button>
             <button type="button" aria-label="Ctrl+C: stop" class="touch-stop" on:click=move |_| { focus_input(); shell.interrupt(); }>"^C"</button>
         </div>
         </section>

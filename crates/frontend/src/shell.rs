@@ -6,6 +6,9 @@
 
 mod commands;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use abi::Call;
 use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
@@ -186,6 +189,11 @@ impl Shown {
     }
 }
 
+/// What an output says of the `count` lines past [`SHOWN`] that it does not show.
+fn more_lines(count: usize) -> String {
+    format!("… {count} more lines; pipe the output into head, tail or grep to see them")
+}
+
 /// Wait `ms` milliseconds.
 async fn sleep(ms: i32) {
     let promise = js_sys::Promise::new(&mut |resolve, _| {
@@ -204,9 +212,10 @@ fn call(object: &JsValue, name: &str, argument: &JsValue) {
         let _ = method.call1(object, argument);
     }
 }
-/// The process the stage `args` runs, if it is one, as [`Shell::invoke`] would run it: a utility
-/// of /usr/bin's coreutils the terminal has no program of its own for (by name, by its path, or
-/// as `coreutils NAME`), with the arguments it is given.
+/// The process the stage `args` runs, if it is one: a utility of /usr/bin's coreutils the
+/// terminal has no program of its own for (by name, by its path, or as `coreutils NAME`), with
+/// the arguments it is given. [`Shell::invoke`] runs it so, and a pipeline at once with the
+/// processes beside it.
 fn process(args: &[String]) -> Option<Vec<String>> {
     let mut args = args.to_vec();
     if let Some(named) = cli_bin::named(args.first()?) {
@@ -380,10 +389,8 @@ impl Shell {
         let count = value.lines().count();
         let value = if count > SHOWN {
             let mut kept: String = value.lines().take(SHOWN).collect::<Vec<_>>().join("\n");
-            kept.push_str(&format!(
-                "\n… {} more lines; pipe the output into head, tail or grep to see them",
-                count - SHOWN
-            ));
+            kept.push('\n');
+            kept.push_str(&more_lines(count - SHOWN));
             kept
         } else {
             value
@@ -1001,32 +1008,34 @@ impl Shell {
         set(&options, "cancelled", cancelled.as_ref().clone());
         // What they write to the terminal shows as they write it: the last's output, a line of
         // the transcript that grows, a new one after anything else shows; errors a line at a time.
-        let shown = StoredValue::new_local(Shown::default());
-        let output = Closure::<dyn Fn(u32, String)>::new(move |fd: u32, text: String| {
-            if fd == 2 {
-                let lines = shown.try_update_value(|shown| shown.error(&text));
-                for line in lines.unwrap_or_default() {
-                    self.error(line);
+        let shown = Rc::new(RefCell::new(Shown::default()));
+        let output = Closure::<dyn Fn(u32, String)>::new({
+            let shown = shown.clone();
+            move |fd: u32, text: String| {
+                if fd == 2 {
+                    let lines = shown.borrow_mut().error(&text);
+                    for line in lines {
+                        self.error(line);
+                    }
+                    return;
                 }
-                return;
-            }
-            let current = shown.with_value(|shown| shown.line);
-            let live = self.lines.with_untracked(
-                |lines| matches!(lines.last(), Some(LogLine::Live(line)) if Some(*line) == current),
-            );
-            let line = match current {
-                Some(line) if live => line,
-                _ => {
-                    let line = RwSignal::new(String::new());
-                    self.push(LogLine::Live(line));
-                    shown.update_value(|shown| shown.line = Some(line));
-                    line
-                }
-            };
-            if let Some(text) = shown
-                .try_update_value(|shown| shown.output(&text))
-                .flatten()
-            {
+                // NULs end lines, as the transcript shows any stage's output.
+                let Some(text) = shown.borrow_mut().output(&text.replace('\0', "\n")) else {
+                    return;
+                };
+                let current = shown.borrow().line;
+                let live = self.lines.with_untracked(
+                    |lines| matches!(lines.last(), Some(LogLine::Live(line)) if Some(*line) == current),
+                );
+                let line = match current {
+                    Some(line) if live => line,
+                    _ => {
+                        let line = RwSignal::new(String::new());
+                        self.push(LogLine::Live(line));
+                        shown.borrow_mut().line = Some(line);
+                        line
+                    }
+                };
                 line.update(|line| line.push_str(&text));
             }
         });
@@ -1039,7 +1048,17 @@ impl Shell {
             self.terminal.set_value(input);
         });
         set(&options, "onTty", tty.as_ref().clone());
-        let reading = Closure::<dyn Fn()>::new(move || self.reading.set(true));
+        let reading = Closure::<dyn Fn()>::new({
+            let shown = shown.clone();
+            move || {
+                // A prompt written to standard error, its line not ended, shows as it waits.
+                let prompt = std::mem::take(&mut shown.borrow_mut().partial);
+                if !prompt.is_empty() {
+                    self.error(prompt);
+                }
+                self.reading.set(true);
+            }
+        });
         set(&options, "onReading", reading.as_ref().clone());
         let names: Vec<String> = stages.iter().map(|args| args[0].clone()).collect();
         let argvs = js_sys::Array::new();
@@ -1057,18 +1076,22 @@ impl Shell {
         drop((cancelled, output, tty, reading));
         let exited = exited.map_err(js_message)?;
         // What is left of an error line, and how much output was not shown.
-        let (rest, hidden, line) =
-            shown.with_value(|shown| (shown.partial.clone(), shown.hidden, shown.line));
-        if !rest.is_empty() {
-            self.error(rest);
+        let Shown {
+            line,
+            hidden,
+            partial,
+            ..
+        } = shown.take();
+        if !partial.is_empty() {
+            self.error(partial);
         }
         if hidden > 0
             && let Some(line) = line
         {
             line.update(|line| {
-                line.push_str(&format!(
-                    "\n… {hidden} more lines; pipe the output into head, tail or grep to see them"
-                ))
+                line.truncate(line.trim_end_matches('\n').len());
+                line.push('\n');
+                line.push_str(&more_lines(hidden));
             });
         }
         let field = |key: &str| js_sys::Reflect::get(&exited, &JsValue::from_str(key)).ok();
@@ -1218,27 +1241,19 @@ impl Shell {
             {
                 return self.program(args, stdin, piped, false).await;
             }
-            // A name the terminal has nothing of its own for runs coreutils', as PATH finds it.
-            if cli_bin::program(&name).is_some()
-                && commands::find(&name).is_none()
-                && cli::definition(&name).is_none()
-                && !userland::PROGRAMS.contains(&name.as_str())
-            {
-                return self.bin(args, stdin, piped, false).await;
+            // A name the terminal has nothing of its own for runs coreutils', as PATH finds it,
+            // and `coreutils NAME` uutils' NAME.
+            if let Some(argv) = process(&args) {
+                return self.bin(argv, stdin, piped, false).await;
             }
             if name == "coreutils" {
-                let mut args = args;
-                args.remove(0);
-                if args.is_empty() {
-                    return Ok(Output::text(format!(
+                return match args.get(1) {
+                    None => Ok(Output::text(format!(
                         "coreutils (uutils): {}\n",
                         cli_bin::PROGRAMS.join(" ")
-                    )));
-                }
-                if cli_bin::program(&args[0]).is_none() {
-                    return Err(format!("coreutils: {}: no such utility", args[0]));
-                }
-                return self.bin(args, stdin, piped, false).await;
+                    ))),
+                    Some(utility) => Err(format!("coreutils: {utility}: no such utility")),
+                };
             }
             match commands::find(&name) {
                 Some(command) => command.run(self, args, stdin, piped).await,
@@ -1250,17 +1265,21 @@ impl Shell {
         .boxed_local()
     }
 
+    /// The line `line`, entered on the command line: the input of the process reading the
+    /// terminal, if one may, echoed as a terminal's line discipline echoes it; else the pipeline
+    /// to run. Buttons run theirs with [`Shell::run`], which gives a process nothing.
+    pub fn enter(self, line: String) {
+        let Some(input) = self.terminal.get_value() else {
+            return self.run(line);
+        };
+        self.input.set(String::new());
+        self.log(line.clone());
+        self.reading.set(false);
+        call(&input, "write", &format!("{line}\n").into());
+    }
+
     /// Run the pipeline `command`, typed into this tab.
     pub fn run(self, command: String) {
-        if let Some(input) = self.terminal.get_value() {
-            // The line is the input of the process reading the terminal, echoed as a terminal's
-            // line discipline echoes it.
-            self.input.set(String::new());
-            self.log(command.clone());
-            self.reading.set(false);
-            call(&input, "write", &format!("{command}\n").into());
-            return;
-        }
         if self.asking.get_untracked() {
             // The line answers the question a command is waiting on.
             self.input.set(String::new());
@@ -1385,7 +1404,11 @@ impl Shell {
                 Ok(_) if !run.is_empty() => {
                     // head reads only the lines it shows: then it closes the pipe.
                     let enough = match &ahead {
-                        Some(Ok(next)) if next.first().is_some_and(|name| name == "head") => {
+                        Some(Ok(next))
+                            if next.first().is_some_and(|name| {
+                                cli_bin::named(name).unwrap_or(name) == "head"
+                            }) =>
+                        {
                             text::parse("head", &next[1..])
                                 .ok()
                                 .and_then(|filter| filter.reads())

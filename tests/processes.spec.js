@@ -69,6 +69,40 @@ test('the first process reads the terminal: a line as typed, Ctrl+D ends a read,
   await expect(last(page)).toHaveText('x\ny');
 });
 
+test('head takes its lines as they come, a prompt shows as it waits, and NULs end lines', async ({ page }) => {
+  await ready(page);
+  // A line at a time: head has two of its three, and the pipeline goes on.
+  await run(page, 'tr a-z A-Z | head -n 3', { wait: false });
+  for (const line of ['one', 'two']) {
+    await expect(busy(page)).toHaveText('Input ↵');
+    await input(page).fill(line); await input(page).press('Enter');
+  }
+  await page.waitForTimeout(1_000);
+  await expect(busy(page)).toHaveText('Input ↵');
+  await input(page).fill('three'); await input(page).press('Enter');
+  await expect(busy(page)).toHaveText('Input ↵');
+  await input(page).press('Control+d');
+  await expect(busy(page)).toHaveText('↵', { timeout: 10_000 });
+  await expect(last(page)).toHaveText('ONE\nTWO\nTHREE');
+  // head by its path closes its input too.
+  await run(page, 'yes | /bin/head -n 2');
+  await expect(last(page)).toHaveText('y\ny');
+  await expect(page.locator('.transcript')).not.toContainText('cut short');
+  // A question on standard error, its line not ended, shows while it waits for the answer.
+  const name = '/tmp/asked-' + Date.now().toString(36);
+  await run(page, 'coreutils touch ' + name);
+  await run(page, 'coreutils rm -i ' + name, { wait: false });
+  await expect(busy(page)).toHaveText('Input ↵');
+  await expect(page.locator('.transcript')).toContainText(`rm: remove regular empty file '${name}'?`);
+  await input(page).fill('y'); await input(page).press('Enter');
+  await expect(busy(page)).toHaveText('↵', { timeout: 10_000 });
+  await run(page, 'coreutils ls ' + name);
+  await expect(last(page)).toContainText('No such file or directory');
+  // What a program writes for the terminal shows NULs as the ends of lines.
+  await run(page, "coreutils printf 'a\\0b'");
+  await expect(last(page)).toHaveText('a\nb');
+});
+
 test('a page not isolated runs a pipeline one process after another, and nothing reads the terminal', async ({ page }) => {
   await page.route(url => new URL(url).pathname === '/', async route => {
     const response = await route.fetch();

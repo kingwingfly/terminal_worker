@@ -32,18 +32,23 @@ function columns() {
 }
 
 // The terminal's input, which the page writes typed lines to: what does not fit yet waits, and
-// Ctrl+D ends a read after what was typed before it.
+// Ctrl+D ends a read after what was typed before it, and before what is typed after it.
 function terminalInput() {
   const pipe = new Pipe(pipeBuffer()), queue = [];
   let timer = 0;
   const pump = () => {
     timer = 0;
+    // Nothing reads it any more: what was typed goes nowhere.
+    if (pipe.readerGone) { queue.length = 0; return; }
     while (queue.length) {
       if (queue[0] === null) { pipe.endOfFile(); queue.shift(); continue; }
+      // What follows Ctrl+D waits until a read has ended with it.
+      if (pipe.ending) break;
       const put = pipe.put(queue[0]);
-      if (put < queue[0].length) { queue[0] = queue[0].subarray(put); timer = setTimeout(pump, 20); return; }
+      if (put < queue[0].length) { queue[0] = queue[0].subarray(put); break; }
       queue.shift();
     }
+    if (queue.length) timer = setTimeout(pump, 20);
   };
   const send = item => { queue.push(item); if (!timer) pump(); };
   return { pipe, write: text => send(encoder.encode(text)), eof: () => send(null), close: () => { clearTimeout(timer); pipe.closeWriter(); } };
@@ -65,8 +70,12 @@ export async function exec(stages, options = {}) {
     TERM: piped ? 'dumb' : 'xterm-256color', COLUMNS: String(columns()),
     TZ: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
   });
-  const last = stages.length - 1;
-  let stdout = '', truncated = false, lines = 0, stopped = false;
+  const last = stages.length - 1, isolated = globalThis.crossOriginIsolated;
+  let stdout = '', truncated = false, lines = 0, full = false, stopped = false;
+  // Whether the last's reader, which takes only so much, has closed its end: the last hears
+  // SIGPIPE at its next write and ends as a process does, closing what it has open (memory it
+  // shares, where the page may share it; else the page ends it).
+  const closed = isolated && enough != null && !tty ? new Int32Array(new SharedArrayBuffer(4)) : null;
   const processes = [];
   // Stop every process still running, as `status` would end it.
   const stop = status => { stopped = true; for (const process of processes) process.kill(status); };
@@ -74,10 +83,12 @@ export async function exec(stages, options = {}) {
   // which may want only so much.
   const collect = (text, isLast) => {
     stdout += text;
-    if (isLast && enough != null && !stopped) {
-      for (let at = stdout.indexOf('\n'); at !== -1 && lines < enough; at = stdout.indexOf('\n', at + 1)) lines++;
-      if (lines >= enough) stop(SIGPIPE);
-    }
+    if (!isLast || enough == null || full) return;
+    for (let at = text.indexOf('\n'); at !== -1 && lines < enough; at = text.indexOf('\n', at + 1)) lines++;
+    if (lines < enough) return;
+    full = true;
+    if (closed) Atomics.store(closed, 0, 1);
+    else stop(SIGPIPE);
   };
   const start = (index, io) => {
     const argv = stages[index], decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
@@ -108,10 +119,11 @@ export async function exec(stages, options = {}) {
   };
   const watch = setInterval(() => { if (cancelled()) stop(SIGINT); }, 100);
   const statuses = [];
+  let input = null;
   try {
-    if (globalThis.crossOriginIsolated) {
+    if (isolated) {
       // At once, through pipes; the first reads the terminal unless given its input.
-      const input = stdin == null ? terminalInput() : null;
+      input = stdin == null ? terminalInput() : null;
       if (input) onTty(input);
       const pipes = stages.slice(1).map(() => pipeBuffer());
       for (let index = 0; index <= last; index++) {
@@ -120,11 +132,10 @@ export async function exec(stages, options = {}) {
           stdin: from ? { message: { pipe: from }, reader: new Pipe(from) }
             : input ? { message: { pipe: input.pipe.state.buffer, tty: true }, reader: null }
             : { message: { data: encoder.encode(stdin) } },
-          stdout: to ? { message: { pipe: to }, writer: new Pipe(to) } : { message: { tty }, tty },
+          stdout: to ? { message: { pipe: to }, writer: new Pipe(to) } : { message: { tty, closed: closed?.buffer }, tty },
         });
       }
       statuses.push(...await Promise.all(processes.map(process => process.exited)));
-      if (input) { input.close(); onTty(null); }
     } else {
       // One after another, each given what the one before wrote.
       let given = stdin ?? '';
@@ -139,7 +150,10 @@ export async function exec(stages, options = {}) {
       }
     }
   } finally {
+    // What still runs, if starting one failed, ends with the pipeline.
+    for (const process of processes) process.kill(SIGINT);
     clearInterval(watch);
+    if (input) { input.close(); onTty(null); }
   }
   return { status: statuses[last] ?? SIGINT, stdout, truncated };
 }

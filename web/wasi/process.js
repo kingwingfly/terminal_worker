@@ -6,9 +6,9 @@
 //
 // Started with {module, argv, env, umask, sudo, stdin, stdout, stderr}: standard input is
 // {data} (bytes given whole) or {pipe} (a pipe's buffer, web/wasi/pipe.js), the terminal if
-// {tty}; standard output {pipe}, or the page's, a terminal if {tty}; standard error {tty}. It posts
-// {out, fd} as it writes to the page, {reading} as it waits on the terminal, and {exit} as it
-// ends.
+// {tty}; standard output {pipe}, or the page's, a terminal if {tty}, whose reader may close it
+// ({closed}, a word of shared memory); standard error {tty}. It posts {out, fd} as it writes to
+// the page, {reading} as it waits on the terminal, and {exit} as it ends.
 import { Pipe } from './pipe.js';
 
 // WASI's errno numbers, by Linux's names, as the kernel answers.
@@ -178,9 +178,9 @@ function readFrom(found, at, count) {
     return out;
   }
   if (found.kind === 'pipe-in') {
-    // The terminal's reader waits for a line: what it wrote shows first, and the page hears it
-    // asks.
-    if (found.tty && found.pipe.empty) { flush(); postMessage({ reading: true }); }
+    if (count === 0) return new Uint8Array(0);
+    // A read that waits shows what was written first; on the terminal, the page hears it asks.
+    if (found.pipe.empty) { flush(); if (found.tty) postMessage({ reading: true }); }
     return found.pipe.read(count);
   }
   if (found.kind === 'out' || found.kind === 'pipe-out') throw new Errno(EBADF);
@@ -207,9 +207,19 @@ function readFrom(found, at, count) {
 }
 
 function writeTo(found, at, data) {
-  if (found.kind === 'out') { output(found.fd, data); return data.length; }
-  // A pipe whose reader is gone: SIGPIPE, whose default is to end the process, quietly.
-  if (found.kind === 'pipe-out') { if (!found.pipe.write(data)) { flush(); throw new Exit(141); } return data.length; }
+  // A pipe whose reader is gone, or the page's whose reader has closed its end (head, with its
+  // lines): SIGPIPE, whose default is to end the process, quietly.
+  if (found.kind === 'out') {
+    if (found.closed && Atomics.load(found.closed, 0)) { flush(); throw new Exit(141); }
+    output(found.fd, data);
+    return data.length;
+  }
+  if (found.kind === 'pipe-out') {
+    // A write that waits for room shows what was written first.
+    if (found.pipe.room < data.length) flush();
+    if (!found.pipe.write(data)) { flush(); throw new Exit(141); }
+    return data.length;
+  }
   if (found.kind === 'pipe-in') throw new Errno(EBADF);
   if (found.kind !== 'file' || (!found.writer && !found.rewrite)) throw new Errno(EBADF);
   if (found.rewrite) {
@@ -402,6 +412,8 @@ const wasi = {
       bytes().set(data, ptr); total += data.length;
       if (!STDIO.has(found.kind)) found.pos = at + data.length;
       if (data.length < len) break;
+      // A pipe gives what it has: once some is read, the read waits for no more.
+      if (found.kind === 'pipe-in' && total > 0 && found.pipe.queued === 0) break;
     }
     view().setUint32(nread, total, true);
   }),
@@ -534,6 +546,8 @@ function times(path, atim, mtim, flags) {
 function sleepUntil(until) {
   const left = until - performance.now();
   if (left <= 0) return;
+  // What it wrote shows while it sleeps.
+  flush();
   if (typeof SharedArrayBuffer === 'function') { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, left); return; }
   while (performance.now() < until) { /* the clock is the only thing to wait on */ }
 }
@@ -556,7 +570,7 @@ onmessage = async ({ data }) => {
   environ = Object.entries(data.env ?? {}).map(([name, value]) => `${name}=${value}`);
   const { stdin = {}, stdout = {}, stderr = {} } = data;
   fds.set(0, stdin.pipe ? { kind: 'pipe-in', pipe: new Pipe(stdin.pipe), tty: !!stdin.tty } : { kind: 'in', tty: !!stdin.tty, data: stdin.data ?? new Uint8Array(0), pos: 0 });
-  fds.set(1, stdout.pipe ? { kind: 'pipe-out', pipe: new Pipe(stdout.pipe) } : { kind: 'out', fd: 1, tty: !!stdout.tty });
+  fds.set(1, stdout.pipe ? { kind: 'pipe-out', pipe: new Pipe(stdout.pipe) } : { kind: 'out', fd: 1, tty: !!stdout.tty, closed: stdout.closed ? new Int32Array(stdout.closed) : null });
   fds.set(2, { kind: 'out', fd: 2, tty: !!stderr.tty });
   fds.set(3, { kind: 'dir', path: '/' });
   let code = 0;
