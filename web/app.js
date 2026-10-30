@@ -936,6 +936,11 @@ window.terminal = { config: () => configuration.branding, exec, open, follow, pl
 }, setDirectory: path => { directory = path; }, focusInput: () => {
   observeTranscript();
   restoreTerminalFocus();
+}, focusAfter: panel => {
+  observeTranscript();
+  // A tap on the files, on a touch screen, means no typing: the keyboard stays closed.
+  if (panel && matchMedia('(pointer: coarse)').matches) return;
+  restoreTerminalFocus();
 } };
 
 // A file name keeps to one line; one that does not fit slides to show the rest (style.css). Each

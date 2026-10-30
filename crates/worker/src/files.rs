@@ -205,9 +205,11 @@ impl Reader {
         }
         let parts = Rc::new(RefCell::new(parts));
         let reader = Rc::new(RefCell::new(Some(self)));
+        let first = Rc::new(std::cell::Cell::new(true));
         let next = Closure::<dyn FnMut() -> js_sys::Promise>::new(move || {
             let part = parts.borrow_mut().pop_front();
             let reader = reader.clone();
+            let first = first.replace(false);
             future_to_promise(async move {
                 let Some((index, offset, length)) = part else {
                     return Ok(JsValue::NULL);
@@ -217,6 +219,13 @@ impl Reader {
                     .borrow_mut()
                     .take()
                     .ok_or_else(|| JsValue::from_str("chunks were read out of order"))?;
+                // Each chunk after the first is asked for again: a read under way stops as soon
+                // as its reader may no longer read (chmod, setfacl, a removal, signing out).
+                if !first {
+                    this.refresh()
+                        .await
+                        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                }
                 let key = this.key(index).await;
                 let bucket = this.bucket.clone();
                 *reader.borrow_mut() = Some(this);
@@ -268,7 +277,8 @@ impl Reader {
         .await?;
         if grant.status_code() >= 400 {
             return Err(Error::RustError(
-                "File was removed while it was read".into(),
+                "Reading the file is no longer allowed, or it was removed, while it was read"
+                    .into(),
             ));
         }
         let grant: Grant = grant.json().await?;

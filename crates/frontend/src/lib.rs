@@ -53,6 +53,10 @@ extern "C" {
     fn set_directory(path: &str);
     #[wasm_bindgen(js_namespace = terminal, js_name = focusInput)]
     fn focus_input();
+    /// The command line focused again after a command, unless the file panel ran it on a touch
+    /// screen, where focusing opens a keyboard nobody asked for.
+    #[wasm_bindgen(js_namespace = terminal, js_name = focusAfter)]
+    fn focus_after(panel: bool);
     #[wasm_bindgen(js_namespace = terminal, js_name = completionFocus)]
     fn completion_focus(value: &str, inside_quote: bool);
     /// exec(2) of a program of /bin, as a process of its own (web/wasi/exec.mjs): its exit
@@ -139,6 +143,18 @@ pub(crate) fn listed(mtime: u64) -> String {
 }
 fn render_line(line: LogLine) -> AnyView {
     match line {
+        // What programs write for a terminal (colours, styles, links) shows as they mean it.
+        LogLine::Text(text) if terminal_worker_core::ansi::escaped(&text) => {
+            let runs = terminal_worker_core::ansi::parse(&text);
+            view! { <pre class="output-line">{runs.into_iter().map(|run| {
+                let style = run.style.css();
+                match run.link.filter(|link| link.starts_with("https://") || link.starts_with("http://")) {
+                    Some(link) => view! { <a href=link target="_blank" rel="noopener noreferrer" style=style>{run.text}</a> }.into_any(),
+                    None => view! { <span style=style>{run.text}</span> }.into_any(),
+                }
+            }).collect_view()}</pre> }
+            .into_any()
+        }
         LogLine::Text(text) => view! { <pre class="output-line">{text}</pre> }.into_any(),
         LogLine::Live(text) => view! { <pre class="output-line">{move || text.get()}</pre> }.into_any(),
         LogLine::Command { user, cwd, command } => {

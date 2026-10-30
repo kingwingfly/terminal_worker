@@ -128,6 +128,36 @@ test('/usr is the build\'s, read-only: /usr/bin holds what names run, setuid wha
   await expect(page.locator('.transcript pre').last()).toContainText(/^usr .* 100% \/usr$/m);
 });
 
+test('what programs write for a terminal shows as they mean it: colours, styles and links', async ({ page }) => {
+  await terminal(page);
+  await run(page, "printf '\\033[1;31mred\\033[0m plain \\033[38;5;208morange\\033[m \\033]8;;https://example.com/\\033\\\\site\\033]8;;\\033\\\\\\n'");
+  const last = page.locator('.transcript pre').last();
+  await expect(last).toHaveText('red plain orange site');
+  await expect(last.locator('span', { hasText: 'red' })).toHaveAttribute('style', 'color:var(--ansi-1);font-weight:700;');
+  await expect(last.locator('span', { hasText: 'orange' })).toHaveAttribute('style', 'color:rgb(255,135,0);');
+  await expect(last.locator('a', { hasText: 'site' })).toHaveAttribute('href', 'https://example.com/');
+  // uutils' ls colours what it lists, at a terminal.
+  await run(page, 'mkdir -p coloured');
+  await run(page, 'coreutils ls --color=auto');
+  await expect(page.locator('.transcript pre').last().locator('span', { hasText: 'coloured' })).toHaveAttribute('style', /color:var\(--ansi-4\)/);
+});
+
+test('/ is laid out as Arch\'s', async ({ page }) => {
+  await terminal(page);
+  await run(page, 'ls / | cat');
+  const names = (await page.locator('.transcript pre').last().innerText()).split('\n');
+  for (const name of ['bin', 'boot', 'dev', 'etc', 'home', 'lib', 'lib64', 'mnt', 'opt', 'proc', 'root', 'run', 'sbin', 'srv', 'sys', 'tmp', 'usr', 'var']) expect(names).toContain(name);
+  await run(page, 'readlink /sbin /lib /lib64 /usr/sbin /usr/lib64');
+  await expect(page.locator('.transcript pre').last()).toHaveText('usr/bin\nusr/lib\nusr/lib\nbin\nlib');
+  await run(page, "stat -c '%a %U' /tmp /root /sys /usr/local");
+  await expect(page.locator('.transcript pre').last()).toHaveText('1777 root\n750 root\n555 root\n755 root');
+  await run(page, 'ls /usr | cat');
+  await expect(page.locator('.transcript pre').last()).toHaveText('bin\ninclude\nlib\nlib64\nlibexec\nlocal\nsbin\nshare\nsrc');
+  // A program is found through any of them.
+  await run(page, '/sbin/seq 2');
+  await expect(page.locator('.transcript pre').last()).toHaveText('1\n2');
+});
+
 test('Ctrl+C kills a program of /bin, and output past the limit stops it', async ({ page }) => {
   await terminal(page);
   const input = page.getByRole('combobox', { name: 'Terminal command' });

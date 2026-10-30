@@ -655,14 +655,28 @@ pub fn generated(db: &Db, path: &str) -> Option<String> {
     }
 }
 
-/// Make /etc and the files the kernel writes in it, root's, where they are not; and /proc, where
-/// procfs answers.
+/// Make /etc and the files the kernel writes in it, root's, where they are not; /proc, where
+/// procfs answers; and the rest of Arch's / that is the store's.
 pub fn ensure(db: &mut Db) {
     if db.node("/etc").is_none() {
         db.set_node("/etc", &Node::directory(0, 0, 0o755));
     }
     if db.node("/proc").is_none() {
         db.set_node("/proc", &Node::directory(0, 0, 0o555));
+    }
+    // The rest of Arch's /, the store's: /tmp shared and sticky, as /guest is.
+    for (path, mode) in [
+        ("/boot", 0o755),
+        ("/mnt", 0o755),
+        ("/opt", 0o755),
+        ("/run", 0o755),
+        ("/srv", 0o755),
+        ("/tmp", 0o1777),
+        ("/var", 0o755),
+    ] {
+        if db.node(path).is_none() {
+            db.set_node(path, &Node::directory(0, 0, mode));
+        }
     }
     for path in ["/etc/passwd", "/etc/group"] {
         if db.node(path).is_none() {

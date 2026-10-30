@@ -56,6 +56,8 @@ Anonymous visitors are the `guest` account (uid 65534, group `guest`), which can
 | Follow a symbolic link in a sticky directory others may write | Own the link, or the directory's owner does (protected_symlinks) |
 | `user.*` attributes (setfattr) | File w; on a sticky directory, its owner |
 
+Every request is checked when it is made, reads included: a `chmod`, `chown`, `setfacl`, removal or sign-out refuses the next one at once. A read already under way, a long download or a video that plays on, is checked again before each 8 MiB it sends, and stops there once its reader may no longer read.
+
 Defaults are files 644, directories 755, and user homes 700. Public files inside private homes also need traversable ancestors; for example, home 711 and file 644 allow reading a known path without listing the home. Use 755 to permit listing.
 
 The executable bit is stored and displayed, but files and commands never execute on the host. The umask is 022 and cannot be changed. Omitted chmod classes apply to all three classes.
@@ -162,6 +164,8 @@ ls | grep -i draft | sort
 - Unsaved drafts require explicit discard and can be downloaded.
 - UTF-8 text only, up to 2 MB. Files without write access are read-only.
 - Saves use ETag conditions or create-only conditions. Concurrent edits/deletions reject overwrites and preserve the local draft.
+
+What programs write for a terminal shows as they mean it, as an xterm shows it: SGR's colours (the 16, whose shades suit the theme, 256, and 24-bit) and styles (bold, dim, italic, underline, inverse, strike), and OSC 8's links (`http` and `https` ones open in a new tab). What moves a cursor or clears a screen has no place in a transcript and is dropped. A program of /usr/bin knows it writes to a terminal, unless piped (`coreutils ls --color=auto`).
 
 The main font is 20px. Wide screens default to side-by-side panels; narrow screens default to a stacked layout. Either the file panel or the terminal can be hidden, never both: hiding one shows the other. A file name keeps to one line; one too long slides back and forth to show the rest, when pointed at or focused, or always on touch screens. Terminal scrollbars are hidden while scrolling remains available. Icons distinguish media and file types; ls highlights directories and executable markers with a restrained palette.
 
@@ -329,14 +333,14 @@ A session is a browser: a signed-in one's, or, signed out, the browser's own (th
 
 ### /usr: the build's, read-only
 
-`/usr` is the system's own, as an image-based system mounts its `/usr` read-only: what the build put there (the Worker's assets), not R2's, and `/bin` is a link to `usr/bin`, as on merged-`/usr` distributions (Arch, Fedora, Debian). Changing anything in it fails with EROFS. `/usr/bin` holds what a name runs:
+`/usr` is the system's own, as an image-based system mounts its `/usr` read-only: what the build put there (the Worker's assets), not R2's. The tree is Arch's: `/bin` and `/sbin` are links to `usr/bin`, `/lib` and `/lib64` to `usr/lib`, `/usr/sbin` to `bin` and `/usr/lib64` to `lib`; `/usr` holds `bin`, `include`, `lib`, `libexec`, `local`, `share` and `src`; `/sys`, sysfs's place, is empty. Changing any of them fails with EROFS. The rest of `/` is the store's, made at first start as Arch has it: `/boot`, `/mnt`, `/opt`, `/run`, `/srv` and `/var` (755), `/tmp` (1777, shared and sticky), `/root` (750), with `/dev`, `/etc`, `/home`, `/proc` and this system's `/guest`. `/usr/bin` holds what a name runs:
 
 - The terminal's own programs (`ls`, `chmod`, `cp`, `passwd`…), built into the page's binary (`/pkg/frontend_bg.wasm`), each a file of it, root's, 755. Those that act beyond the caller's own rights by a policy of their own are setuid root, `-rwsr-xr-x`, as `passwd`, `su` and `sudo` are on Linux, and `useradd` and `userdel`, with which a guest makes an account of its own and an account deletes itself. The bit says, rather than grants: the page cannot be trusted with a setuid program, so the kernel's calls hold each one's policy. Root's tools (`usermod`, `groupadd`…) are 755 and need root, as on Linux. The shell's builtins (`cd`, `exit`, `logout`, `jobs`, `help`) are no files.
 - uutils' coreutils, built for `wasm32-wasip1` (`crates/coreutils`, one binary as busybox is), and a link to it of each of its utilities the terminal has no program of its own for (`cut`, `tr`, `seq`, `printf`, `date`, `tee`, `truncate`, `sha256sum`…).
 
 uutils' run as processes of their own in the page's WASI engine (`web/wasi/`). The browser's WebAssembly engine is only a CPU; the engine is what a process imports. Each process is a Worker of its own that instantiates the binary, compiled once, with WASI preview 1 implemented over the system calls, synchronously (the Worker waits on each request, as a process blocks in a call), plus one import of its own, `terminal.sys`, which carries a batch of the kernel's calls as it is, for what WASI has no words for (modes, owners, ACLs, devices, accounts): the `syscall` program makes them. The engine keeps the descriptors (a file read ahead, one written in order, an existing one changed in place by rewriting it whole), the terminal and pipes as its standard streams, the working directory (`PWD`, which the binary enters as it starts) and the time; Ctrl+C terminates the Worker, and output over 10 MB stops it. The terminal's own programs run in the page itself, which draws what they give (`ls`'s listing, its icons, colours and uploads' progress) rather than text.
 
-A name runs the terminal's program, or uutils' where it has none; `/usr/bin/NAME` and `/bin/NAME` run what NAME does, and `coreutils NAME` uutils' NAME whatever the terminal has. `help` lists uutils'; `NAME --help` tells how to use one.
+A name runs the terminal's program, or uutils' where it has none; `/usr/bin/NAME`, and `/bin/NAME`, `/sbin/NAME` and `/usr/sbin/NAME` through the links, run what NAME does, and `coreutils NAME` uutils' NAME whatever the terminal has. `help` lists uutils'; `NAME --help` tells how to use one.
 
 ## Storage and project boundaries
 

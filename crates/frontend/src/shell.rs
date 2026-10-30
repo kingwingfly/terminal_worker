@@ -1122,9 +1122,10 @@ impl Shell {
             }
             self.busy.set(false);
             self.cancelled.set(false);
+            let panel = self.panel.get_untracked();
             self.panel.set(false);
             crate::persist();
-            focus_input();
+            crate::focus_after(panel);
         });
     }
     /// The previous command in the history, or with `up` false the next, into the command line.

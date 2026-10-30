@@ -3,7 +3,7 @@
 //! engine (web/wasi/). /usr/bin holds what a name runs (the kernel's usr.rs): the terminal's
 //! own programs, and links to `coreutils` of the utilities it has none of its own for, which a
 //! name runs at once; `coreutils NAME` runs uutils' NAME whatever the terminal has. `/usr/bin/NAME`
-//! and `/bin/NAME` (/bin is a link to usr/bin) run what NAME does.
+//! runs what NAME does, and so do `/bin/NAME`, `/sbin/NAME` and `/usr/sbin/NAME`, links to it.
 
 /// The utilities coreutils has, as crates/coreutils builds them: uutils', and `syscall`, which
 /// makes the kernel's own calls through the engine's `terminal.sys`.
@@ -100,10 +100,12 @@ pub fn program(name: &str) -> Option<&'static str> {
     PROGRAMS.iter().copied().find(|program| *program == name)
 }
 
-/// The name a path to /usr/bin runs, as typed: `/usr/bin/NAME` or `/bin/NAME`.
+/// The name a path to /usr/bin runs, as typed: `/usr/bin/NAME`, or through a link to it (`/bin`,
+/// `/sbin`, `/usr/sbin`).
 pub fn named(path: &str) -> Option<&str> {
-    path.strip_prefix("/usr/bin/")
-        .or_else(|| path.strip_prefix("/bin/"))
+    ["/usr/bin/", "/bin/", "/sbin/", "/usr/sbin/"]
+        .iter()
+        .find_map(|dir| path.strip_prefix(dir))
         .filter(|name| !name.is_empty() && !name.contains('/'))
 }
 
@@ -132,6 +134,7 @@ mod tests {
         assert_eq!(super::program("zip"), None);
         assert_eq!(super::named("/usr/bin/ls"), Some("ls"));
         assert_eq!(super::named("/bin/cut"), Some("cut"));
+        assert_eq!(super::named("/sbin/useradd"), Some("useradd"));
         assert_eq!(super::named("/usr/bin/a/b"), None);
     }
 }

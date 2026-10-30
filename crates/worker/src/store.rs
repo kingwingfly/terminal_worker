@@ -652,7 +652,7 @@ impl TerminalAuthority {
             for (path, group, mode) in [
                 ("/", 0, 0o755),
                 ("/home", 0, 0o755),
-                ("/root", 0, 0o700),
+                ("/root", 0, 0o750),
                 (GUEST_HOME, GUEST, 0o1777),
             ] {
                 db.set_node(path, &Node::directory(0, group, mode));

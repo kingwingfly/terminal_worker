@@ -1,4 +1,5 @@
 pub mod acl;
+pub mod ansi;
 pub mod archive;
 pub mod bin;
 pub mod cli;

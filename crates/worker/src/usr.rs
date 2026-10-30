@@ -1,6 +1,7 @@
 //! /usr: the system's own files, read-only, as an image-based system mounts its /usr (systemd's
-//! hermetic /usr): what the build put there (the Worker's assets), not R2's. /bin is a link to
-//! usr/bin, as on merged-/usr distributions (Arch, Fedora, Debian).
+//! hermetic /usr): what the build put there (the Worker's assets), not R2's. Its tree is Arch's:
+//! /bin and /sbin are links to usr/bin, /lib and /lib64 to usr/lib, /usr/sbin to bin and
+//! /usr/lib64 to lib, as on merged-/usr distributions; /sys is sysfs's place, empty here.
 //!
 //! /usr/bin holds what a name typed runs. The terminal's own programs (ls, chmod, passwd…), built
 //! into the page's binary (`/pkg/frontend_bg.wasm`), are each a file of it, as a distribution's
@@ -95,9 +96,30 @@ pub fn mount(coreutils: u64, terminal: u64) {
     MOUNTED.with(|cell| cell.set(crate::auth::clock()));
 }
 
-/// Whether `path`, as the kernel resolved it, is the image's: /usr, what is in it, and /bin.
+/// The image's names outside /usr/bin, each a directory (None) or a link to its target, in /
+/// and /usr, as Arch has them.
+const TREE: &[(&str, Option<&str>)] = &[
+    ("/bin", Some("usr/bin")),
+    ("/lib", Some("usr/lib")),
+    ("/lib64", Some("usr/lib")),
+    ("/sbin", Some("usr/bin")),
+    ("/sys", None),
+    ("/usr", None),
+    ("/usr/bin", None),
+    ("/usr/include", None),
+    ("/usr/lib", None),
+    ("/usr/lib64", Some("lib")),
+    ("/usr/libexec", None),
+    ("/usr/local", None),
+    ("/usr/sbin", Some("bin")),
+    ("/usr/share", None),
+    ("/usr/src", None),
+];
+
+/// Whether `path`, as the kernel resolved it, is the image's: /usr and what is in it, and its
+/// names in /.
 pub fn is(path: &str) -> bool {
-    path == "/usr" || path.starts_with("/usr/") || path == "/bin"
+    path.starts_with("/usr/") || TREE.iter().any(|(name, _)| *name == path)
 }
 
 /// The node at `path`, if it is the image's.
@@ -108,34 +130,45 @@ pub fn node(path: &str) -> Option<Node> {
         links: node.links.max(1),
         ..node
     };
-    Some(match path {
-        "/bin" => numbered(Node::symlink(0, 0, "usr/bin"), 0),
-        "/usr" => numbered(directory(1), 1),
-        "/usr/bin" => numbered(directory(0), 2),
-        _ => {
-            let name = path.strip_prefix("/usr/bin/")?;
-            let programs = programs();
-            let at = programs.iter().position(|program| program.name == name)?;
-            let (coreutils, terminal) = SIZES.with(Cell::get);
-            let node = match programs[at].content {
-                Some(content) => {
-                    let mode = if SETUID.contains(&name) {
-                        0o4755
-                    } else {
-                        0o755
-                    };
-                    let size = if content == COREUTILS {
-                        coreutils
-                    } else {
-                        terminal
-                    };
-                    Node::file(0, 0, mode, content.into(), size)
-                }
-                None => Node::symlink(0, 0, "coreutils"),
+    if let Some(at) = TREE.iter().position(|(name, _)| *name == path) {
+        let node = match TREE[at].1 {
+            Some(target) => Node::symlink(0, 0, target),
+            None if path == "/sys" => Node {
+                links: 2,
+                ..Node::directory(0, 0, 0o555)
+            },
+            None => directory(
+                TREE.iter()
+                    .filter(|(name, link)| {
+                        link.is_none() && terminal_worker_core::parent(name) == path
+                    })
+                    .count() as u32,
+            ),
+        };
+        return Some(numbered(node, at as u64));
+    }
+    // A program of /usr/bin: a file of a binary, or a link to coreutils.
+    let name = path.strip_prefix("/usr/bin/")?;
+    let programs = programs();
+    let at = programs.iter().position(|program| program.name == name)?;
+    let (coreutils, terminal) = SIZES.with(Cell::get);
+    let node = match programs[at].content {
+        Some(content) => {
+            let mode = if SETUID.contains(&name) {
+                0o4755
+            } else {
+                0o755
             };
-            numbered(node, 3 + at as u64)
+            let size = if content == COREUTILS {
+                coreutils
+            } else {
+                terminal
+            };
+            Node::file(0, 0, mode, content.into(), size)
         }
-    })
+        None => Node::symlink(0, 0, "coreutils"),
+    };
+    Some(numbered(node, TREE.len() as u64 + at as u64))
 }
 
 /// A directory of the image, root's, 755, with `subdirectories` in it.
@@ -149,12 +182,21 @@ fn directory(subdirectories: u32) -> Node {
 /// What is in the image's directory `path`, if it is one of them; and in /, the image's names.
 pub fn children(path: &str) -> Option<Vec<(String, Node)>> {
     let names: Vec<String> = match path {
-        "/" => vec!["/bin".into(), "/usr".into()],
-        "/usr" => vec!["/usr/bin".into()],
+        "/" | "/usr" => TREE
+            .iter()
+            .filter(|(name, _)| terminal_worker_core::parent(name) == path)
+            .map(|(name, _)| name.to_string())
+            .collect(),
         "/usr/bin" => programs()
             .into_iter()
             .map(|program| format!("/usr/bin/{}", program.name))
             .collect(),
+        _ if TREE
+            .iter()
+            .any(|(name, link)| *name == path && link.is_none()) =>
+        {
+            Vec::new()
+        }
         _ => return None,
     };
     Some(
@@ -168,7 +210,7 @@ pub fn children(path: &str) -> Option<Vec<(String, Node)>> {
 /// The times of the image's inode `ino`: when it was mounted.
 pub fn times(ino: u64) -> Option<kernel::Times> {
     let at = MOUNTED.with(Cell::get);
-    (ino >= INO && ino < INO + 3 + programs().len() as u64).then_some(kernel::Times {
+    (ino >= INO && ino < INO + (TREE.len() + programs().len()) as u64).then_some(kernel::Times {
         atime: at,
         mtime: at,
         ctime: at,
@@ -182,7 +224,7 @@ pub fn statfs() -> abi::StatFs {
     abi::StatFs {
         bsize: 4096,
         blocks,
-        files: 3 + programs().len() as u64,
+        files: (TREE.len() + programs().len()) as u64,
         namelen: abi::NAME_MAX as u64,
         ..abi::StatFs::default()
     }

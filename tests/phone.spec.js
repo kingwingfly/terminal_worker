@@ -112,3 +112,18 @@ test('long names keep one line and scroll; titles keep the file name; either pan
   await page.getByRole('button', { name: 'Toggle file panel' }).tap();
   await expect(files).toBeVisible(); await expect(terminal).toBeVisible();
 });
+
+test('a tap on the files runs what it means without opening the keyboard', async ({ page, context }) => {
+  await mkdirp(context.request, base + '/docs');
+  await page.goto('/');
+  const input = page.getByRole('combobox', { name: 'Terminal command' });
+  await expect(page.locator('.busy')).toHaveText('↵');
+  await input.tap(); await input.fill('cd ' + base); await input.press('Enter');
+  await expect(page.locator('.directory-bar')).toContainText(base);
+  await input.blur();
+  // The directory opens; the command line, and so the on-screen keyboard, stays closed.
+  await page.locator('.files .file', { hasText: 'docs' }).tap();
+  await expect(page.locator('.directory-bar')).toContainText(base + '/docs');
+  await expect(page.locator('.busy')).toHaveText('↵');
+  await expect(input).not.toBeFocused();
+});
