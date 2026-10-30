@@ -203,6 +203,31 @@ pub async fn handle(req: &mut Request, env: &Env, state: &State) -> Result<Reply
                 }))
             })
         }
+        // A read token (fds.rs by_token): what the Worker reads it by, the kernel asked again.
+        (Method::Get, "/internal/token") => {
+            let token = param("token");
+            let guest = auth::guest_key(req);
+            run(state, move |db| {
+                let who = auth::identity(db, key.as_deref());
+                let sid = auth::sid(db, key.as_deref(), guest.as_deref());
+                match crate::fds::by_token(db, sid.as_deref(), &who, &token) {
+                    Ok(file) => {
+                        let chunks: Vec<_> = db
+                            .chunks(&file.id)
+                            .into_iter()
+                            .map(|c| json!([c.idx, c.key]))
+                            .collect();
+                        let path = db.showing(&file.id).pop().unwrap_or(file.target.clone());
+                        Reply::ok(json!({
+                            "file": file.id, "size": file.size, "chunk_size": file.chunk_size,
+                            "state": file.state, "etag": file.etag(), "mime": mime(&path), "chunks": chunks,
+                            "readable": file.size,
+                        }))
+                    }
+                    Err(error) => errno_reply(&error).keep(),
+                }
+            })
+        }
         // pwrite(2) through a descriptor, as the Worker streams its bytes to R2 (files.rs):
         // where the chunk goes, then that it is there.
         (Method::Get, "/internal/pwrite") => {

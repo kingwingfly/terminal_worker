@@ -307,7 +307,15 @@ pub struct Opened {
     pub created: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resumed: bool,
+    /// A descriptor reading a file whole: its token, to read it by (`GET /api/file?token=`),
+    /// which the Worker serves without asking the kernel each time, as long as its session
+    /// sends it. The kernel asks again, of the descriptor and the reader's permission, at most
+    /// every `TOKEN_FRESH` seconds; closing it ends the token, at the latest then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
+/// How long the Worker trusts what the kernel last said of a read token.
+pub const TOKEN_FRESH: u64 = 60;
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }

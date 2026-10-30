@@ -302,3 +302,28 @@ test('inotify: a session watches directories it may list, each once, and at most
   expect(watched.filter(result => 'ok' in result).length).toBe(128);
   expect(watched.at(-1).err.errno).toBe('ENOSPC');
 });
+
+test('read tokens: a whole file read by its descriptor\'s token, by its session alone', async () => {
+  const O_WRONLY = 1, O_CREAT = 0o100, O_TRUNC = 0o1000;
+  await root.batch([{ mkdir: { path: base, mode: 0o777 } }]);
+  const path = base + '/played.txt', text = 'a file a player reads in many ranges\n';
+  await ann.batch([{ open: { path, flags: O_WRONLY | O_CREAT | O_TRUNC, mode: 0o644 } }, { pwrite: { fd: { ref: 0 }, index: 0, data: Buffer.from(text).toString('base64') } }, { close: { fd: { ref: 0 } } }]);
+  const opened = await ann.sys({ open: { path, flags: 0 } });
+  expect(opened.token).toMatch(/^[0-9a-f]{64}$/);
+  const byToken = url => `/api/file?token=${encodeURIComponent(opened.token)}`;
+  expect(await (await ann.context.get(byToken())).text()).toBe(text);
+  const ranged = await ann.context.get(byToken(), { headers: { Range: 'bytes=2-5' } });
+  expect([ranged.status(), await ranged.text()]).toEqual([206, 'file']);
+  // Another session's request with it is refused: the token is its session's.
+  expect((await root.context.get(byToken())).status()).toBeGreaterThanOrEqual(400);
+  // Closed before it was read, it reads nothing.
+  const closed = await ann.sys({ open: { path, flags: 0 } });
+  await ann.sys({ close: { fd: closed.fd } });
+  expect((await ann.context.get(`/api/file?token=${closed.token}`)).status()).toBeGreaterThanOrEqual(400);
+  // A directory, and a file still being written, have none.
+  expect((await ann.sys({ open: { path: base, flags: 0o200000 } })).token).toBeUndefined();
+  const writing = await ann.sys({ open: { path: base + '/growing', flags: O_WRONLY | O_CREAT, mode: 0o644 } });
+  expect((await ann.sys({ open: { path: base + '/growing', flags: 0 } })).token).toBeUndefined();
+  await ann.sys({ close: { fd: writing.fd } });
+  await ann.sys({ close: { fd: opened.fd } });
+});

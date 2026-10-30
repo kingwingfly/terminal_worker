@@ -135,9 +135,21 @@ async fn show(
     version: String,
 ) -> Result<JsValue, String> {
     let url = file_url(&path);
-    let size = head(&url).await?;
+    // A player asks for many ranges: it plays from a read descriptor's token, which the Worker
+    // serves without asking the kernel each time; closing the preview closes it.
+    let held = if matches!(listed.as_str(), "video" | "audio") {
+        playing(&path).await
+    } else {
+        None
+    };
+    let size = if held.is_some() { 0 } else { head(&url).await? };
     let preview = match listed.as_str() {
-        "image" | "video" | "audio" => Preview::Media(listed, url),
+        "image" | "video" | "audio" => Preview::Media(
+            listed,
+            held.as_ref().map_or(url, |(_, token)| {
+                format!("/api/file?token={}", js_sys::encode_uri_component(token))
+            }),
+        ),
         _ => {
             let archive = [".zip", ".tar", ".tar.gz", ".tgz"]
                 .iter()
@@ -163,12 +175,54 @@ async fn show(
             }
         }
     };
+    let fd = held.map(|(fd, _)| fd);
     if content.get_attribute("data-version").as_deref() != Some(version.as_str()) {
+        let _ = close(fd);
         return Ok(Closure::once_into_js(|| {}));
     }
     content.set_text_content(None);
     let handle = mount_to(content, move || render(preview, path));
-    Ok(Closure::once_into_js(move || drop(handle)))
+    Ok(Closure::once_into_js(move || {
+        drop(handle);
+        let _ = close(fd);
+    }))
+}
+
+/// A read descriptor of the file at `path`, and its token, if it has one.
+async fn playing(path: &str) -> Option<(u32, String)> {
+    let opened: abi::Opened = userland::sys::call(
+        &crate::sys::HttpSys::default(),
+        abi::Call::Open {
+            path: path.to_string(),
+            flags: abi::O_RDONLY,
+            mode: 0o666,
+            size: None,
+            sha256: None,
+            version: None,
+        },
+    )
+    .await
+    .ok()?;
+    match opened.token {
+        Some(token) => Some((opened.fd, token)),
+        None => {
+            let _ = close(Some(opened.fd));
+            None
+        }
+    }
+}
+
+/// Let go of the descriptor `fd`, if there is one, in the background.
+fn close(fd: Option<u32>) -> Option<()> {
+    let fd = fd?;
+    spawn_local(async move {
+        let _ = userland::sys::calls::<serde_json::Value>(
+            &crate::sys::HttpSys::default(),
+            vec![abi::Call::Close { fd: fd.into() }],
+        )
+        .await;
+    });
+    Some(())
 }
 
 /// The size of the file at `url`, which the viewer may read.

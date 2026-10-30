@@ -34,7 +34,7 @@ const ROLLBACK: &str = "rollback";
 /// The version of the tables below, which local state made by an older one does not have.
 pub const SCHEMA_VERSION: &str = "3";
 
-const SCHEMA: [&str; 27] = [
+const SCHEMA: [&str; 28] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
@@ -59,7 +59,9 @@ const SCHEMA: [&str; 27] = [
     // File descriptors (fds.rs): a session's (each browser is one), by number; the content it
     // reads or writes (none once another writer took it over), where, its open(2) flags,
     // whether it made the file, and when it was last kept (its lease).
-    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, PRIMARY KEY(sid, fd))",
+    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, token TEXT, PRIMARY KEY(sid, fd))",
+    // A read descriptor's token: what the Worker reads its file by without asking each time.
+    "CREATE INDEX IF NOT EXISTS fds_token ON fds(token)",
     "CREATE INDEX IF NOT EXISTS fds_device ON fds(device)",
     "CREATE INDEX IF NOT EXISTS fds_file ON fds(file)",
     // Directories a session watches (inotify), by its watch numbers: what changes in them is
@@ -222,6 +224,11 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     }
     if sql.exec("SELECT device FROM fds LIMIT 0", None).is_err() {
         sql.exec("ALTER TABLE fds ADD COLUMN device TEXT", None)?;
+    }
+    // Descriptors made before read tokens have none.
+    if sql.exec("SELECT token FROM fds LIMIT 0", None).is_err() {
+        sql.exec("ALTER TABLE fds ADD COLUMN token TEXT", None)?;
+        sql.exec("CREATE INDEX IF NOT EXISTS fds_token ON fds(token)", None)?;
     }
     // Tables made just now are this version's, said at once: initialization may fail (a
     // missing ADMIN_PASSWORD), and the next start must not take them for an older version's.
@@ -738,6 +745,26 @@ impl Db {
             ],
         );
         fd
+    }
+    /// Give the read descriptor `fd` of `sid` the token `token`.
+    pub fn set_fd_token(&mut self, sid: &str, fd: u32, token: &str) {
+        self.run(
+            "UPDATE fds SET token = ? WHERE sid = ? AND fd = ?",
+            vec![text(token), text(sid), int(fd)],
+        );
+    }
+    /// The descriptor whose token is `token`, and its session.
+    pub fn fd_by_token(&self, token: &str) -> Option<(String, Fd)> {
+        #[derive(Deserialize)]
+        struct Of {
+            sid: String,
+            fd: u32,
+        }
+        let of = self
+            .rows::<Of>("SELECT sid, fd FROM fds WHERE token = ?", vec![text(token)])
+            .pop()?;
+        let found = self.fd(&of.sid, of.fd)?;
+        Some((of.sid, found))
     }
     /// Keep the descriptor `fd` of `sid`, from `now`.
     pub fn lease_fd(&mut self, sid: &str, fd: u32, now: u64) {

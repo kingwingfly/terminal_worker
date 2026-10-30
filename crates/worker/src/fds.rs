@@ -132,9 +132,18 @@ fn open(
         };
         let fd = db.add_fd(sid, Some(&file), &path, flags, false, now);
         db.set_expiry("fd", &fd_key(sid, fd), now + IDLE);
+        // A file whole is read by its token too, without asking each time.
+        let token = db
+            .file(&file)
+            .filter(File::complete)
+            .map(|_| auth::random_token());
+        if let Some(token) = &token {
+            db.set_fd_token(sid, fd, token);
+        }
         return Ok(Opened {
             fd,
             size: node.size,
+            token,
             ..Opened::default()
         });
     }
@@ -285,6 +294,7 @@ fn resume(db: &mut Db, sid: &str, path: &str, flags: u32, file: &File, now: u64)
         committed: db.chunks(&file.id).into_iter().map(|c| c.idx).collect(),
         created,
         resumed: true,
+        token: None,
     })
 }
 
@@ -589,6 +599,33 @@ fn window(bytes: Vec<u8>, offset: u64, count: u64) -> Vec<u8> {
     let start = (offset as usize).min(bytes.len());
     let end = start.saturating_add(count as usize).min(bytes.len());
     bytes[start..end].to_vec()
+}
+
+/// What the Worker reads by the token `token`, for the session `sid` reading it now: the
+/// file's content, if the descriptor is still open, its session `sid`'s, and its account may
+/// still read the file at a name it shows at; the descriptor is kept, as it is used.
+pub fn by_token(db: &mut Db, sid: Option<&str>, who: &Identity, token: &str) -> Result<File> {
+    let (of, found) = db.fd_by_token(token).ok_or(Errno::EBADF)?;
+    if sid != Some(of.as_str()) {
+        return Err(Errno::EBADF.into());
+    }
+    let file = found
+        .file
+        .as_deref()
+        .and_then(|file| db.file(file))
+        .filter(File::complete)
+        .ok_or(Errno::EBADF)?;
+    let readable = db.showing(&file.id).iter().any(|path| {
+        db.access(who, path, terminal_worker_core::permissions::READ)
+            .is_ok()
+    });
+    if !readable {
+        return Err(Errno::EACCES.into());
+    }
+    let now = auth::now();
+    db.lease_fd(&of, found.fd, now);
+    db.set_expiry("fd", &fd_key(&of, found.fd), now + IDLE);
+    Ok(file)
 }
 
 /// The most a file written in order may grow to.

@@ -928,6 +928,8 @@ window.terminal = { config: () => configuration.branding, exec, open, follow, pl
   requestAnimationFrame(() => {
     const input = $('command');
     if (input?.value !== value || document.querySelector('dialog[open]')) return;
+    // Text selected since (the line chosen whole, to type over) is the typist's: the caret stays.
+    if (document.activeElement === input && input.selectionStart !== input.selectionEnd) return;
     input.focus({ preventScroll: true });
     const end = value.length - (insideQuote && value.endsWith('"') ? 1 : 0);
     input.setSelectionRange(end, end);

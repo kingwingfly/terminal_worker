@@ -90,23 +90,89 @@ struct Grant {
     chunks: Vec<(u64, String)>,
 }
 
-/// GET or HEAD a file: authorization precedes every HEAD, Range and conditional response,
-/// including 304. A file still uploading is read as it arrives: the response waits for each
-/// chunk not uploaded yet.
-pub async fn read(req: Request, env: &Env) -> Result<Response> {
-    let query = format!("path={}", encode(&param(&req, "path")?));
-    let mut grant = authority(
+thread_local! {
+    /// What the kernel last said of read tokens, by token: the session reading by it, when it
+    /// said so, and the file's content to read.
+    static TOKENS: RefCell<HashMap<String, (String, u64, Value)>> = RefCell::default();
+}
+
+/// The session a request comes from, as its cookies say: a signed-in one's, or a browser's own.
+fn session(req: &Request) -> String {
+    let cookie = |name| crate::auth::cookie_token(req, name).unwrap_or_default();
+    format!(
+        "{} {}",
+        cookie(crate::auth::COOKIE),
+        cookie(crate::auth::GUEST_COOKIE)
+    )
+}
+
+/// What a read by the token `token` reads: what the kernel last said of it, if it said so
+/// lately to the same session, or what it says now; or why not, as its reply.
+async fn by_token(
+    req: &Request,
+    env: &Env,
+    token: &str,
+) -> Result<std::result::Result<Value, Response>> {
+    let (session, now) = (session(req), crate::auth::now());
+    let known = TOKENS.with(|tokens| {
+        tokens
+            .borrow()
+            .get(token)
+            .filter(|(of, at, _)| *of == session && now < at + abi::TOKEN_FRESH)
+            .map(|(_, _, grant)| grant.clone())
+    });
+    if let Some(grant) = known {
+        return Ok(Ok(grant));
+    }
+    let mut asked = authority(
         env,
-        &req,
+        req,
         Method::Get,
-        &format!("/internal/read?{query}"),
+        &format!("/internal/token?token={}", encode(token)),
         None,
     )
     .await?;
-    if grant.status_code() >= 400 {
-        return Ok(grant);
+    if asked.status_code() >= 400 {
+        TOKENS.with(|tokens| tokens.borrow_mut().remove(token));
+        return Ok(Err(asked));
     }
-    let grant: serde_json::Value = grant.json().await?;
+    let grant: Value = asked.json().await?;
+    TOKENS.with(|tokens| {
+        let mut tokens = tokens.borrow_mut();
+        if tokens.len() > 4096 {
+            tokens.retain(|_, (_, at, _)| now < *at + abi::TOKEN_FRESH);
+        }
+        tokens.insert(token.to_string(), (session, now, grant.clone()));
+    });
+    Ok(Ok(grant))
+}
+
+/// GET or HEAD a file, by its path or by a read descriptor's token: authorization precedes
+/// every HEAD, Range and conditional response, including 304; by a token, the kernel's word is
+/// taken for `TOKEN_FRESH` seconds. A file still uploading is read as it arrives: the response
+/// waits for each chunk not uploaded yet.
+pub async fn read(req: Request, env: &Env) -> Result<Response> {
+    let token = param(&req, "token")?;
+    let query = format!("path={}", encode(&param(&req, "path")?));
+    let grant: serde_json::Value = if token.is_empty() {
+        let mut grant = authority(
+            env,
+            &req,
+            Method::Get,
+            &format!("/internal/read?{query}"),
+            None,
+        )
+        .await?;
+        if grant.status_code() >= 400 {
+            return Ok(grant);
+        }
+        grant.json().await?
+    } else {
+        match by_token(&req, env, &token).await? {
+            Ok(grant) => grant,
+            Err(refused) => return Ok(refused),
+        }
+    };
     // A file the kernel writes as it is read (/etc/passwd): all of it, as it is now.
     if let Some(text) = grant["generated"].as_str() {
         let headers = Headers::new();
@@ -205,11 +271,9 @@ impl Reader {
         }
         let parts = Rc::new(RefCell::new(parts));
         let reader = Rc::new(RefCell::new(Some(self)));
-        let first = Rc::new(std::cell::Cell::new(true));
         let next = Closure::<dyn FnMut() -> js_sys::Promise>::new(move || {
             let part = parts.borrow_mut().pop_front();
             let reader = reader.clone();
-            let first = first.replace(false);
             future_to_promise(async move {
                 let Some((index, offset, length)) = part else {
                     return Ok(JsValue::NULL);
@@ -219,13 +283,6 @@ impl Reader {
                     .borrow_mut()
                     .take()
                     .ok_or_else(|| JsValue::from_str("chunks were read out of order"))?;
-                // Each chunk after the first is asked for again: a read under way stops as soon
-                // as its reader may no longer read (chmod, setfacl, a removal, signing out).
-                if !first {
-                    this.refresh()
-                        .await
-                        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-                }
                 let key = this.key(index).await;
                 let bucket = this.bucket.clone();
                 *reader.borrow_mut() = Some(this);
@@ -277,8 +334,7 @@ impl Reader {
         .await?;
         if grant.status_code() >= 400 {
             return Err(Error::RustError(
-                "Reading the file is no longer allowed, or it was removed, while it was read"
-                    .into(),
+                "File was removed while it was read".into(),
             ));
         }
         let grant: Grant = grant.json().await?;

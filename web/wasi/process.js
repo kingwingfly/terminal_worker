@@ -78,9 +78,11 @@ function stat(path, follow = true) {
   cache.set(key, found);
   return found;
 }
-// Bytes `start`..`end` of the file at `path`, by a ranged GET.
-function range(path, start, end) {
-  const xhr = request('GET', '/api/file?path=' + encodeURIComponent(path), null, { Range: `bytes=${start}-${end - 1}` }, true);
+// Bytes `start`..`end` of the file at `path`, by a ranged GET: by its descriptor's token, which
+// the Worker serves without asking the kernel each time, if it has one.
+function range(path, start, end, token) {
+  const url = token ? '/api/file?token=' + encodeURIComponent(token) : '/api/file?path=' + encodeURIComponent(path);
+  const xhr = request('GET', url, null, { Range: `bytes=${start}-${end - 1}` }, true);
   if (xhr.status === 416) return new Uint8Array(0);
   if (xhr.status !== 200 && xhr.status !== 206) throw new Errno(xhr.status === 404 ? ENOENT : xhr.status === 403 ? ERRNO.EACCES : EIO);
   return new Uint8Array(xhr.response);
@@ -143,9 +145,9 @@ const size = found => found.rewrite ? found.data.length : found.writer ? found.f
 function openRead(path) {
   const [opened, read, stated] = batch([{ open: { path, flags: O_RDONLY } }, { pread: { fd: { ref: 0 }, count: INLINE } }, { stat: { path } }]);
   if (opened.err?.errno === 'EISDIR') return { kind: 'dir', path };
-  const { fd } = ok(opened);
+  const { fd, token } = ok(opened);
   const first = ok(read);
-  return { kind: 'file', path, kfd: fd, read: true, pos: 0, size: first.size, window: { start: 0, data: unbase64(first.data) }, stat: stated.ok };
+  return { kind: 'file', path, kfd: fd, token, read: true, pos: 0, size: first.size, window: { start: 0, data: unbase64(first.data) }, stat: stated.ok };
 }
 // Open it for writing in order: a growing file, truncated or new.
 function openWriter(path, flags, read) {
@@ -185,7 +187,7 @@ function readFrom(found, at, count) {
       found.size = read.size;
       found.window = { start: at, data: unbase64(read.data) };
     } else {
-      found.window = { start: at, data: range(found.path, at, Math.min(found.size, at + Math.min(want, WINDOW))) };
+      found.window = { start: at, data: range(found.path, at, Math.min(found.size, at + Math.min(want, WINDOW)), found.token) };
     }
   }
   const from = at - found.window.start;
