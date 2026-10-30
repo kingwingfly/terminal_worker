@@ -1,6 +1,12 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { api, errno, listing, mkdirp, put } from './sys.js';
+// The Files go to `path` of their own: its location typed (files.rs).
+async function browse(page, path) {
+  const location = page.getByRole('textbox', { name: 'Location' });
+  await location.fill(path); await location.press('Enter');
+  await expect(location).toHaveValue(path);
+}
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 // A line is typed at the prompt, once the one before has ended, as the shell takes no other.
@@ -66,7 +72,9 @@ test('terminal, password modal, upload, sanitized Markdown, slides and media', a
   await page.getByLabel('Password', { exact: true }).fill(password); await page.locator('#auth button[type=submit]').click();
   await expect(page.locator('.busy')).toHaveText('↵');
   await run(page, 'mkdir ' + folder);
-  await complete(input, 'cd ' + folder.slice(0, -1), 'cd "' + folder + '/"'); await input.press('Enter'); await expect(page.locator('.directory-bar')).toContainText(folder);
+  await complete(input, 'cd ' + folder.slice(0, -1), 'cd "' + folder + '/"'); await input.press('Enter'); await expect(page.locator('label[for=command] .prompt-path')).toHaveText('/' + folder);
+  // The Files upload into their own directory.
+  await browse(page, '/' + folder);
   const chooserPromise = page.waitForEvent('filechooser'); await page.getByRole('button', { name: '↑ Upload files' }).click();
   await (await chooserPromise).setFiles({ name: 'Safe preview.md', mimeType: 'text/markdown', buffer: Buffer.from('# Rendered safely\n\n<img src="missing" onerror="window.xss=true">\n<script>window.xss=true</script>\n[bad](javascript:alert(1))') });
   await expect(page.locator('.filename').filter({ hasText: 'Safe preview.md' })).toBeVisible();
@@ -90,7 +98,8 @@ test('drag/drop uploads images and videos, warning of one that is not faststart'
   await page.locator('#auth button[type=submit]').click();
   await expect(page.locator('.busy')).toHaveText('↵');
   await run(page, 'mkdir ' + folder);
-  await run(page, 'cd ' + folder); await expect(page.locator('.directory-bar')).toContainText(folder);
+  await run(page, 'cd ' + folder); await expect(page.locator('label[for=command] .prompt-path')).toHaveText(folder);
+  await browse(page, folder);
   for (const name of ['pixel.png', 'faststart.mp4', 'tail-moov.mp4']) {
     const bytes = [...await readFile('tests/fixtures/' + name)];
     const transfer = await page.evaluateHandle(({ name, bytes }) => {

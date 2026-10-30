@@ -1,6 +1,12 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { api, mkdirp, put, rmrf } from './sys.js';
+// The Files go to `path` of their own: its location typed (files.rs).
+async function browse(page, path) {
+  const location = page.getByRole('textbox', { name: 'Location' });
+  await location.fill(path); await location.press('Enter');
+  await expect(location).toHaveValue(path);
+}
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -27,6 +33,7 @@ test('a directory listed again asks the kernel nothing, until something in it ch
     await page.getByLabel('Password', { exact: true }).fill(password); await page.locator('#auth button[type=submit]').click();
     await expect(page.locator('#auth')).not.toBeVisible();
     await run('cd ' + base);
+    await browse(page, base);
     await run('ls -l');
     await expect(last).toContainText('one.txt');
     // Again: every answer is the cache's.

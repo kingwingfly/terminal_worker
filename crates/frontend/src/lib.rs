@@ -1,4 +1,5 @@
 mod desktop;
+mod files;
 mod manual;
 mod preview;
 mod search;
@@ -54,10 +55,6 @@ extern "C" {
     fn set_directory(path: &str);
     #[wasm_bindgen(js_namespace = terminal, js_name = focusInput)]
     fn focus_input();
-    /// The command line focused again after a command, unless the file panel ran it on a touch
-    /// screen, where focusing opens a keyboard nobody asked for.
-    #[wasm_bindgen(js_namespace = terminal, js_name = focusAfter)]
-    fn focus_after(panel: bool);
     #[wasm_bindgen(js_namespace = terminal, js_name = completionFocus)]
     fn completion_focus(value: &str, inside_quote: bool);
     /// exec(2) of programs of /usr/bin, a pipeline of processes (web/wasi/exec.mjs), each
@@ -355,6 +352,9 @@ fn App() -> impl IntoView {
         .collect();
     first[0].log("Connected as guest. Access follows account and rwx permissions.\nEnter help or open a file.");
     let active = RwSignal::new(first[saved_active].id);
+    // The Files app keeps a directory of its own, from where the terminal starts.
+    let files = files::Files::new(account, first[saved_active].cwd.get_untracked());
+    files.refresh();
     let tabs = RwSignal::new(first);
     TABS.with(|t| *t.borrow_mut() = Some((tabs, active)));
     let current = Signal::derive(move || {
@@ -417,6 +417,7 @@ fn App() -> impl IntoView {
             let before = account.username.get_untracked();
             // Why, if it changed from elsewhere (app.js `changed`).
             let reason = e.detail().as_string();
+            files.refresh();
             spawn_local(async move {
                 for shell in tabs.get_untracked() {
                     if let Err(e) = shell.refresh().await {
@@ -466,19 +467,16 @@ fn App() -> impl IntoView {
     told.forget();
     let remote = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |_: web_sys::CustomEvent| {
         let dirs = CHANGED.with(|changed| std::mem::take(&mut *changed.borrow_mut()));
-        for shell in tabs.get_untracked() {
-            if dirs.contains(&shell.cwd.get_untracked()) {
-                spawn_local(async move {
-                    let _ = shell.refresh().await;
-                });
-            }
+        if dirs.contains(&files.cwd.get_untracked()) {
+            files.refresh();
         }
     });
     window
         .add_event_listener_with_callback("terminal-remote", remote.as_ref().unchecked_ref())
         .unwrap();
     remote.forget();
-    // Files dropped on the page upload in the active tab.
+    // Files dropped on the page upload in the active tab; dropped on the Files, into its
+    // directory.
     let dropped =
         Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
             current.get_untracked().upload_dropped(e.detail());
@@ -487,6 +485,17 @@ fn App() -> impl IntoView {
         .add_event_listener_with_callback("terminal-files", dropped.as_ref().unchecked_ref())
         .unwrap();
     dropped.forget();
+    let dropped_on_files =
+        Closure::<dyn FnMut(web_sys::CustomEvent)>::new(move |e: web_sys::CustomEvent| {
+            files.dropped(e.detail());
+        });
+    window
+        .add_event_listener_with_callback(
+            "files-dropped",
+            dropped_on_files.as_ref().unchecked_ref(),
+        )
+        .unwrap();
+    dropped_on_files.forget();
     // Alt+T opens a tab, Alt+W closes it, Alt+1…9 switch; browsers keep Ctrl+T and Ctrl+W.
     let keys =
         Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
@@ -563,27 +572,7 @@ fn App() -> impl IntoView {
             <section class="intro wallpaper"><span class="eyebrow">"PUBLIC ARCHIVE / 001"</span><h1>{heading}</h1><p>{description}</p></section>
             <section class="window" id="window-files" data-window="files" aria-label="Files window" tabindex="-1">
                 <div class="window-bar" data-window-bar><span class="window-title">{file_icon("directory", true)}"Files"</span>{desktop::controls("files", "Files")}</div>
-                <section class="file-panel" aria-label="File manager">
-                <div class="directory-bar"><span>{move || current.get().cwd.get()}</span>
-                    <button on:click=move |_| current.get_untracked().run_from_panel("upload".into())>"↑ Upload files"</button></div>
-                <p class="file-notice" role="status">{move || current.get().notice.get()}</p>
-                <div class="files" aria-label="Current directory">
-                    <Show when=move || current.get().cwd.get() != "/"><button class="file" on:click=move |_| current.get_untracked().run_from_panel("cd ..".into())><span class="file-kind">{file_icon("directory", true)}</span><span>"../"</span></button></Show>
-                    {move || current.get().entries.get().into_iter().map(|entry| {
-                        let command = format!("{} \"{}\"", if entry.directory { "cd" } else { "open" }, entry.path.replace('"', "\\\""));
-                        let size = if entry.directory { String::new() } else { upload_progress(&entry).unwrap_or_else(|| format!("{:.1} KB", entry.size as f64 / 1000.0)) };
-                        let title = format!("{} {}:{}{}", entry.mode_line(), entry.owner, entry.group, entry.link.as_ref().map(|t| format!(" -> {t}")).unwrap_or_default());
-                        let linked = entry.link.is_some();
-                        // What the account may not open shows dimmed, and says why when clicked.
-                        let denied = entry.denied;
-                        let refusal = denied.then(|| format!("Permission denied: {} is {} {}:{}", entry.name, entry.mode_line().trim_end(), entry.owner, entry.group));
-                        let title = if denied { format!("{title} · permission denied") } else { title };
-                        view! { <button class="file" class:link=linked class:denied=denied aria-disabled=denied.then_some("true") data-kind=if entry.directory { "directory".to_string() } else { entry.kind.clone() } title=title on:click=move |_| { let shell = current.get_untracked(); match &refusal { Some(refusal) => shell.notice.set(refusal.clone()), None => shell.run_from_panel(command.clone()) } }><span class="file-kind">{file_icon(&entry.kind, entry.directory)}</span><span class="filename"><span class="filename-text">{entry.name}{if entry.directory { "/" } else { "" }}</span></span><span class="file-size">{if linked { "→".to_string() } else { size }}</span></button> }
-                    }).collect_view()}
-                    <p class="directory-error" role="status">{move || current.get().directory_error.get()}</p>
-                    <Show when=move || current.get().entries.get().is_empty() && current.get().directory_error.get().is_empty()><p class="empty">"This directory is empty. Drop files here or use mkdir to create a directory."</p></Show>
-                </div>
-                </section>
+                {files::view(files)}
                 {desktop::handles()}
             </section>
             <section class="window" id="window-terminal" data-window="terminal" aria-label="Terminal window">
@@ -628,7 +617,7 @@ fn App() -> impl IntoView {
                         <button type="button" role="menuitem" on:click=move |_| launch("terminal")><span aria-hidden="true">">_"</span>"Terminal"</button>
                         <button type="button" role="menuitem" on:click=move |_| launch("files")><span aria-hidden="true">"▤"</span>"Files"</button>
                         <button type="button" role="menuitem" on:click=move |_| { launcher.set(false); current.get_untracked().run("man".into()); }><span aria-hidden="true">"?"</span>"Manual"</button>
-                        <button type="button" role="menuitem" on:click=move |_| { launcher.set(false); desktop.show("terminal"); current.get_untracked().run("upload".into()); }><span aria-hidden="true">"↑"</span>"Upload files"</button>
+                        <button type="button" role="menuitem" on:click=move |_| { launcher.set(false); desktop.show("files"); files.choose(); }><span aria-hidden="true">"↑"</span>"Upload files"</button>
                     </div>
                 </Show>
             </nav>

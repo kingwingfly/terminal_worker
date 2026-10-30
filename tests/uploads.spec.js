@@ -2,6 +2,12 @@ import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { api, call, descriptors, errno, listing, mkdirp, rmrf, sys } from './sys.js';
+// The Files go to `path` of their own: its location typed (files.rs).
+async function browse(page, path) {
+  const location = page.getByRole('textbox', { name: 'Location' });
+  await location.fill(path); await location.press('Enter');
+  await expect(location).toHaveValue(path);
+}
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const rootPassword = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const CHUNK = 8 * 1024 * 1024;
@@ -122,7 +128,7 @@ test('the browser resumes an interrupted upload from the chunks already sent, an
   for (const command of ['mkdir ' + folder, 'cd ' + folder]) {
     await input.fill(command); await input.press('Enter'); await expect(page.locator('.busy')).toHaveText('↵');
   }
-  await expect(page.locator('.directory-bar')).toContainText(folder);
+  await browse(page, folder);
   const bytes = content();
   const sent = [];
   // Drop the connection on the third chunk, until the client gives up after its retries.
@@ -132,42 +138,43 @@ test('the browser resumes an interrupted upload from the chunks already sent, an
     if (index === 2 && offline) return route.abort('connectionreset');
     sent.push(index); return route.continue();
   });
-  // The panel's button runs upload once the line before has ended, as a typed line does.
+  // The Files' button uploads into their directory, once the upload before has ended.
   const prompt = () => expect(page.locator('.busy')).toHaveText('↵');
-  const choose = async () => { await prompt(); const chooser = page.waitForEvent('filechooser'); await page.getByRole('button', { name: '↑ Upload files' }).click(); await (await chooser).setFiles({ name: 'data.log', mimeType: 'application/octet-stream', buffer: bytes }); };
+  const button = page.getByRole('button', { name: '↑ Upload files' });
+  const choose = async () => { await expect(button).toBeEnabled(); const chooser = page.waitForEvent('filechooser'); await button.click(); await (await chooser).setFiles({ name: 'data.log', mimeType: 'application/octet-stream', buffer: bytes }); };
   await choose();
-  // Progress and results show in the tab that uploads, not over the page.
-  const transcript = page.locator('.terminal-panel:not([hidden]) .transcript');
-  await expect(transcript).toContainText('choose the same file again to resume', { timeout: 30_000 });
+  // Progress and results show in the Files, not over the page, nor in the terminal.
+  const progress = page.getByRole('status', { name: 'Upload progress' });
+  await expect(progress).toContainText('choose the same file again to resume', { timeout: 30_000 });
   expect(sent.sort()).toEqual([0, 1]);
   offline = false;
   await expect(page.locator('.filename').filter({ hasText: 'data.log' })).toBeVisible();
   sent.length = 0;
   await choose();
-  await expect(transcript).toContainText('✓ data.log (resumed)', { timeout: 30_000 });
+  await expect(progress).toContainText('✓ data.log (resumed)', { timeout: 30_000 });
   expect(sent).toEqual([2]);
   const stored = await page.request.get(file(folder + '/data.log'), { headers: { 'Accept-Encoding': 'identity' } });
   expect(Buffer.compare(await stored.body(), bytes)).toBe(0);
   // Slow chunks down, and cancel during the upload.
   await page.unroute('**/api/pwrite?**');
-  // A chunk Ctrl+C stopped meanwhile is not sent on.
+  // A chunk Cancel stopped meanwhile is not sent on.
   await page.route('**/api/pwrite?**', async route => { await new Promise(r => setTimeout(r, 1500)); return route.continue().catch(() => {}); });
-  await prompt(); const chooser = page.waitForEvent('filechooser'); await page.getByRole('button', { name: '↑ Upload files' }).click();
+  await expect(button).toBeEnabled(); const chooser = page.waitForEvent('filechooser'); await button.click();
   await (await chooser).setFiles({ name: 'other.log', mimeType: 'application/octet-stream', buffer: bytes.subarray(0, CHUNK + 5) });
-  await expect(transcript).toContainText('↑ other.log', { timeout: 15_000 });
-  await page.locator('#command').press('Control+c');
-  await expect(transcript).toContainText('✕ other.log: Upload cancelled', { timeout: 15_000 });
+  await expect(progress).toContainText('↑ other.log', { timeout: 15_000 });
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(progress).toContainText('✕ other.log: Upload cancelled', { timeout: 15_000 });
   await expect.poll(async () => (await listing(page.request, folder)).map(e => e.name)).toEqual(['data.log']);
   await page.unroute('**/api/pwrite?**');
   // Any file uploads: media are served as such, what is neither text nor media as bytes.
   for (const [name, type] of [['tone.aac', 'audio/aac'], ['report.docx', 'application/octet-stream']]) {
-    await prompt(); const chooser = page.waitForEvent('filechooser'); await page.getByRole('button', { name: '↑ Upload files' }).click();
+    await expect(button).toBeEnabled(); const chooser = page.waitForEvent('filechooser'); await button.click();
     await (await chooser).setFiles({ name, mimeType: 'application/octet-stream', buffer: Buffer.from([0xFF, 0xF1, 0x50, 0x80, 0x00, 0x1F, 0xFC]) });
-    await expect(transcript).toContainText('✓ ' + name, { timeout: 15_000 });
+    await expect(progress).toContainText('✓ ' + name, { timeout: 15_000 });
     expect((await page.request.head(file(folder + '/' + name))).headers()['content-type']).toBe(type);
   }
-  // A chooser the browser closes without saying so, or never opens, leaves upload waiting
-  // until Ctrl+C, which gives it no files.
+  // In the terminal, a chooser the browser closes without saying so, or never opens, leaves
+  // upload waiting until Ctrl+C, which gives it no files.
   await page.evaluate(() => { HTMLInputElement.prototype.click = function () {}; });
   await prompt();
   await input.fill('upload'); await input.press('Enter');

@@ -14,9 +14,7 @@ use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 
 use super::{LogLine, Output, Shell, js_message};
-use crate::{
-    choose_files, enterable, listing, open_file, record_sound, set_directory, stat, upload_files,
-};
+use crate::{choose_files, enterable, open_file, record_sound, set_directory, stat, upload_files};
 
 /// A command the tab runs.
 pub trait TerminalCommand: Sync {
@@ -235,19 +233,8 @@ impl TerminalCommand for Cd {
             enterable(&path)
                 .await
                 .map_err(|error| format!("cd: {typed}: {error}"))?;
-            let result = listing(&path).await;
             shell.cwd.set(path.clone());
             set_directory(&path);
-            match result {
-                Ok(entries) => {
-                    shell.entries.set(entries);
-                    shell.directory_error.set(String::new());
-                }
-                Err(error) => {
-                    shell.entries.set(Vec::new());
-                    shell.directory_error.set(error);
-                }
-            }
             Ok(Output::default())
         }
         .boxed_local()

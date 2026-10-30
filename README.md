@@ -184,6 +184,8 @@ The page is a desktop: a bar with the account, the area its windows are laid out
 - The launcher (⋮⋮) opens Terminal, Files, the manual, and upload.
 - Ctrl+Alt+← and → put the window up in a half, Ctrl+Alt+↑ fills the desktop with it, and Ctrl+Alt+↓ frees it, or minimizes it if it is free. Alt+` goes to the next window.
 
+The Files keep a directory of their own, apart from the terminal's, which `cd` does not move: its location, at the top, takes a path typed (`~` for the account's home); a click goes into a directory, `../` out of it, and opens a file in the preview. Nothing done in the Files is a command of the terminal, nor shows in it: what they cannot do, and an upload's progress, show in them. Their upload button, the launcher's, and files dropped on them upload into their directory; files dropped elsewhere, into the terminal's, as `upload` does there. Each browser tab keeps where its Files are.
+
 Each browser keeps its layout (localStorage `terminal-desktop`). Nothing is modal but signing in: the preview and the editor are windows among the others, and what is typed goes to the window that has the keyboard.
 
 ## Phones and touch screens

@@ -13,7 +13,7 @@ test.beforeEach(async ({ request, page }) => {
   await page.goto('/');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill('cd ' + base); await input.press('Enter');
-  await expect(page.locator('.directory-bar')).toContainText(base);
+  await expect(page.locator('label[for=command] .prompt-path')).toHaveText(base);
 });
 test.afterEach(async ({ request }) => { await rmrf(request, base); });
 

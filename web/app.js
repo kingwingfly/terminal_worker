@@ -729,7 +729,8 @@ window.addEventListener('dragenter', e => { if (e.dataTransfer?.types.includes('
 window.addEventListener('dragover', e => { if (e.dataTransfer?.types.includes('Files')) e.preventDefault(); });
 window.addEventListener('dragleave', () => { if (--depth <= 0) { depth = 0; $('dropzone').hidden = true; } });
 // Dropped files go to the active tab, which uploads them as its upload command would.
-window.addEventListener('drop', e => { e.preventDefault(); depth = 0; $('dropzone').hidden = true; if (e.dataTransfer?.files.length) window.dispatchEvent(new CustomEvent('terminal-files', { detail: [...e.dataTransfer.files] })); });
+// Dropped on the Files, files go into its directory; anywhere else, the terminal's.
+window.addEventListener('drop', e => { e.preventDefault(); depth = 0; $('dropzone').hidden = true; if (e.dataTransfer?.files.length) window.dispatchEvent(new CustomEvent(e.target?.closest?.('#window-files') ? 'files-dropped' : 'terminal-files', { detail: [...e.dataTransfer.files] })); });
 
 // Where each file's preview was left, by path, kept in this browser for the last 200 files, so
 // that opening one again continues there: the page code records how far it was scrolled and
@@ -944,11 +945,6 @@ window.terminal = { config: () => configuration.branding, exec, open, follow, pl
   });
 }, setDirectory: path => { directory = path; }, focusInput: () => {
   observeTranscript();
-  restoreTerminalFocus();
-}, focusAfter: panel => {
-  observeTranscript();
-  // A tap on the files, on a touch screen, means no typing: the keyboard stays closed.
-  if (panel && matchMedia('(pointer: coarse)').matches) return;
   restoreTerminalFocus();
 } };
 

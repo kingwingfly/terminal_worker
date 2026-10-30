@@ -112,16 +112,9 @@ pub struct Shell {
     pub id: u64,
     pub account: Account,
     pub cwd: RwSignal<String>,
-    pub entries: RwSignal<Vec<Entry>>,
     pub lines: RwSignal<Vec<LogLine>>,
     pub input: RwSignal<String>,
     pub busy: RwSignal<bool>,
-    pub directory_error: RwSignal<String>,
-    /// What the file panel says of the last thing clicked in it, which the terminal, perhaps
-    /// hidden, would say alone: a refusal, or the error of the line it ran ...
-    pub notice: RwSignal<String>,
-    /// ... while the running line is one the panel started.
-    panel: RwSignal<bool>,
     pub history: RwSignal<Vec<String>>,
     pub history_index: RwSignal<usize>,
     pub completion: RwSignal<Option<CompletionSession>>,
@@ -235,7 +228,7 @@ fn process(args: &[String]) -> Option<Vec<String>> {
         || userland::PROGRAMS.contains(&name.as_str());
     (cli_bin::program(&name).is_some() && !own).then_some(args)
 }
-fn js_message(error: JsValue) -> String {
+pub(crate) fn js_message(error: JsValue) -> String {
     js_sys::Reflect::get(&error, &JsValue::from_str("message"))
         .ok()
         .and_then(|v| v.as_string())
@@ -350,13 +343,9 @@ impl Shell {
             id,
             account,
             cwd: RwSignal::new(cwd),
-            entries: RwSignal::new(Vec::new()),
             lines: RwSignal::new(Vec::new()),
             input: RwSignal::new(String::new()),
             busy: RwSignal::new(false),
-            directory_error: RwSignal::new(String::new()),
-            notice: RwSignal::new(String::new()),
-            panel: RwSignal::new(false),
             history: RwSignal::new(history),
             history_index: RwSignal::new(index),
             completion: RwSignal::new(None),
@@ -398,23 +387,10 @@ impl Shell {
         self.push(LogLine::Text(value));
     }
     fn error(self, message: impl AsRef<str>) {
-        if self.panel.get_untracked() {
-            self.notice.set(message.as_ref().into());
-        }
         self.log(format!("! {}", message.as_ref()));
     }
-    /// Run `command` for the file panel, which shows its errors, and says so when the tab is
-    /// busy, rather than leave a click unanswered while the terminal may be hidden.
-    pub fn run_from_panel(self, command: String) {
-        if self.busy.get_untracked() || self.asking.get_untracked() {
-            self.notice.set(
-                "A command is running in this tab; wait for it, or stop it with Ctrl+C".into(),
-            );
-            return;
-        }
-        self.panel.set(true);
-        self.run(command);
-    }
+    /// Learn the account again, which a command may have changed, and let the Files list their
+    /// directory again, which it may have changed too.
     pub async fn refresh(self) -> Result<(), String> {
         if let Ok(creds) =
             userland::sys::call::<abi::Creds>(&crate::sys::HttpSys::default(), abi::Call::Getcreds)
@@ -424,15 +400,8 @@ impl Shell {
             self.account.username.set(creds.user);
             self.account.home.set(creds.home);
         }
-        match listing(&self.cwd.get_untracked()).await {
-            Ok(entries) => {
-                self.entries.set(entries);
-                self.directory_error.set(String::new());
-            }
-            Err(error) => {
-                self.entries.set(Vec::new());
-                self.directory_error.set(error);
-            }
+        if let Some(files) = crate::files::files() {
+            files.refresh();
         }
         Ok(())
     }
@@ -1315,8 +1284,6 @@ impl Shell {
         }
         self.reset_completion();
         self.input.set(String::new());
-        // What the panel said of the last click is old news once another line runs.
-        self.notice.set(String::new());
         self.push(LogLine::Command {
             user: self.account.username.get_untracked(),
             cwd: self.cwd.get_untracked(),
@@ -1334,10 +1301,8 @@ impl Shell {
             }
             self.busy.set(false);
             self.cancelled.set(false);
-            let panel = self.panel.get_untracked();
-            self.panel.set(false);
             crate::persist();
-            crate::focus_after(panel);
+            crate::focus_input();
         });
     }
     /// The previous command in the history, or with `up` false the next, into the command line.

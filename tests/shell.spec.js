@@ -189,13 +189,12 @@ test('tabs run at once with their own directory and history, and Ctrl+C stops a 
   await expect(page.getByRole('tab')).toHaveCount(2);
   await expect(page.locator('#command')).toBeFocused();
   await run(page, 'cd docs');
-  await expect(page.locator('.directory-bar')).toContainText(base + '/docs');
+  await expect(page.locator('label[for=command] .prompt-path')).toHaveText(base + '/docs');
   // Tab 2 runs a long xargs; tab 1 works meanwhile.
   await run(page, 'fd -e dat | xargs -t -n 1 cat');
   await expect(page.locator('.terminal-panel:not([hidden]) .transcript')).toContainText('+ cat');
   await page.keyboard.press('Alt+1');
-  await expect(page.locator('.directory-bar')).toContainText(base);
-  await expect(page.locator('.directory-bar')).not.toContainText('docs');
+  await expect(page.locator('label[for=command] .prompt-path')).toHaveText(base);
   expect(await output(page, 'pwd')).toBe(base);
   await input.press('ArrowUp'); await expect(page.locator('#command')).toHaveValue('pwd');
   await page.keyboard.press('Alt+2');
@@ -210,7 +209,7 @@ test('tabs run at once with their own directory and history, and Ctrl+C stops a 
   await expect(page.getByRole('tab')).toHaveCount(2);
   await page.getByRole('button', { name: 'Close tab 2' }).click();
   await expect(page.getByRole('tab')).toHaveCount(1);
-  await expect(page.locator('.directory-bar')).toContainText(base);
+  await expect(page.locator('label[for=command] .prompt-path')).toHaveText(base);
 });
 
 test('cp and mv -i ask as well under sudo, xargs and fd -x, about each file they would replace', async ({ page, request }) => {

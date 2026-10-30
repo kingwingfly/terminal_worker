@@ -1,6 +1,12 @@
 import { test, expect } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { api, entry, errno, mkdirp, put, rmrf } from './sys.js';
+// The Files go to `path` of their own: its location typed (files.rs).
+async function browse(page, path) {
+  const location = page.getByRole('textbox', { name: 'Location' });
+  await location.fill(path); await location.press('Enter');
+  await expect(location).toHaveValue(path);
+}
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const headers = { Origin: origin };
@@ -76,7 +82,7 @@ test('rm requires explicit login, handles quoted paths, refreshes lists and refu
   await expect.poll(async () => (await entry(request, base))?.directory).toBe(true);
   try {
     await command(page, 'cd ' + base);
-    await expect(page.locator('.directory-bar')).toContainText(base);
+    await browse(page, base);
     await command(page, 'mkdir "Delete this directory"');
     await expect(page.locator('.filename').filter({ hasText: 'Delete this directory' })).toBeVisible();
     await command(page, 'rm "Delete this directory"');

@@ -1,6 +1,12 @@
 import { test, expect, devices } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { api, mkdirp, put, rmrf } from './sys.js';
+// The Files go to `path` of their own: its location typed (files.rs).
+async function browse(page, path) {
+  const location = page.getByRole('textbox', { name: 'Location' });
+  await location.fill(path); await location.press('Enter');
+  await expect(location).toHaveValue(path);
+}
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const { defaultBrowserType, ...pixel } = devices['Pixel 7'];
@@ -44,7 +50,8 @@ test('a phone shows the terminal as an app that keeps its command line above the
   await page.evaluate(() => { document.documentElement.style.setProperty('--app-height', '400px'); document.documentElement.classList.add('keyboard'); });
   await expect(page.locator('header')).toBeHidden();
   await expect(page.getByRole('region', { name: 'File manager', exact: true })).toBeHidden();
-  expect(await bottom()).toBeLessThanOrEqual(400);
+  // The desktop lays its window out again as the area resizes, the next frame.
+  await expect.poll(bottom).toBeLessThanOrEqual(400);
   // A tap on the transcript goes to the command line.
   await input.blur();
   await page.locator('.terminal-panel:not([hidden]) .transcript').tap();
@@ -56,7 +63,7 @@ test('keys a phone lacks are buttons, and Upload opens the chooser at once, befo
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await expect(page.locator('.busy')).toHaveText('↵');
   await input.fill('cd ' + base); await input.press('Enter');
-  await expect(page.locator('.directory-bar')).toContainText(base);
+  await expect(page.locator('label[for=command] .prompt-path')).toHaveText(base);
   // Tab completes, ↑ recalls, ^C clears.
   await input.fill('mkd');
   await page.getByRole('button', { name: 'Tab: complete' }).tap();
@@ -68,13 +75,15 @@ test('keys a phone lacks are buttons, and Upload opens the chooser at once, befo
   await page.getByRole('button', { name: 'Ctrl+C: stop' }).tap();
   await expect(input).toHaveValue('');
   await dock(page, 'Files').tap();
+  await browse(page, base);
   // Phones open a chooser only while the tap is fresh: a slow server must not delay it.
-  await page.route('**/api/session*', async route => { await new Promise(r => setTimeout(r, 3000)); await route.continue(); });
+  await page.route('**/api/sys', async route => { await new Promise(r => setTimeout(r, 3000)); await route.continue(); });
   const chooser = page.waitForEvent('filechooser', { timeout: 1000 });
   await page.getByRole('button', { name: '↑ Upload files' }).tap();
   await (await chooser).setFiles({ name: 'photo.png', mimeType: 'image/png', buffer: await readFile('tests/fixtures/pixel.png') });
-  await expect(page.locator('.transcript')).toContainText('✓ photo.png', { timeout: 20_000 });
-  await page.unroute('**/api/session*');
+  await page.unroute('**/api/sys');
+  // What it says, it says in the Files.
+  await expect(page.getByRole('status', { name: 'Upload progress' })).toContainText('✓ photo.png', { timeout: 20_000 });
 });
 
 test('long names keep one line and scroll; titles keep the file name; the dock switches windows; Escape closes only the dialog', async ({ page, context }) => {
@@ -83,8 +92,8 @@ test('long names keep one line and scroll; titles keep the file name; the dock s
   await page.goto('/');
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await expect(page.locator('.busy')).toHaveText('↵');
-  await input.fill('cd ' + base); await input.press('Enter');
   await dock(page, 'Files').tap();
+  await browse(page, base);
   // One line, sliding to show the rest: a touch screen points at nothing to wait for.
   const name = page.locator('.files .filename', { hasText: long });
   await expect(name).toHaveAttribute('data-overflow', '');
@@ -121,18 +130,17 @@ test('long names keep one line and scroll; titles keep the file name; the dock s
   await expect(terminal).toBeVisible();
 });
 
-test('a tap on the files runs what it means without opening the keyboard', async ({ page, context }) => {
+test('a tap on the files opens what it means, in the Files, without the terminal or its keyboard', async ({ page, context }) => {
   await mkdirp(context.request, base + '/docs');
   await page.goto('/');
-  const input = page.getByRole('combobox', { name: 'Terminal command' });
   await expect(page.locator('.busy')).toHaveText('↵');
-  await input.tap(); await input.fill('cd ' + base); await input.press('Enter');
-  await expect(page.locator('.directory-bar')).toContainText(base);
-  await input.blur();
   await dock(page, 'Files').tap();
-  // The directory opens; the command line, and so the on-screen keyboard, stays closed.
+  await browse(page, base);
+  await page.getByRole('textbox', { name: 'Location' }).blur();
+  // The directory opens; the command line, and so the on-screen keyboard, stays closed, and
+  // the terminal hears nothing of it.
   await page.locator('.files .file', { hasText: 'docs' }).tap();
-  await expect(page.locator('.directory-bar')).toContainText(base + '/docs');
-  await expect(page.locator('.busy')).toHaveText('↵');
+  await expect(page.getByRole('textbox', { name: 'Location' })).toHaveValue(base + '/docs');
   await expect(page.locator('#command')).not.toBeFocused();
+  await expect(page.locator('.transcript')).not.toContainText('cd ');
 });

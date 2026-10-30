@@ -1,6 +1,12 @@
 import { test, expect, request as playwrightRequest } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { api, mkdirp, program, put, rmrf } from './sys.js';
+// The Files go to `path` of their own: its location typed (files.rs).
+async function browse(page, path) {
+  const location = page.getByRole('textbox', { name: 'Location' });
+  await location.fill(path); await location.press('Enter');
+  await expect(location).toHaveValue(path);
+}
 const origin = process.env.TERMINAL_TEST_URL || 'http://127.0.0.1:8787';
 const password = (await readFile('.dev.vars', 'utf8')).match(/^ADMIN_PASSWORD=(.+)$/m)[1];
 const file = path => '/api/file?path=' + encodeURIComponent(path);
@@ -21,9 +27,8 @@ test('a page shows what other devices change as it happens, and hears nothing of
     await page.goto('/');
     const input = page.getByRole('combobox', { name: 'Terminal command' });
     await expect(page.locator('.busy')).toHaveText('↵');
-    await input.fill('cd ' + base); await input.press('Enter');
-    await expect(page.locator('.directory-bar')).toContainText(base);
-    // Without anything typed here, the files follow the other device.
+    await browse(page, base);
+    // Without anything done here, the Files follow the other device.
     const names = page.locator('.files .filename');
     expect((await put(other, file(base + '/hello.txt'), { data: 'hi' })).status()).toBe(201);
     await expect(names).toHaveText(['hello.txt']);
@@ -69,7 +74,8 @@ test('removing a file another device is uploading stops that upload, as rm does 
     const input = page.getByRole('combobox', { name: 'Terminal command' });
     await expect(page.locator('.busy')).toHaveText('↵');
     await input.fill('cd ' + base); await input.press('Enter');
-    await expect(page.locator('.directory-bar')).toContainText(base);
+    await expect(page.locator('label[for=command] .prompt-path')).toHaveText(base);
+    await browse(page, base);
     // Slow chunks leave the other device time to remove the file.
     // A chunk the stopped upload aborted meanwhile is handled already, and continues nowhere.
     await page.route('**/api/pwrite?**', async route => { await new Promise(r => setTimeout(r, 1500)); await route.continue().catch(() => {}); });
