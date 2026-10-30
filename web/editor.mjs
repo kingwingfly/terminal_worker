@@ -49,7 +49,7 @@ export async function edit(path,{api,fileUrl,unlock,changed}) {
  const dialog=$('editor'), body=$('editor-body'), status=$('editor-status'), save=$('editor-save'), discard=$('editor-discard');
  const state={path,view:null,dirty:false,saving:false,etag:null,existing:false,readOnly:false};active=state;
  $('editor-title').textContent=path; status.textContent='Loading...'; save.disabled=true; discard.hidden=true;
- body.replaceChildren();dialog.showModal();
+ body.replaceChildren();dialog.show();dialog.focus({preventScroll:true});
  const close=force=>{
   if(state.saving)return;
   if(state.dirty&&!force){status.textContent='You have unsaved changes. Save or choose Discard changes.';discard.hidden=false;return;}

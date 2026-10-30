@@ -110,8 +110,7 @@ test('the file panel dims what the account may not open, and says why when click
     await expect(entry('open/')).not.toHaveClass(/denied/); await expect(entry('notes.txt')).not.toHaveClass(/denied/);
     // ls in the terminal dims them too.
     await run(page, 'ls'); await expect(transcript(page).locator('.entry-denied')).toHaveCount(2);
-    // With the terminal hidden, a click on one says why, in the panel.
-    await page.getByRole('button', { name: 'Toggle terminal' }).click();
+    // A click on one says why, in the panel.
     // aria-disabled, which Playwright will not click; people may, and are told why.
     await entry('secret.txt').click({ force: true });
     await expect(page.locator('.file-notice')).toContainText('Permission denied: secret.txt is -rw------- root:root');

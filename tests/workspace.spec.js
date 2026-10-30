@@ -13,19 +13,21 @@ function pdfBytes(){
  const xref=Buffer.byteLength(text);text+=`xref\n0 ${objects.length+1}\n0000000000 65535 f \n`+offsets.slice(1).map(n=>String(n).padStart(10,'0')+' 00000 n \n').join('');text+=`trailer\n<< /Size ${objects.length+1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;return Buffer.from(text);
 }
 
-test('manual, large terminal, collapsible layouts, prompt/listing colors, icons and keyboard focus',async({page,request})=>{
+test('manual, large terminal, the dock, prompt/listing colors, icons and keyboard focus',async({page,request})=>{
  await page.goto('/');
  await expect(page.getByRole('combobox')).toHaveCSS('font-size','20px');
  await expect(page.locator('.transcript')).toHaveCSS('scrollbar-width','none');
  for(const width of [1440,390]){
   await page.setViewportSize({width,height:1000});
-  for(let i=0;i<2;i++){
-   const toggle=page.getByRole('button',{name:'Toggle file panel'});await toggle.click();await expect(page.getByRole('region',{name:'File manager',exact:true})).toBeHidden();await expect(page.getByRole('region',{name:'Terminal',exact:true})).toBeVisible();
-   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
-   await toggle.click();await expect(page.getByRole('region',{name:'File manager',exact:true})).toBeVisible();
-   // Phones keep the files above the terminal: no side-by-side switch there.
-   const layout=page.getByRole('button',{name:'Toggle workspace layout'});if(width>650)await layout.click();else await expect(layout).toBeHidden();
-  }
+  // The dock focuses a window, minimizes the focused one, and brings it back.
+  const files=page.getByRole('region',{name:'File manager',exact:true}),terminal=page.getByRole('region',{name:'Terminal',exact:true}),dock=name=>page.getByRole('navigation',{name:'Dock'}).getByRole('button',{name,exact:true});
+  await dock('Files').click();await expect(files).toBeVisible();await expect(dock('Files')).toHaveAttribute('aria-pressed','true');
+  await dock('Files').click();await expect(files).toBeHidden();await expect(terminal).toBeVisible();
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+  await dock('Files').click();await expect(files).toBeVisible();
+  // A phone shows one window at a time.
+  if(width<=650)await expect(terminal).toBeHidden();else await expect(terminal).toBeVisible();
+  await dock('Terminal').click();await expect(terminal).toBeVisible();
  }
  // A phone shows the terminal as an app: the command line on the screen, the account on one line.
  const box=await page.getByRole('combobox').boundingBox();expect(box.y+box.height).toBeLessThanOrEqual(1000);
@@ -39,7 +41,7 @@ test('manual, large terminal, collapsible layouts, prompt/listing colors, icons 
  await expect(page.locator('.manual h2')).toHaveText(['Options','Permissions','Examples','See also']);await expect(page.locator('.manual table td').first()).toHaveText('-R, --recursive');
  const before=await page.getByRole('combobox').inputValue();await page.keyboard.type('xyz');expect(await page.getByRole('combobox').inputValue()).toBe(before);
  await page.getByRole('button',{name:'Close preview'}).click();
- await page.locator('h1').first().click();await page.keyboard.type('pwd');await expect(page.getByRole('combobox')).toHaveValue('pwd');await page.keyboard.press('Enter');await expect(page.locator('.transcript pre').last()).toHaveText('/');
+ await page.locator('.wordmark').click();await page.keyboard.type('pwd');await expect(page.getByRole('combobox')).toHaveValue('pwd');await page.keyboard.press('Enter');await expect(page.locator('.transcript pre').last()).toHaveText('/');
  await run(page,'login');await expect(page.getByLabel('Username',{exact:true})).toHaveCSS('background-color','rgb(8, 13, 10)');await page.getByLabel('Username',{exact:true}).fill('root');await page.getByLabel('Password',{exact:true}).fill(password);await page.locator('#auth button[type=submit]').click();await expect(page.locator('.lock')).toContainText('root');
  await page.screenshot({path:'test-results/workspace-desktop.png',fullPage:true});
 });

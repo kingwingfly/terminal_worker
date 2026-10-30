@@ -13,7 +13,7 @@ async function command(page, text) {
 
 test('stdout and errors scroll after DOM updates; completion uses a separate pager', async ({ page }) => {
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Your files, right here.' })).toBeVisible();
+  await expect(page.getByRole('navigation', { name: 'Dock' })).toBeVisible();
   const log = page.locator('.transcript');
   await page.route('**/api/sys', async route => { if (route.request().postData()?.includes('getdents')) await new Promise(resolve => setTimeout(resolve, 120)); await route.continue(); });
   for (const width of [1440, 390]) {

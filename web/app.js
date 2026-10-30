@@ -228,6 +228,8 @@ function followAgain(name, presentation, sound) {
 // A speaker view, which a deck's S opened (viewer.rs): it shows the deck its address names once
 // the terminal runs.
 export function started() {
+  const files = $('window-files');
+  if (files) new ResizeObserver(measureNames).observe(files);
   const deck = new URLSearchParams(location.search).get('speaker');
   if (!deck) return;
   document.title = 'Speaker view · ' + deck.split('/').pop();
@@ -282,7 +284,7 @@ async function accountCommand(args, cwd) {
     trail.length = 0; showTrail();
     viewerTitle(args[1] ? 'man · ' + args[1] : 'Terminal Worker · Manual'); $('download').hidden = true;
     const article = document.createElement('article'); article.className = 'markdown manual'; article.innerHTML = window.terminalPreview.markdown(text, '/'); $('viewer-content').replaceChildren(article);
-    if (!$('viewer').open) { opener = document.activeElement; $('viewer').showModal(); placePlayer(); }
+    if (!$('viewer').open) { opener = document.activeElement; showWindow($('viewer')); placePlayer(); }
     return {};
   }
   if (args[0] === 'vim') {
@@ -749,6 +751,9 @@ function showTrail() { $('viewer-back').hidden = !trail.length; $('viewer-back')
 async function follow(path, kind) { if (shown) trail.push(shown); return open(path, kind, true); }
 $('viewer-back').onclick = () => { const previous = trail.pop(); if (previous) void open(previous.path, previous.kind, true); };
 // The viewer's title. A path too long for the bar loses its start, not its file name: the title
+// A window of the desktop opened, the preview's or the editor's (a non-modal dialog, which the
+// compositor lays out): it has the keyboard.
+function showWindow(dialog) { dialog.show(); dialog.focus({ preventScroll: true }); }
 // overflows right to left (style.css), and <bdi> keeps the path's own order.
 function viewerTitle(text) { const title = document.createElement('bdi'); title.textContent = text; $('viewer-title').replaceChildren(title); }
 async function cleanupViewer() {
@@ -784,14 +789,16 @@ async function closeViewer() {
   if (version === viewerVersion) $('viewer').close();
 }
 $('viewer').addEventListener('cancel', event => { event.preventDefault(); void closeViewer(); });
-// Escape closes a dialog, and nothing else. Left to the browser, Safari also leaves its full-screen
-// window, so the page takes the key and asks the dialog to cancel, which each one handles as its
-// own Escape (the viewer closes, the editor asks about unsaved changes). Keys handled inside a
-// dialog first, as the preview search's and the editor's, are left alone.
+// Escape closes a modal dialog (a password asked), or else the window that has the keyboard (the
+// preview, the editor: windows of the desktop, crates/frontend/src/desktop.rs), and nothing else.
+// Left to the browser, Safari also leaves its full-screen window, so the page takes the key and
+// asks the dialog to cancel, which each one handles as its own Escape (the viewer closes, the
+// editor asks about unsaved changes). Keys handled inside a dialog first, as the preview search's
+// and the editor's, are left alone.
 document.addEventListener('keydown', event => {
   // A preview shown full screen leaves that first, as the browser does with Escape.
   if (event.key !== 'Escape' || event.defaultPrevented || event.isComposing || document.fullscreenElement) return;
-  const dialog = document.querySelector('dialog[open]');
+  const dialog = document.querySelector('dialog[open]:modal') ?? document.activeElement?.closest?.('dialog[open]');
   if (!dialog) return;
   event.preventDefault();
   if (dialog.dispatchEvent(new Event('cancel', { cancelable: true }))) dialog.close();
@@ -864,7 +871,7 @@ async function open(path, kind, followed = false, attending = false) {
   const content = $('viewer-content'), dialog = $('viewer');
   $('download').hidden = false;
   viewerTitle(path); $('download').href = fileUrl(path); $('download').download = path.split('/').pop();
-  if (!dialog.open) { opener = document.activeElement; dialog.showModal(); placePlayer(); }
+  if (!dialog.open) { opener = document.activeElement; showWindow(dialog); placePlayer(); }
   content.textContent = 'Loading...';
   try {
     if (kind === 'game') {
@@ -927,7 +934,7 @@ if (window.visualViewport) {
 window.terminal = { config: () => configuration.branding, exec, open, follow, place, setPlace, present, presentFile: (path, name) => dev.present(path, name ?? undefined), stopPresenting: name => dev.stop(`${dev.PRESENT}/${name}`).then(() => ({ device: `${dev.PRESENT}/${name}` })), presented: path => heard.get(path) ?? null, ask, recordSound, stopRecording, barOf, togglePresenting, goLive, askToSpeak, answerAsk, endVoice, attending: path => following?.path === path ? following : null, unlock, sudo: sudoAuthenticate, chooseFiles, cancelChoosing, uploadFiles, cancelUploads, accountCommand, completionFocus: (value, insideQuote) => {
   requestAnimationFrame(() => {
     const input = $('command');
-    if (input?.value !== value || document.querySelector('dialog[open]')) return;
+    if (input?.value !== value || document.querySelector('dialog[open]:modal')) return;
     // Text selected since (the line chosen whole, to type over) is the typist's: the caret stays.
     if (document.activeElement === input && input.selectionStart !== input.selectionEnd) return;
     input.focus({ preventScroll: true });
@@ -946,8 +953,8 @@ window.terminal = { config: () => configuration.branding, exec, open, follow, pl
 } };
 
 // A file name keeps to one line; one that does not fit slides to show the rest (style.css). Each
-// gets how far it overflows, measured as the list changes, a pane is shown or hidden, or the
-// window resizes.
+// gets how far it overflows, measured as the list changes, and as the Files window is shown,
+// hidden or resized (started()).
 let namesFrame;
 function measureNames() {
   cancelAnimationFrame(namesFrame);
@@ -962,17 +969,20 @@ function measureNames() {
     }
   });
 }
-new MutationObserver(changes => { if (changes.some(change => change.target.closest?.('.files') || change.attributeName)) measureNames(); })
-  .observe($('app'), { childList: true, subtree: true, characterData: true, attributeFilter: ['data-files', 'data-terminal', 'data-layout'] });
-window.addEventListener('resize', measureNames);
+new MutationObserver(changes => { if (changes.some(change => change.target.closest?.('.files'))) measureNames(); })
+  .observe($('app'), { childList: true, subtree: true, characterData: true });
 
 // Dialog focus restoration and Leptos updates may finish after the command promise.
 // Wait for the browser's next layout; never steal focus from another open modal.
 let resetTerminalFocus = false;
+// The window up (crates/frontend/src/desktop.rs), if not the terminal: the keyboard is its.
+const otherWindow = () => document.querySelector('.window-focused:not(#window-terminal)');
 function restoreTerminalFocus() {
   requestAnimationFrame(() => {
     const input = $('command');
-    if (document.querySelector('dialog[open]') || !['↵', 'Answer ↵'].includes(input?.closest('form')?.querySelector('.busy')?.textContent)) return;
+    // Not while a password is asked, nor from another window that has the keyboard (the Files,
+    // the preview, the editor), nor while a command runs.
+    if (document.querySelector('dialog[open]:modal') || otherWindow() || document.activeElement?.closest?.('dialog[open], .window:not(#window-terminal)') || !['↵', 'Answer ↵'].includes(input?.closest('form')?.querySelector('.busy')?.textContent)) return;
     // After closing a modal Chromium can report this input as active while its
     // native text-editing focus still belongs to the closed dialog. Reacquire it.
     if (resetTerminalFocus && document.activeElement === input) input.blur();
@@ -985,10 +995,15 @@ for (const id of ['auth', 'editor']) {
 }
 
 // Redirect ordinary typing only when the surrounding shell is idle. Preserve
-// selection, shortcuts, button activation, IME and every modal/editor input.
+// selection, shortcuts, button activation, IME and every modal/editor input; what is typed in
+// another window is that window's.
 document.addEventListener('keydown', event => {
-  if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey || document.querySelector('dialog[open]')) return;
+  if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey || event.altKey || document.querySelector('dialog[open]:modal') || event.target?.closest?.('dialog[open], .window:not(#window-terminal)')) return;
   const target = event.target;
+  // Another window up, whose focus fell to the page as what had it went (a box closed, a mode
+  // changed): the key is its, and so is the focus again.
+  const up = otherWindow();
+  if (up) { if (!up.contains(document.activeElement)) up.focus({ preventScroll: true }); return; }
   if (!(target instanceof Element) || (target.closest('input,textarea,select,[contenteditable="true"]') && target.getClientRects().length) || window.getSelection()?.toString()) return;
   if (target.closest('button,a') && ['Enter', ' ', 'Tab'].includes(event.key)) return;
   const input = $('command'); if (!input || !['↵', 'Answer ↵'].includes(input.closest('form')?.querySelector('.busy')?.textContent)) return;
@@ -1003,5 +1018,5 @@ document.addEventListener('keydown', event => {
   }
 });
 document.addEventListener('click', event => {
-  if (!document.querySelector('dialog[open]') && !window.getSelection()?.toString() && event.target instanceof Element && event.target.closest('.terminal-panel') && !event.target.closest('button,a,input,textarea,select,[contenteditable="true"]')) $('command')?.focus({preventScroll:true});
+  if (!document.querySelector('dialog[open]:modal') && !window.getSelection()?.toString() && event.target instanceof Element && event.target.closest('.terminal-panel') && !event.target.closest('button,a,input,textarea,select,[contenteditable="true"]')) $('command')?.focus({preventScroll:true});
 });

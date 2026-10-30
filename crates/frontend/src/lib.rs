@@ -1,3 +1,4 @@
+mod desktop;
 mod manual;
 mod preview;
 mod search;
@@ -316,18 +317,9 @@ fn App() -> impl IntoView {
     let subtitle = branding["subtitle"].as_str().unwrap_or("").to_owned();
     let heading = branding["heading"].as_str().unwrap_or("").to_owned();
     let description = branding["description"].as_str().unwrap_or("").to_owned();
-    let layout = RwSignal::new(None::<bool>);
-    let files_visible = RwSignal::new(true);
-    let terminal_visible = RwSignal::new(true);
-    // Either pane may be hidden, never both: hiding one shows the other.
-    let toggle = move |this: RwSignal<bool>, other: RwSignal<bool>| {
-        if this.get_untracked() {
-            this.set(false);
-            other.set(true);
-        } else {
-            this.set(true);
-        }
-    };
+    // The compositor: the Files, the Terminal, the preview and the editor are its windows.
+    let desktop = desktop::Desktop::new();
+    let launcher = RwSignal::new(false);
     let account = Account {
         writable: RwSignal::new(false),
         username: RwSignal::new("guest".into()),
@@ -488,9 +480,10 @@ fn App() -> impl IntoView {
             if !e.alt_key() || e.ctrl_key() || e.meta_key() || e.is_composing() {
                 return;
             }
+            // A modal dialog (a password asked) has the keyboard; windows do not.
             let dialog = web_sys::window()
                 .and_then(|w| w.document())
-                .and_then(|d| d.query_selector("dialog[open]").ok().flatten());
+                .and_then(|d| d.query_selector("dialog[open]:modal").ok().flatten());
             if dialog.is_some() {
                 return;
             }
@@ -518,36 +511,45 @@ fn App() -> impl IntoView {
         .unwrap();
     keys.forget();
     let numbered = move || tabs.get().into_iter().enumerate().collect::<Vec<_>>();
+    // The dock: the launcher, then each app, shown, focused, or to be opened.
+    let dock_item = move |id: &'static str, title: &'static str, icon: &'static str| {
+        let shown = move || {
+            desktop
+                .windows
+                .with(|w| w.iter().any(|w| w.id == id && w.shown()))
+        };
+        let open = move || {
+            desktop
+                .windows
+                .with(|w| w.iter().any(|w| w.id == id && w.open))
+        };
+        let focused = move || desktop.focused.get() == Some(id) && shown();
+        view! {
+            <button type="button" class="dock-item" class:dock-open=open class:dock-focused=focused
+                aria-label=title title=title aria-pressed=move || focused().to_string()
+                on:click=move |_| desktop.toggle(id)>
+                <span class="dock-icon" aria-hidden="true">{icon}</span><span class="dock-label">{title}</span>
+            </button>
+        }
+    };
+    let launch = move |id: &'static str| {
+        launcher.set(false);
+        desktop.show(id);
+    };
     view! {
-        <main class="terminal-shell">
-            <header><div class="wordmark"><span class="signal"></span>{title}<span class="subtitle">{subtitle}</span></div>
+        <main class="desktop">
+            <header class="topbar"><div class="wordmark"><span class="signal"></span>{title}<span class="subtitle">{subtitle}</span></div>
                 <button class="lock" on:click=move |_| current.get_untracked().run(if account.writable.get_untracked() { "logout".into() } else { "login".into() })>
                     // Kept to one line: a long name shortens, the action stays.
                     <span class="lock-name">{move || if account.writable.get() { format!("● {}", account.username.get()) } else { "○ guest".into() }}</span>
                     <span class="lock-action">{move || if account.writable.get() { " · Sign out" } else { " · Sign in" }}</span>
                 </button>
             </header>
-            <section class="intro"><span class="eyebrow">"PUBLIC ARCHIVE / 001"</span><h1>{heading}</h1><p>{description}</p></section>
-            <section class="workspace" aria-label="File terminal"
-                data-files=move || if files_visible.get() { "visible" } else { "hidden" }
-                data-terminal=move || if terminal_visible.get() { "visible" } else { "hidden" }
-                data-layout=move || match layout.get() { Some(true) => "columns", Some(false) => "rows", None => "auto" }>
-                <div class="workspace-toolbar"><div class="pane-toggles">
-                    <button class="files-toggle" aria-label="Toggle file panel" aria-expanded=move || files_visible.get().to_string() on:click=move |_| toggle(files_visible, terminal_visible)>{move || if files_visible.get() { "◂ Hide files" } else { "▸ Show files" }}</button>
-                    <button class="terminal-toggle" aria-label="Toggle terminal" aria-expanded=move || terminal_visible.get().to_string() on:click=move |_| toggle(terminal_visible, files_visible)>{move || if terminal_visible.get() { "◂ Hide terminal" } else { "▸ Show terminal" }}</button>
-                </div>
-                    <button class="layout-toggle" aria-label="Toggle workspace layout" title="Toggle workspace layout"
-                        on:click=move |_| {
-                            let horizontal = layout.get_untracked().unwrap_or_else(|| {
-                                web_sys::window().and_then(|w| w.inner_width().ok()).and_then(|v| v.as_f64()).unwrap_or(0.0) >= 900.0
-                            });
-                            layout.set(Some(!horizontal));
-                        }>
-                        <span class="layout-to-rows">"▤ Stacked layout"</span>
-                        <span class="layout-to-columns">"◫ Side-by-side layout"</span>
-                    </button>
-                </div>
-                <div class="workspace-panes">
+            <div class="desktop-area">
+            // The wallpaper: what the site says of itself.
+            <section class="intro wallpaper"><span class="eyebrow">"PUBLIC ARCHIVE / 001"</span><h1>{heading}</h1><p>{description}</p></section>
+            <section class="window" id="window-files" data-window="files" aria-label="Files window" tabindex="-1">
+                <div class="window-bar" data-window-bar><span class="window-title">{file_icon("directory", true)}"Files"</span>{desktop::controls("files", "Files")}</div>
                 <section class="file-panel" aria-label="File manager">
                 <div class="directory-bar"><span>{move || current.get().cwd.get()}</span>
                     <button on:click=move |_| current.get_untracked().run_from_panel("upload".into())>"↑ Upload files"</button></div>
@@ -569,6 +571,10 @@ fn App() -> impl IntoView {
                     <Show when=move || current.get().entries.get().is_empty() && current.get().directory_error.get().is_empty()><p class="empty">"This directory is empty. Drop files here or use mkdir to create a directory."</p></Show>
                 </div>
                 </section>
+                {desktop::handles()}
+            </section>
+            <section class="window" id="window-terminal" data-window="terminal" aria-label="Terminal window">
+                <div class="window-bar" data-window-bar><span class="window-title"><span class="window-glyph" aria-hidden="true">">_"</span>{move || format!("Terminal · {}", current.get().cwd.get())}</span>{desktop::controls("terminal", "Terminal")}</div>
                 <div class="terminal-tabs">
                     <div class="tab-bar" role="tablist" aria-label="Terminal tabs">
                         <For each=numbered key=|(index, shell)| (*index, shell.id) let:item>
@@ -593,9 +599,26 @@ fn App() -> impl IntoView {
                         {terminal_view(shell, active)}
                     </For>
                 </div>
-                </div>
+                {desktop::handles()}
             </section>
-            <footer><span>"TAB / SHIFT+TAB complete   ↑↓ history   | pipes   ALT+T new tab   Drop files to upload"</span><span>"ACCESS: USER / GROUP / OTHER"</span></footer>
+            </div>
+            <nav class="dock" aria-label="Dock">
+                <button type="button" class="dock-item dock-launcher" aria-label="Applications" title="Applications" aria-expanded=move || launcher.get().to_string() on:click=move |_| launcher.update(|open| *open = !*open)>
+                    <span class="dock-icon" aria-hidden="true">"⋮⋮"</span>
+                </button>
+                {dock_item("terminal", "Terminal", ">_")}
+                {dock_item("files", "Files", "▤")}
+                <Show when=move || desktop.windows.with(|w| w.iter().any(|w| w.id == "viewer" && w.open))>{dock_item("viewer", "Preview", "◫")}</Show>
+                <Show when=move || desktop.windows.with(|w| w.iter().any(|w| w.id == "editor" && w.open))>{dock_item("editor", "Editor", "✎")}</Show>
+                <Show when=move || launcher.get()>
+                    <div class="launcher" role="menu" aria-label="Applications">
+                        <button type="button" role="menuitem" on:click=move |_| launch("terminal")><span aria-hidden="true">">_"</span>"Terminal"</button>
+                        <button type="button" role="menuitem" on:click=move |_| launch("files")><span aria-hidden="true">"▤"</span>"Files"</button>
+                        <button type="button" role="menuitem" on:click=move |_| { launcher.set(false); current.get_untracked().run("man".into()); }><span aria-hidden="true">"?"</span>"Manual"</button>
+                        <button type="button" role="menuitem" on:click=move |_| { launcher.set(false); desktop.show("terminal"); current.get_untracked().run("upload".into()); }><span aria-hidden="true">"↑"</span>"Upload files"</button>
+                    </div>
+                </Show>
+            </nav>
         </main>
     }
 }
@@ -613,5 +636,8 @@ pub fn start() {
         .unwrap();
     root.set_text_content(None);
     leptos::mount::mount_to(root.unchecked_into(), App).forget();
+    if let Some(desktop) = desktop::desktop() {
+        desktop::run(desktop);
+    }
     focus_input();
 }

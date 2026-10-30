@@ -47,7 +47,7 @@ async function complete(input, text, expected) {
 test('terminal, password modal, upload, sanitized Markdown, slides and media', async ({ page }) => {
   const errors = []; page.on('pageerror', e => errors.push(e.message));
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: 'Your files, right here.' })).toBeVisible();
+  await expect(page.getByRole('navigation', { name: 'Dock' })).toBeVisible();
   await expect(page.locator('.loading')).toHaveCount(0);
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   await input.fill('hel'); await input.press('Tab'); await expect(input).toHaveValue('help ');
