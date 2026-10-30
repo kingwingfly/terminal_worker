@@ -99,8 +99,12 @@ impl DurableObject for TerminalAuthority {
                         db.add_lines(&id, &[(true, why.into())]);
                         jobs::finish(db, &id, "cancelled");
                     }
-                    // A session not heard from for long watches nothing any more.
-                    ("watches", _, _) => db.drop_watches(&id),
+                    // A session not heard from for long watches nothing any more, and once it
+                    // keeps no descriptor, its numbers start again.
+                    ("watches", _, _) => {
+                        db.drop_watches(&id);
+                        db.forget_fd_numbers(&id);
+                    }
                     // A descriptor not kept for long is closed; what it wrote waits, unfinished,
                     // for a writer to go on with it.
                     ("fd", _, _) => {

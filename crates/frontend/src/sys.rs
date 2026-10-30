@@ -218,7 +218,14 @@ impl userland::Sys for HttpSys {
                 sending.push((index, call));
             }
         });
-        watching.truncate(BATCH_MAX.saturating_sub(sending.len() + unwatched.len()));
+        // Watches to drop and to add go along with the calls, as many as the batch has room
+        // for; the drops left wait for the next.
+        let room = BATCH_MAX.saturating_sub(sending.len());
+        if unwatched.len() > room {
+            let rest = unwatched.split_off(room);
+            CACHE.with(|cache| cache.borrow_mut().unwatched.extend(rest));
+        }
+        watching.truncate(room.saturating_sub(unwatched.len()));
         let mut outgoing: Vec<Call> = sending.iter().map(|(_, call)| call.clone()).collect();
         outgoing.extend(watching.iter().map(|dir| Call::InotifyAddWatch {
             path: dir.clone(),
@@ -233,12 +240,19 @@ impl userland::Sys for HttpSys {
         } else {
             self.send(outgoing).await
         };
-        let watched: Vec<Result<Value, Error>> = results.drain(sending.len()..).collect();
+        let mut watched: Vec<Result<Value, Error>> = results.drain(sending.len()..).collect();
+        let dropped = watched.split_off(watching.len().min(watched.len()));
         CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             for (dir, watch) in watching.iter().zip(watched) {
                 if let Some(wd) = watch.ok().and_then(|wd| wd.as_u64()) {
                     cache.watch(dir, wd as u32);
+                }
+            }
+            // A drop the batch could not carry is made with the next.
+            for (wd, result) in unwatched.iter().zip(dropped) {
+                if result.is_err_and(|error| error.errno == Errno::EIO) {
+                    cache.unwatched.push(*wd);
                 }
             }
             for ((index, call), result) in sending.into_iter().zip(results) {

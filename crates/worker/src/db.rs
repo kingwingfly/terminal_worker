@@ -34,7 +34,7 @@ const ROLLBACK: &str = "rollback";
 /// The version of the tables below, which local state made by an older one does not have.
 pub const SCHEMA_VERSION: &str = "3";
 
-const SCHEMA: [&str; 28] = [
+const SCHEMA: [&str; 29] = [
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, gid INTEGER NOT NULL, groups TEXT NOT NULL, home TEXT NOT NULL, locked INTEGER NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS unix_groups(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)",
@@ -59,7 +59,10 @@ const SCHEMA: [&str; 28] = [
     // File descriptors (fds.rs): a session's (each browser is one), by number; the content it
     // reads or writes (none once another writer took it over), where, its open(2) flags,
     // whether it made the file, and when it was last kept (its lease).
-    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, token TEXT, PRIMARY KEY(sid, fd))",
+    "CREATE TABLE IF NOT EXISTS fds(sid TEXT NOT NULL, fd INTEGER NOT NULL, file TEXT, device TEXT, path TEXT NOT NULL, flags INTEGER NOT NULL, created INTEGER NOT NULL, leased INTEGER NOT NULL, token TEXT, root INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(sid, fd))",
+    // The next descriptor number of each session: numbers are not given again, as a session's
+    // pages share its descriptors, and one may go on using a number another closed.
+    "CREATE TABLE IF NOT EXISTS fd_numbers(sid TEXT PRIMARY KEY, next INTEGER NOT NULL)",
     // A read descriptor's token: what the Worker reads its file by without asking each time.
     "CREATE INDEX IF NOT EXISTS fds_token ON fds(token)",
     "CREATE INDEX IF NOT EXISTS fds_device ON fds(device)",
@@ -229,6 +232,13 @@ pub fn create(sql: &SqlStorage) -> Result<()> {
     if sql.exec("SELECT token FROM fds LIMIT 0", None).is_err() {
         sql.exec("ALTER TABLE fds ADD COLUMN token TEXT", None)?;
         sql.exec("CREATE INDEX IF NOT EXISTS fds_token ON fds(token)", None)?;
+    }
+    // Descriptors made before they said as whom they were opened were not opened as root.
+    if sql.exec("SELECT root FROM fds LIMIT 0", None).is_err() {
+        sql.exec(
+            "ALTER TABLE fds ADD COLUMN root INTEGER NOT NULL DEFAULT 0",
+            None,
+        )?;
     }
     // Tables made just now are this version's, said at once: initialization may fail (a
     // missing ADMIN_PASSWORD), and the next start must not take them for an older version's.
@@ -442,6 +452,10 @@ pub struct Fd {
     pub flags: u32,
     #[serde(deserialize_with = "flag")]
     pub created: bool,
+    /// Whether it was opened as root (or under sudo): what it reads and writes, it does as root,
+    /// as a descriptor keeps the access it was opened with.
+    #[serde(deserialize_with = "flag", default)]
+    pub root: bool,
 }
 impl Fd {
     pub fn writes(&self) -> bool {
@@ -616,7 +630,7 @@ impl Db {
     /// The descriptor `fd` of the session `sid`.
     pub fn fd(&self, sid: &str, fd: u32) -> Option<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased FROM fds WHERE sid = ? AND fd = ?",
+            "SELECT fd, file, device, path, flags, created, leased, root FROM fds WHERE sid = ? AND fd = ?",
             vec![text(sid), int(fd)],
         )
         .pop()
@@ -624,14 +638,14 @@ impl Db {
     /// The descriptors of the session `sid`.
     pub fn fds_of(&self, sid: &str) -> Vec<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased FROM fds WHERE sid = ? ORDER BY fd",
+            "SELECT fd, file, device, path, flags, created, leased, root FROM fds WHERE sid = ? ORDER BY fd",
             vec![text(sid)],
         )
     }
     /// The descriptor writing `file`, if one is.
     pub fn writer(&self, file: &str) -> Option<Fd> {
         self.rows(
-            "SELECT fd, file, device, path, flags, created, leased FROM fds WHERE file = ? AND flags & 3 != 0",
+            "SELECT fd, file, device, path, flags, created, leased, root FROM fds WHERE file = ? AND flags & 3 != 0",
             vec![text(file)],
         )
         .pop()
@@ -709,8 +723,17 @@ impl Db {
         .collect()
     }
     /// Forget every watch of `sid`, a session not heard from for long.
+    /// Forget what the session `sid` watches, and when it would have: it is not heard from.
     pub fn drop_watches(&mut self, sid: &str) {
         self.run("DELETE FROM watches WHERE sid = ?", vec![text(sid)]);
+        self.clear_expiry("watches", sid);
+    }
+    /// Forget the next descriptor number of the session `sid`, once it has none open.
+    pub fn forget_fd_numbers(&mut self, sid: &str) {
+        self.run(
+            "DELETE FROM fd_numbers WHERE sid = ?1 AND NOT EXISTS (SELECT 1 FROM fds WHERE sid = ?1)",
+            vec![text(sid)],
+        );
     }
     /// Keep every descriptor of the session `sid`, as of `now`.
     pub fn lease_fds(&mut self, sid: &str, now: u64) {
@@ -719,8 +742,9 @@ impl Db {
             vec![int(now), text(sid)],
         );
     }
-    /// A new descriptor of the session `sid`, the lowest number free from 3, as open(2) gives
-    /// the lowest; it is kept from `now`.
+    /// A new descriptor of the session `sid`, numbered from 3 on, each number given once: a
+    /// session's pages share its descriptors, so a page may still use a number another page
+    /// closed, which must then name nothing rather than another file. It is kept from `now`.
     pub fn add_fd(
         &mut self,
         sid: &str,
@@ -730,8 +754,20 @@ impl Db {
         created: bool,
         now: u64,
     ) -> u32 {
+        #[derive(Deserialize)]
+        struct Next {
+            next: u32,
+        }
         let taken: BTreeSet<u32> = self.fds_of(sid).into_iter().map(|fd| fd.fd).collect();
-        let fd = (3..).find(|n| !taken.contains(n)).unwrap_or(3);
+        let next = self
+            .rows::<Next>("SELECT next FROM fd_numbers WHERE sid = ?", vec![text(sid)])
+            .pop()
+            .map_or(3, |n| n.next);
+        let fd = (next.max(3)..).find(|n| !taken.contains(n)).unwrap_or(next);
+        self.run(
+            "INSERT INTO fd_numbers(sid, next) VALUES(?, ?) ON CONFLICT(sid) DO UPDATE SET next = excluded.next",
+            vec![text(sid), int(fd.saturating_add(1))],
+        );
         self.run(
             "INSERT INTO fds(sid, fd, file, path, flags, created, leased) VALUES(?, ?, ?, ?, ?, ?, ?)",
             vec![
@@ -745,6 +781,13 @@ impl Db {
             ],
         );
         fd
+    }
+    /// Say the descriptor `fd` of `sid` was opened as root.
+    pub fn set_fd_root(&mut self, sid: &str, fd: u32) {
+        self.run(
+            "UPDATE fds SET root = 1 WHERE sid = ? AND fd = ?",
+            vec![text(sid), int(fd)],
+        );
     }
     /// Give the read descriptor `fd` of `sid` the token `token`.
     pub fn set_fd_token(&mut self, sid: &str, fd: u32, token: &str) {
@@ -822,6 +865,7 @@ impl Db {
             for fd in self.fds_of(&session.key) {
                 self.close_fd(&session.key, fd.fd);
             }
+            self.forget_fd_numbers(&session.key);
         }
         if !ended.is_empty() {
             ENDED.set(true);

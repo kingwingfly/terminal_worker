@@ -119,3 +119,14 @@ test('a page not isolated runs a pipeline one process after another, and nothing
   await run(page, 'tr a-z A-Z');
   await expect(last(page)).toHaveText(/tr a-z A-Z$/);
 });
+
+test('a process reads one file after another; cp copies what the kernel makes, reading it', async ({ page }) => {
+  await ready(page);
+  await run(page, 'coreutils md5sum /etc/passwd /etc/group');
+  await expect(last(page)).toHaveText(/^[0-9a-f]{32}  \/etc\/passwd\n[0-9a-f]{32}  \/etc\/group$/);
+  const copy = '/tmp/passwd-' + Date.now().toString(36);
+  await run(page, `cp /etc/passwd ${copy}`);
+  await run(page, `cat ${copy}`);
+  await expect(last(page)).toContainText('root:x:0:0');
+  await run(page, `rm ${copy}`);
+});

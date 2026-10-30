@@ -291,6 +291,24 @@ fn inputs(
 }
 
 /// Start the archive job `command` asks for, as `who`; it is the reply's `job`.
+/// Refuse to write `path`, as `who` resolves it (its directory, if it is not there yet), if it is
+/// the image's (/usr), read-only, as the kernel's calls refuse with EROFS (sys.rs).
+fn read_only(db: &Db, who: &Identity, cmd: &str, path: &str) -> Result<(), String> {
+    let real = kernel::namei(db, who, path, true)
+        .map(|name| name.path)
+        .or_else(|_| {
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+            let parent = if parent.is_empty() { "/" } else { parent };
+            kernel::namei(db, who, parent, true)
+                .map(|dir| format!("{}/{name}", dir.path.trim_end_matches('/')))
+        })
+        .unwrap_or_else(|_| path.to_string());
+    if crate::usr::is(&real) {
+        return Err(format!("{cmd}: {path}: Read-only file system"));
+    }
+    Ok(())
+}
+
 pub fn start(
     db: &mut Db,
     who: &Identity,
@@ -331,6 +349,7 @@ pub fn start(
             // Only where `who` may look is it told what is there.
             db.traverse(who, &output)
                 .map_err(|e| format!("{cmd}: {e}"))?;
+            read_only(db, who, cmd, &output)?;
             match db.node(&output) {
                 Some(node) if node.directory => {
                     return Err(format!("{cmd}: {output} is a directory"));
@@ -379,6 +398,7 @@ pub fn start(
             {
                 return Err(format!("{cmd}: {e}"));
             }
+            read_only(db, who, cmd, &dest)?;
             match db.node(&dest) {
                 Some(node) if node.directory => {
                     db.access(who, &dest, WRITE | EXEC)
@@ -404,6 +424,7 @@ pub fn start(
         // keeps its owner, mode, ACLs and other names, and shows its old content until done.
         Command::Faststart { file } => {
             let target = path(db, file)?;
+            read_only(db, who, cmd, &target)?;
             let found = source(db, who, cmd, &target)?;
             let node = db
                 .access(who, &target, READ | WRITE)

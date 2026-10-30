@@ -29,6 +29,15 @@ pub fn asset(content: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+/// How many bytes the binary `content` is.
+pub fn size(content: &str) -> u64 {
+    let (coreutils, terminal) = SIZES.with(Cell::get);
+    match content {
+        COREUTILS => coreutils,
+        TERMINAL => terminal,
+        _ => 0,
+    }
+}
 /// What the build says of the binaries: their sizes (scripts/build.mjs).
 pub const MANIFEST: &str = "/usr/manifest.json";
 /// The shell's builtins, which no file is.
@@ -52,9 +61,9 @@ thread_local! {
     static PROGRAMS: RefCell<Vec<Program>> = const { RefCell::new(Vec::new()) };
 }
 
-/// /usr/bin, by name: the terminal's programs, coreutils, and links to it of the utilities
-/// the terminal has no program of its own for.
-fn programs() -> Vec<Program> {
+/// `f` of /usr/bin, by name: the terminal's programs, coreutils, and links to it of the
+/// utilities the terminal has no program of its own for.
+fn with_programs<R>(f: impl FnOnce(&[Program]) -> R) -> R {
     PROGRAMS.with(|programs| {
         let mut programs = programs.borrow_mut();
         if programs.is_empty() {
@@ -86,7 +95,7 @@ fn programs() -> Vec<Program> {
             all.sort_by(|a, b| a.name.cmp(&b.name));
             *programs = all;
         }
-        programs.clone()
+        f(&programs)
     })
 }
 
@@ -119,7 +128,9 @@ const TREE: &[(&str, Option<&str>)] = &[
 /// Whether `path`, as the kernel resolved it, is the image's: /usr and what is in it, and its
 /// names in /.
 pub fn is(path: &str) -> bool {
-    path.starts_with("/usr/") || TREE.iter().any(|(name, _)| *name == path)
+    path.starts_with("/usr/")
+        || path.starts_with("/sys/")
+        || TREE.iter().any(|(name, _)| *name == path)
 }
 
 /// The node at `path`, if it is the image's.
@@ -149,10 +160,12 @@ pub fn node(path: &str) -> Option<Node> {
     }
     // A program of /usr/bin: a file of a binary, or a link to coreutils.
     let name = path.strip_prefix("/usr/bin/")?;
-    let programs = programs();
-    let at = programs.iter().position(|program| program.name == name)?;
+    let (at, content) = with_programs(|programs| {
+        let at = programs.iter().position(|program| program.name == name)?;
+        Some((at, programs[at].content))
+    })?;
     let (coreutils, terminal) = SIZES.with(Cell::get);
-    let node = match programs[at].content {
+    let node = match content {
         Some(content) => {
             let mode = if SETUID.contains(&name) {
                 0o4755
@@ -187,10 +200,12 @@ pub fn children(path: &str) -> Option<Vec<(String, Node)>> {
             .filter(|(name, _)| terminal_worker_core::parent(name) == path)
             .map(|(name, _)| name.to_string())
             .collect(),
-        "/usr/bin" => programs()
-            .into_iter()
-            .map(|program| format!("/usr/bin/{}", program.name))
-            .collect(),
+        "/usr/bin" => with_programs(|programs| {
+            programs
+                .iter()
+                .map(|program| format!("/usr/bin/{}", program.name))
+                .collect()
+        }),
         _ if TREE
             .iter()
             .any(|(name, link)| *name == path && link.is_none()) =>
@@ -209,8 +224,11 @@ pub fn children(path: &str) -> Option<Vec<(String, Node)>> {
 
 /// The times of the image's inode `ino`: when it was mounted.
 pub fn times(ino: u64) -> Option<kernel::Times> {
+    if ino < INO {
+        return None;
+    }
     let at = MOUNTED.with(Cell::get);
-    (ino >= INO && ino < INO + (TREE.len() + programs().len()) as u64).then_some(kernel::Times {
+    (ino < INO + (TREE.len() + with_programs(<[Program]>::len)) as u64).then_some(kernel::Times {
         atime: at,
         mtime: at,
         ctime: at,
@@ -224,7 +242,7 @@ pub fn statfs() -> abi::StatFs {
     abi::StatFs {
         bsize: 4096,
         blocks,
-        files: (TREE.len() + programs().len()) as u64,
+        files: (TREE.len() + with_programs(<[Program]>::len)) as u64,
         namelen: abi::NAME_MAX as u64,
         ..abi::StatFs::default()
     }

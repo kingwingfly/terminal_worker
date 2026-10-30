@@ -43,7 +43,15 @@ pub fn call(db: &mut Db, sid: Option<&str>, process: &Process, call: Call) -> Re
             size,
             sha256,
             version,
-        } => open(db, sid, process, &path, flags, mode, size, sha256, version).map(|o| json!(o)),
+        } => {
+            let opened = open(db, sid, process, &path, flags, mode, size, sha256, version)?;
+            // What it reads and writes later, apart from this call (the Worker's streams), it
+            // does as it was opened: as root, under sudo.
+            if process.cred.id == 0 {
+                db.set_fd_root(sid, opened.fd);
+            }
+            Ok(json!(opened))
+        }
         Call::Close { fd } => close(db, sid, &process.cred, fd.number()).map(|c| json!(c)),
         Call::Ioctl { fd, request, arg } => match crate::dev::request(db, sid, fd.number())? {
             Some(device) => crate::dev::ioctl(db, process, device, request, arg),
@@ -58,6 +66,16 @@ pub fn call(db: &mut Db, sid: Option<&str>, process: &Process, call: Call) -> Re
             None => Err(Errno::ENOTTY.into()),
         },
         _ => Err(Errno::ENOSYS.into()),
+    }
+}
+
+/// As whom the descriptor `found` acts, for `who`, its session's account now: root if it was
+/// opened as root, as a descriptor keeps the access it was opened with.
+fn acting(found: &crate::db::Fd, who: &Identity) -> Identity {
+    if found.root {
+        Identity::root()
+    } else {
+        who.clone()
     }
 }
 
@@ -352,7 +370,7 @@ fn close(db: &mut Db, sid: &str, who: &Identity, fd: u32) -> Result<Closed> {
             None => Err(Error::because(Errno::EBADF, ELSEWHERE)),
         };
     }
-    let closed = closing(db, who, &found);
+    let closed = closing(db, &acting(&found, who), &found);
     // A new file removed while it was written goes with its last descriptor, as an unlinked
     // file does on Linux.
     if let Some(file) = found.file.as_deref().and_then(|id| db.file(id))
@@ -379,6 +397,15 @@ fn closing(db: &mut Db, who: &Identity, found: &crate::db::Fd) -> Result<Closed>
         .file
         .clone()
         .ok_or_else(|| Error::because(Errno::EBADF, ELSEWHERE))?;
+    // A binary of /usr, or a copy sharing it: the build's, complete.
+    if crate::usr::asset(&file).is_some() {
+        return Ok(Closed {
+            path: found.path.clone(),
+            size: crate::usr::size(&file),
+            version: file,
+            created: found.created,
+        });
+    }
     let Some(file) = db.file(&file) else {
         return Err(Error::because(
             Errno::EBADF,
@@ -452,32 +479,53 @@ pub fn renew(db: &mut Db, sid: &str, now: u64) {
 /// ioctl(fd, FICLONE, source): the file `fd` writes, nothing of it written yet, takes the
 /// content `source` reads, shared, at once, as a reflink copy does.
 fn clone(db: &mut Db, sid: &str, who: &Identity, fd: u32, source: u64) -> Result<()> {
+    let source = u32::try_from(source).map_err(|_| Errno::EBADF)?;
+    // What the kernel makes as it is read (/etc/passwd, /proc, a device's state) has no content
+    // to share: a copy reads it, as cp does where it cannot clone.
+    let reading = db.fd(sid, source).ok_or(Errno::EBADF)?;
+    if reading.device.is_some()
+        || crate::procfs::is(&reading.path)
+        || crate::sys::generated(db, &reading.path).is_some()
+    {
+        return Err(Error::because(
+            Errno::EOPNOTSUPP,
+            "its content is made as it is read",
+        ));
+    }
     let (writer, target) = descriptor(db, sid, fd)?;
-    let (reader, content) = descriptor(db, sid, source as u32)?;
+    let (reader, content) = descriptor(db, sid, source)?;
     if !writer.writes() || reader.flags & O_ACCMODE == abi::O_WRONLY {
         return Err(Errno::EBADF.into());
     }
-    let content = db.file(&content).ok_or(Errno::EBADF)?;
-    if !content.complete() {
-        return Err(Error::because(
-            Errno::EBUSY,
-            format!(
-                "{} is still uploading; copy it once it completes",
-                reader.path
-            ),
-        ));
-    }
+    let who = &acting(&writer, who);
+    // A binary of /usr is the build's content, shared as any is.
+    let (content, size) = match crate::usr::asset(&content) {
+        Some(_) => (content.clone(), crate::usr::size(&content)),
+        None => {
+            let content = db.file(&content).ok_or(Errno::EBADF)?;
+            if !content.complete() {
+                return Err(Error::because(
+                    Errno::EBUSY,
+                    format!(
+                        "{} is still uploading; copy it once it completes",
+                        reader.path
+                    ),
+                ));
+            }
+            (content.id, content.size)
+        }
+    };
     let target = unfinished(db, &target)?;
     if target.recording() || !db.chunks(&target.id).is_empty() {
         return Err(Errno::EINVAL.into());
     }
     let (path, node) = writable(db, who, &target)?;
-    db.set_fd_file(sid, fd, &content.id);
+    db.set_fd_file(sid, fd, &content);
     db.set_node(
         &path,
         &Node {
-            file: Some(content.id.clone()),
-            size: content.size,
+            file: Some(content.clone()),
+            size,
             ..node
         },
     );
@@ -494,6 +542,8 @@ fn clone(db: &mut Db, sid: &str, who: &Identity, fd: u32, source: u64) -> Result
 pub enum Read {
     Bytes(Vec<u8>, u64),
     Chunks(Vec<(String, u64, u64)>, u64),
+    /// Of a binary of /usr: the Worker's asset, from an offset, so many bytes; and its size.
+    Asset(String, u64, u64, u64),
 }
 
 /// pread(2) of `count` bytes from `offset`, through the descriptor `fd` of `sid`, or of the file
@@ -509,8 +559,7 @@ pub fn pread(
 ) -> Result<Read> {
     let state = |value: Option<Value>| {
         let bytes = value.ok_or(Errno::ENXIO)?.to_string().into_bytes();
-        let size = bytes.len() as u64;
-        Ok(Read::Bytes(window(bytes, offset, count), size))
+        Ok(made(bytes, offset, count))
     };
     let content = match (fd, path) {
         (Some(fd), None) => {
@@ -523,8 +572,7 @@ pub fn pread(
                 return state(crate::dev::read(db, &process.cred, Some(sid), &found.path));
             }
             if let Some(text) = crate::sys::generated(db, &found.path) {
-                let size = text.len() as u64;
-                return Ok(Read::Bytes(window(text.into_bytes(), offset, count), size));
+                return Ok(made(text.into_bytes(), offset, count));
             }
             if found.file.is_none() && crate::procfs::is(&found.path) {
                 return proc(db, Some(sid), process, &found.path, offset, count);
@@ -546,8 +594,7 @@ pub fn pread(
                 return Err(Errno::ENOENT.into());
             };
             if let Some(text) = crate::sys::generated(db, &path) {
-                let size = text.len() as u64;
-                return Ok(Read::Bytes(window(text.into_bytes(), offset, count), size));
+                return Ok(made(text.into_bytes(), offset, count));
             }
             if node.is_device() {
                 return state(crate::dev::read(db, &process.cred, sid, &path));
@@ -561,6 +608,11 @@ pub fn pread(
             ));
         }
     };
+    if let Some(asset) = crate::usr::asset(&content) {
+        let size = crate::usr::size(&content);
+        let length = size.saturating_sub(offset).min(count);
+        return Ok(Read::Asset(asset.to_string(), offset, length, size));
+    }
     let file = db.file(&content).ok_or(Errno::EBADF)?;
     let size = db.readable(&file);
     let end = size.min(offset.saturating_add(count));
@@ -591,13 +643,20 @@ fn proc(
     count: u64,
 ) -> Result<Read> {
     let text = crate::procfs::read(db, sid, &process.cred, path)?;
-    let size = text.len() as u64;
-    Ok(Read::Bytes(window(text.into_bytes(), offset, count), size))
+    Ok(made(text.into_bytes(), offset, count))
+}
+/// pread(2) of what the kernel makes as it is read: `count` bytes of `bytes` from `offset`, and
+/// its size.
+fn made(bytes: Vec<u8>, offset: u64, count: u64) -> Read {
+    let size = bytes.len() as u64;
+    Read::Bytes(window(bytes, offset, count), size)
 }
 /// `count` bytes of `bytes` from `offset`, or fewer at its end.
 fn window(bytes: Vec<u8>, offset: u64, count: u64) -> Vec<u8> {
-    let start = (offset as usize).min(bytes.len());
-    let end = start.saturating_add(count as usize).min(bytes.len());
+    // Offsets and counts past what usize holds (wasm32's 32 bits) are past the end.
+    let start = usize::try_from(offset).map_or(bytes.len(), |offset| offset.min(bytes.len()));
+    let count = usize::try_from(count).unwrap_or(usize::MAX);
+    let end = start.saturating_add(count).min(bytes.len());
     bytes[start..end].to_vec()
 }
 
@@ -609,6 +668,7 @@ pub fn by_token(db: &mut Db, sid: Option<&str>, who: &Identity, token: &str) -> 
     if sid != Some(of.as_str()) {
         return Err(Errno::EBADF.into());
     }
+    let who = &acting(&found, who);
     let file = found
         .file
         .as_deref()
@@ -652,6 +712,7 @@ pub fn pwrite(
     if !found.writes() {
         return Err(Errno::EBADF.into());
     }
+    let who = &acting(&found, who);
     let file = unfinished(db, &file)?;
     if file.sequential() {
         if index != file.chunk_count() || !file.size.is_multiple_of(file.chunk_size) {
@@ -710,6 +771,7 @@ pub fn written(
     if !chunk_of(key, &file, index) || !found.writes() {
         return refused(db, Errno::EINVAL.into());
     }
+    let who = &acting(&found, who);
     let file = match unfinished(db, &file) {
         Ok(file) => file,
         Err(error) => return refused(db, error),

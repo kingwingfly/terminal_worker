@@ -649,6 +649,17 @@ pub async fn mv(sys: &impl Sys, io: &mut Io<'_>) -> i32 {
             status = 1;
             continue;
         }
+        // The working directory, and the directories holding it, stay: the terminal would be
+        // left in a directory no longer there.
+        let holding = format!("{}/", source.trim_end_matches('/'));
+        if io.cwd == source || io.cwd.starts_with(&holding) {
+            io.fail(format!(
+                "mv: cannot move {}: it holds the working directory; cd elsewhere first",
+                quote(typed)
+            ));
+            status = 1;
+            continue;
+        }
         let exists = lstat(sys, &target).await.is_ok();
         if exists && mv.no_clobber {
             continue;

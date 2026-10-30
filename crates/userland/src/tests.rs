@@ -328,6 +328,14 @@ fn mv_n_and_i_leave_what_is_there_unless_answered_yes() {
         sh(&mem, "/m", "mv nothing d").err,
         ["mv: cannot stat 'nothing': No such file or directory"]
     );
+    // The working directory, and what holds it, stay where they are.
+    sh(&mem, "/", "mkdir -p /m/in/deep");
+    assert_eq!(
+        sh(&mem, "/m/in/deep", "mv /m/in /m/out").err,
+        ["mv: cannot move '/m/in': it holds the working directory; cd elsewhere first"]
+    );
+    assert_eq!(sh(&mem, "/m/in", "mv . /m/out").status, 1);
+    assert_eq!(sh(&mem, "/m", "mv in out").status, 0);
 }
 
 #[test]

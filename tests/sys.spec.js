@@ -327,3 +327,65 @@ test('read tokens: a whole file read by its descriptor\'s token, by its session 
   await ann.sys({ close: { fd: writing.fd } });
   await ann.sys({ close: { fd: opened.fd } });
 });
+
+test('a session\'s numbers are given once; sudo\'s descriptors stream as root; what has no content is not cloned; /usr reads through a descriptor; /sys is read-only', async () => {
+  const O_WRONLY = 1, O_CREAT = 0o100, O_EXCL = 0o200, FICLONE = 0x40049409;
+  const dir = base + '/review';
+  await root.batch([{ mkdir: { path: base, mode: 0o777 } }, { mkdir: { path: dir, mode: 0o777 } }, { chmod: { path: dir, mode: 0o1777 } }]);
+  // A number closed is not given again: a page of the session may still hold it.
+  const first = await ann.sys({ open: { path: '/etc/passwd', flags: 0 } });
+  await ann.sys({ close: { fd: first.fd } });
+  const second = await ann.sys({ open: { path: '/etc/passwd', flags: 0 } });
+  expect(second.fd).toBeGreaterThan(first.fd);
+  expect(await ann.sys({ close: { fd: first.fd } })).toBe('EBADF');
+  await ann.sys({ close: { fd: second.fd } });
+  // A wheel member's descriptor opened under sudo writes, closes and is read as root, through
+  // the Worker's streams too, as a descriptor keeps the access it was opened with.
+  const wheel = 'syswheel' + Date.now().toString(36);
+  expect((await program(root.context, ['useradd', '-m', '-G', 'wheel', wheel])).ok()).toBe(true);
+  expect((await api(root.context, 'passwd', { data: { username: wheel, password } })).ok()).toBe(true);
+  const admin = await session(wheel, password);
+  try {
+    expect((await api(admin.context, 'sudo', { data: { password } })).ok()).toBe(true);
+    const secret = dir + '/secret', big = Buffer.alloc(300 * 1024, 'x');
+    await root.batch([{ mkdir: { path: secret, mode: 0o700 } }]);
+    const opened = await admin.sys({ open: { path: secret + '/big', flags: O_WRONLY | O_CREAT | O_EXCL, mode: 0o600, size: big.length } }, { sudo: true });
+    expect((await admin.context.put(`/api/pwrite?fd=${opened.fd}&index=0`, { data: big })).ok()).toBe(true);
+    expect((await admin.sys({ close: { fd: opened.fd } })).size).toBe(big.length);
+    const reading = await admin.sys({ open: { path: secret + '/big', flags: 0 } }, { sudo: true });
+    const read = await admin.context.get(`/api/file?token=${encodeURIComponent(reading.token)}`);
+    expect([read.status(), (await read.body()).length]).toEqual([200, big.length]);
+    await admin.sys({ close: { fd: reading.fd } });
+    expect(await admin.sys({ open: { path: secret + '/big', flags: 0 } })).toBe('EACCES');
+  } finally {
+    await admin.context.dispose();
+    await program(root.context, ['userdel', '-r', wheel]);
+  }
+  // What the kernel makes as it is read has no content to share: cp reads it instead.
+  const [passwd, copy] = await ann.batch([
+    { open: { path: '/etc/passwd', flags: 0 } },
+    { open: { path: dir + '/passwd', flags: O_WRONLY | O_CREAT | O_EXCL, mode: 0o644 } },
+  ]);
+  expect(await ann.sys({ ioctl: { fd: copy.ok.fd, request: FICLONE, arg: passwd.ok.fd } })).toBe('EOPNOTSUPP');
+  await ann.batch([{ close: { fd: copy.ok.fd } }, { close: { fd: passwd.ok.fd } }]);
+  // A binary of /usr is the build's content, shared as any is, and read through a descriptor.
+  const [binary, ls] = await ann.batch([
+    { open: { path: '/usr/bin/ls', flags: 0 } },
+    { open: { path: dir + '/ls', flags: O_WRONLY | O_CREAT | O_EXCL, mode: 0o755 } },
+  ]);
+  const shared = await ann.batch([
+    { ioctl: { fd: ls.ok.fd, request: FICLONE, arg: binary.ok.fd } },
+    { close: { fd: ls.ok.fd } }, { close: { fd: binary.ok.fd } },
+  ]);
+  expect(shared.map(result => 'ok' in result)).toEqual([true, true, true]);
+  expect((await ann.sys({ stat: { path: dir + '/ls' } })).size).toBe((await ann.sys({ stat: { path: '/usr/bin/ls' } })).size);
+  const copied = await ann.context.get('/api/file?path=' + encodeURIComponent(dir + '/ls'));
+  expect((await copied.body()).subarray(0, 4).toString('latin1')).toBe('\0asm');
+  const [, head] = await ann.batch([{ open: { path: '/usr/bin/coreutils', flags: 0 } }, { pread: { fd: { ref: 0 }, offset: 0, count: 4 } }, { close: { fd: { ref: 0 } } }]);
+  expect(Buffer.from(head.ok.data, 'base64').toString('latin1')).toBe('\0asm');
+  // Past 4 GiB, a read is past the end, not at the start again.
+  const [, far] = await ann.batch([{ open: { path: '/etc/passwd', flags: 0 } }, { pread: { fd: { ref: 0 }, offset: 2 ** 32, count: 16 } }, { close: { fd: { ref: 0 } } }]);
+  expect(far.ok.data).toBe('');
+  // /sys is the image's, read-only, what is below it too.
+  expect(await root.sys({ mkdir: { path: '/sys/x', mode: 0o755 } })).toBe('EROFS');
+});

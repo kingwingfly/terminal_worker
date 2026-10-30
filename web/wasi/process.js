@@ -62,13 +62,14 @@ function request(method, url, body, headers = {}, binary = false) {
   try { xhr.send(body ?? null); } catch { throw new Errno(EIO); }
   return xhr;
 }
-// A batch of calls: each one's result, {ok} or {err}.
+// A batch of calls: each one's result, {ok} or {err}. Descriptors to close go after them, so
+// that a call's {ref: i} names the i-th of `calls`.
 function batch(calls) {
-  const sent = [...closing.map(fd => ({ close: { fd } })), ...calls];
+  const sent = [...calls, ...closing.map(fd => ({ close: { fd } }))];
   closing = [];
   const xhr = request('POST', '/api/sys', JSON.stringify({ calls: sent, umask: process.umask, sudo: process.sudo }), { 'Content-Type': 'application/json' });
   if (xhr.status !== 200) return calls.map(() => ({ err: { errno: 'EIO' } }));
-  return JSON.parse(xhr.responseText).results.slice(sent.length - calls.length);
+  return JSON.parse(xhr.responseText).results.slice(0, calls.length);
 }
 // One call: its value, or an Errno thrown.
 function call(one) {
@@ -152,7 +153,13 @@ function openRead(path) {
   const [opened, read, stated] = batch([{ open: { path, flags: O_RDONLY } }, { pread: { fd: { ref: 0 }, count: INLINE } }, { stat: { path } }]);
   if (opened.err?.errno === 'EISDIR') return { kind: 'dir', path };
   const { fd, token } = ok(opened);
-  const first = ok(read);
+  // What cannot be read closes, as it goes: a directory, opened as open(2) opens one, is one.
+  if ('err' in read) {
+    closing.push(fd);
+    if (read.err.errno === 'EISDIR') return { kind: 'dir', path };
+    ok(read);
+  }
+  const first = read.ok;
   return { kind: 'file', path, kfd: fd, token, read: true, pos: 0, size: first.size, window: { start: 0, data: unbase64(first.data) }, stat: stated.ok };
 }
 // Open it for writing in order: a growing file, truncated or new.

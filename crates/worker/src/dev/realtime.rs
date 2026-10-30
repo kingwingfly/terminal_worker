@@ -19,6 +19,11 @@ pub const SDP_MAX: usize = 64 * 1024;
 /// answers it, once, and the seconds it has to.
 pub const LISTENER: &str = "listener";
 pub const ANSWER_TTL: u64 = 60;
+/// How a listener's deadline names it: the session that listened and its Realtime session,
+/// which that session alone answers.
+pub fn listener(sid: &str, session: &str) -> String {
+    format!("{sid} {session}")
+}
 
 /// The site's Realtime app: its id and secret.
 pub fn app(env: &Env) -> std::result::Result<(String, String), String> {

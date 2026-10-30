@@ -214,6 +214,37 @@ impl Session {
 
 /// pread and pwrite of bytes a batch carries: decided in a transaction, moved to or from R2
 /// outside one, and, written, recorded in another.
+/// `length` bytes of the build's asset `asset` from `offset` (a binary of /usr), as the assets
+/// give them: the range, or all of it, cut to the range.
+async fn asset_range(env: &Env, asset: &str, offset: u64, length: u64) -> Sys<Vec<u8>> {
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    let io = |e: worker::Error| Error::because(Errno::EIO, e.to_string());
+    let headers = Headers::new();
+    headers
+        .set("Range", &format!("bytes={offset}-{}", offset + length - 1))
+        .map_err(io)?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Get).with_headers(headers);
+    let request = Request::new_with_init(&format!("https://assets{asset}"), &init).map_err(io)?;
+    let mut response = env
+        .assets("ASSETS")
+        .map_err(io)?
+        .fetch_request(request)
+        .await
+        .map_err(io)?;
+    let body = response.bytes().await.map_err(io)?;
+    if response.status_code() == 206 {
+        return Ok(body);
+    }
+    let start = usize::try_from(offset).map_or(body.len(), |offset| offset.min(body.len()));
+    let end = start
+        .saturating_add(usize::try_from(length).unwrap_or(usize::MAX))
+        .min(body.len());
+    Ok(body[start..end].to_vec())
+}
+
 async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<serde_json::Value> {
     let io = |e: worker::Error| Error::because(Errno::EIO, e.to_string());
     let too_many = || {
@@ -267,6 +298,9 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
                     }
                     (data, size)
                 }
+                crate::fds::Read::Asset(asset, offset, length, size) => {
+                    (asset_range(env, &asset, offset, length).await?, size)
+                }
             };
             Ok(json!(Data {
                 data: data.into(),
@@ -279,39 +313,41 @@ async fn bytes(env: &Env, state: &State, session: Session, call: Call) -> Sys<se
                 return Err(too_many());
             }
             let fd = fd.number();
-            // A process's standard input: what it is written goes to it, and it wakes.
-            let asking = session.clone();
-            let bytes = data.0.clone();
-            let piped = transact(state, move |db| {
-                let piped = asking.of(db).and_then(|(process, sid)| {
-                    let sid = sid.ok_or(Errno::EBADF)?;
-                    let Some(found) = db.fd(&sid, fd) else {
-                        return Ok(None);
-                    };
-                    let Some(pid) = crate::jobs::stdin_pid(&found.path).map(str::to_string) else {
-                        return Ok(None);
-                    };
-                    let owner = auth::identity(db, asking.key.as_deref()).id;
-                    crate::jobs::answer(db, owner, &process, &pid, &bytes).map(|v| Some((pid, v)))
-                });
-                let commit = piped.is_ok();
-                (piped, commit)
-            })
-            .map_err(io)??;
-            if let Some((pid, value)) = piped {
-                crate::api::kick(env, &json!({ "job": pid })).await;
-                return Ok(value);
+            // What the descriptor writes to: a process's standard input, which what it is
+            // written goes to, and wakes; or a file, a chunk of which goes to R2.
+            enum Target {
+                Stdin(String, serde_json::Value),
+                Chunk(String, String),
             }
             let asking = session.clone();
-            let (object, mime) = transact(state, move |db| {
+            let bytes = data.0.clone();
+            let target = transact(state, move |db| {
                 let target = asking.of(db).and_then(|(process, sid)| {
                     let sid = sid.ok_or(Errno::EBADF)?;
-                    crate::fds::pwrite(db, &sid, &process.cred, fd, index, length)
+                    let stdin = db
+                        .fd(&sid, fd)
+                        .and_then(|found| crate::jobs::stdin_pid(&found.path).map(str::to_string));
+                    match stdin {
+                        Some(pid) => {
+                            let owner = auth::identity(db, asking.key.as_deref()).id;
+                            crate::jobs::answer(db, owner, &process, &pid, &bytes)
+                                .map(|value| Target::Stdin(pid, value))
+                        }
+                        None => crate::fds::pwrite(db, &sid, &process.cred, fd, index, length)
+                            .map(|(object, mime)| Target::Chunk(object, mime)),
+                    }
                 });
                 let commit = target.is_ok();
                 (target, commit)
             })
             .map_err(io)??;
+            let (object, mime) = match target {
+                Target::Stdin(pid, value) => {
+                    crate::api::kick(env, &json!({ "job": pid })).await;
+                    return Ok(value);
+                }
+                Target::Chunk(object, mime) => (object, mime),
+            };
             env.bucket("FILES")
                 .map_err(io)?
                 .put(&object, data.0)
@@ -729,6 +765,8 @@ enum Plan {
         speaker: String,
         track: String,
         version: String,
+        /// The session listening, which alone answers.
+        sid: String,
     },
     Answer {
         session: String,
@@ -803,14 +841,17 @@ async fn networked(
                             speaker,
                             track,
                             version: dev::version(&request.device),
+                            sid: sid.clone(),
                         }
                     }
+                    // Only the session that listened answers its pull.
                     (abi::SND_ANSWER, "snd") => {
                         let session = arg["session"].as_str().unwrap_or_default().to_string();
+                        let listener = realtime::listener(&sid, &session);
                         let fresh = db
-                            .expiry(realtime::LISTENER, &session)
+                            .expiry(realtime::LISTENER, &listener)
                             .is_some_and(|due| auth::now() <= due);
-                        db.clear_expiry(realtime::LISTENER, &session);
+                        db.clear_expiry(realtime::LISTENER, &listener);
                         if !fresh {
                             return Err(Error::because(
                                 Errno::ENOENT,
@@ -868,11 +909,12 @@ async fn networked(
             speaker,
             track,
             version,
+            sid,
         } => {
             let (session, offer) = realtime::pull(env, &speaker, &track)
                 .await
                 .map_err(unreached)?;
-            let kept = session.clone();
+            let kept = realtime::listener(&sid, &session);
             transact(state, move |db| {
                 db.set_expiry(
                     realtime::LISTENER,

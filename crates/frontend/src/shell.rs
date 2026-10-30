@@ -663,11 +663,15 @@ impl Shell {
         use userland::procs::{Descriptor, descriptors, processes};
         let sys = crate::sys::HttpSys::default();
         let jobs = processes(&sys).await.unwrap_or_default();
+        // Uploads and recordings: descriptors writing files, not a process's standard input
+        // (/proc/PID/fd/0) nor a device.
         let fds: Vec<Descriptor> = descriptors(&sys)
             .await
             .unwrap_or_default()
             .into_iter()
-            .filter(|fd| fd.flags & 3 != 0)
+            .filter(|fd| {
+                fd.flags & 3 != 0 && !fd.path.starts_with("/proc/") && !fd.path.starts_with("/dev/")
+            })
             .collect();
         let recording = |fd: &Descriptor| fd.flags & O_APPEND != 0;
         match cancel {
