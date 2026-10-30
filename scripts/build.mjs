@@ -72,7 +72,7 @@ await copy(join(target, 'coreutils/wasm32-wasip1/release/coreutils.wasm'), join(
 const sizes = {};
 for (const asset of ['/usr/bin/coreutils.wasm', '/pkg/frontend_bg.wasm']) sizes[asset] = (await stat(join(out, asset))).size;
 await writeFile(join(out, 'usr/manifest.json'), JSON.stringify(sizes));
-for (const name of ['index.html', 'style.css']) await copy('web/' + name, join(out, name));
+for (const name of ['index.html', 'style.css', '_headers']) await copy('web/' + name, join(out, name));
 if (assets) await copyTree(assets, join(out, 'content'));
 await writeFile(join(out, 'terminal-config.json'), JSON.stringify({ branding, games }));
 console.log('Terminal built: ' + out);

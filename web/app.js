@@ -982,7 +982,7 @@ function restoreTerminalFocus() {
     const input = $('command');
     // Not while a password is asked, nor from another window that has the keyboard (the Files,
     // the preview, the editor), nor while a command runs.
-    if (document.querySelector('dialog[open]:modal') || otherWindow() || document.activeElement?.closest?.('dialog[open], .window:not(#window-terminal)') || !['↵', 'Answer ↵'].includes(input?.closest('form')?.querySelector('.busy')?.textContent)) return;
+    if (document.querySelector('dialog[open]:modal') || otherWindow() || document.activeElement?.closest?.('dialog[open], .window:not(#window-terminal)') || !['↵', 'Answer ↵', 'Input ↵'].includes(input?.closest('form')?.querySelector('.busy')?.textContent)) return;
     // After closing a modal Chromium can report this input as active while its
     // native text-editing focus still belongs to the closed dialog. Reacquire it.
     if (resetTerminalFocus && document.activeElement === input) input.blur();
@@ -1006,7 +1006,7 @@ document.addEventListener('keydown', event => {
   if (up) { if (!up.contains(document.activeElement)) up.focus({ preventScroll: true }); return; }
   if (!(target instanceof Element) || (target.closest('input,textarea,select,[contenteditable="true"]') && target.getClientRects().length) || window.getSelection()?.toString()) return;
   if (target.closest('button,a') && ['Enter', ' ', 'Tab'].includes(event.key)) return;
-  const input = $('command'); if (!input || !['↵', 'Answer ↵'].includes(input.closest('form')?.querySelector('.busy')?.textContent)) return;
+  const input = $('command'); if (!input || !['↵', 'Answer ↵', 'Input ↵'].includes(input.closest('form')?.querySelector('.busy')?.textContent)) return;
   if (event.key.length === 1) {
     event.preventDefault(); input.focus({ preventScroll: true });
     input.setRangeText(event.key, input.selectionStart ?? input.value.length, input.selectionEnd ?? input.value.length, 'end');

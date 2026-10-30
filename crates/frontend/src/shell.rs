@@ -17,8 +17,8 @@ use terminal_worker_core::completion::{self, Candidate, Query};
 use terminal_worker_core::glob::{self, Part};
 use terminal_worker_core::shell::{self as grammar, Delimiter, Word};
 use terminal_worker_core::{Entry, cli, find, resolve, split_command, text};
-use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 use crate::{
@@ -141,6 +141,49 @@ pub struct Shell {
     /// The answer a running command waits for, if any.
     prompt: StoredValue<Option<oneshot::Sender<String>>>,
     pub asking: RwSignal<bool>,
+    /// The terminal's input, while the running line's first process may read it
+    /// (web/wasi/exec.mjs): the lines typed go to it, and Ctrl+D ends a read ...
+    terminal: StoredValue<Option<JsValue>, LocalStorage>,
+    /// ... which it waits on now.
+    pub reading: RwSignal<bool>,
+}
+
+/// What a pipeline of processes showed in the transcript as they wrote: the line of the last's
+/// output, how many lines it shows (up to [`SHOWN`]) and how many more there were; and the
+/// part of an error line written so far.
+#[derive(Default)]
+struct Shown {
+    line: Option<RwSignal<String>>,
+    lines: usize,
+    hidden: usize,
+    partial: String,
+}
+impl Shown {
+    /// What of `text`, written to standard output, shows: up to [`SHOWN`] lines in all.
+    fn output(&mut self, text: &str) -> Option<String> {
+        if self.lines >= SHOWN {
+            self.hidden += text.matches('\n').count();
+            return None;
+        }
+        for (at, _) in text.match_indices('\n') {
+            self.lines += 1;
+            if self.lines >= SHOWN {
+                self.hidden += text[at + 1..].matches('\n').count();
+                return Some(text[..=at].to_string());
+            }
+        }
+        Some(text.to_string())
+    }
+    /// The lines `text`, written to standard error, completes, after what was written before.
+    fn error(&mut self, text: &str) -> Vec<String> {
+        self.partial.push_str(text);
+        let mut lines = Vec::new();
+        while let Some(at) = self.partial.find('\n') {
+            lines.push(self.partial[..at].to_string());
+            self.partial.drain(..=at);
+        }
+        lines
+    }
 }
 
 /// Wait `ms` milliseconds.
@@ -151,6 +194,37 @@ async fn sleep(ms: i32) {
         }
     });
     let _ = JsFuture::from(promise).await;
+}
+/// Call `object`'s method `name` with `argument`, as JavaScript would.
+fn call(object: &JsValue, name: &str, argument: &JsValue) {
+    if let Some(method) = js_sys::Reflect::get(object, &JsValue::from_str(name))
+        .ok()
+        .and_then(|method| method.dyn_into::<js_sys::Function>().ok())
+    {
+        let _ = method.call1(object, argument);
+    }
+}
+/// The process the stage `args` runs, if it is one, as [`Shell::invoke`] would run it: a utility
+/// of /usr/bin's coreutils the terminal has no program of its own for (by name, by its path, or
+/// as `coreutils NAME`), with the arguments it is given.
+fn process(args: &[String]) -> Option<Vec<String>> {
+    let mut args = args.to_vec();
+    if let Some(named) = cli_bin::named(args.first()?) {
+        args[0] = named.to_string();
+    }
+    let name = args[0].clone();
+    if cli::wants_help(&args) && cli::help(&name).is_some() {
+        return None;
+    }
+    if name == "coreutils" {
+        args.remove(0);
+        cli_bin::program(args.first()?)?;
+        return Some(args);
+    }
+    let own = commands::find(&name).is_some()
+        || cli::definition(&name).is_some()
+        || userland::PROGRAMS.contains(&name.as_str());
+    (cli_bin::program(&name).is_some() && !own).then_some(args)
 }
 fn js_message(error: JsValue) -> String {
     js_sys::Reflect::get(&error, &JsValue::from_str("message"))
@@ -289,6 +363,8 @@ impl Shell {
             detached: RwSignal::new(false),
             prompt: StoredValue::new(None),
             asking: RwSignal::new(false),
+            terminal: StoredValue::new_local(None),
+            reading: RwSignal::new(false),
         }
     }
     fn push(self, line: LogLine) {
@@ -872,13 +948,32 @@ impl Shell {
     /// transcript. Ctrl+C kills it.
     pub async fn bin(
         self,
-        mut args: Vec<String>,
+        args: Vec<String>,
         stdin: Option<String>,
         piped: bool,
         sudo: bool,
     ) -> Result<Output, String> {
-        let name = cli_bin::program(&args[0]).unwrap_or_default();
-        args[0] = name.to_string();
+        self.processes(vec![args], stdin, false, piped, sudo, None)
+            .await
+    }
+    /// Run `stages`, each a utility of coreutils and its arguments, as a pipeline of processes
+    /// (web/wasi/exec.mjs), given `stdin`, or reading the terminal if `terminal` says so: the
+    /// lines typed then go to the first, and Ctrl+D ends its reads. What the last writes goes on
+    /// if `piped`, of which its reader takes `enough` lines, if it says; to the transcript
+    /// otherwise, as it writes it. What any writes to standard error goes to the transcript, a
+    /// line at a time. Ctrl+C kills them.
+    pub async fn processes(
+        self,
+        mut stages: Vec<Vec<String>>,
+        stdin: Option<String>,
+        terminal: bool,
+        piped: bool,
+        sudo: bool,
+        enough: Option<usize>,
+    ) -> Result<Output, String> {
+        for args in &mut stages {
+            args[0] = cli_bin::program(&args[0]).unwrap_or_default().to_string();
+        }
         let set = |options: &js_sys::Object, key: &str, value: JsValue| {
             let _ = js_sys::Reflect::set(options, &JsValue::from_str(key), &value);
         };
@@ -890,36 +985,104 @@ impl Shell {
             "user",
             self.account.username.get_untracked().into(),
         );
-        set(
-            &options,
-            "stdin",
-            stdin.map_or(JsValue::NULL, JsValue::from),
-        );
+        // None is the terminal's input; nothing to read is an empty one.
+        let stdin = match stdin {
+            Some(text) => JsValue::from(text),
+            None if terminal => JsValue::NULL,
+            None => JsValue::from(""),
+        };
+        set(&options, "stdin", stdin);
         set(&options, "sudo", sudo.into());
         set(&options, "tty", (!piped).into());
+        if let Some(enough) = enough {
+            set(&options, "enough", (enough as f64).into());
+        }
         let cancelled = Closure::<dyn Fn() -> bool>::new(move || self.cancelled());
         set(&options, "cancelled", cancelled.as_ref().clone());
-        let exited = JsFuture::from(crate::exec(args, &options.into()))
-            .await
-            .map_err(js_message)?;
-        drop(cancelled);
+        // What they write to the terminal shows as they write it: the last's output, a line of
+        // the transcript that grows, a new one after anything else shows; errors a line at a time.
+        let shown = StoredValue::new_local(Shown::default());
+        let output = Closure::<dyn Fn(u32, String)>::new(move |fd: u32, text: String| {
+            if fd == 2 {
+                let lines = shown.try_update_value(|shown| shown.error(&text));
+                for line in lines.unwrap_or_default() {
+                    self.error(line);
+                }
+                return;
+            }
+            let current = shown.with_value(|shown| shown.line);
+            let live = self.lines.with_untracked(
+                |lines| matches!(lines.last(), Some(LogLine::Live(line)) if Some(*line) == current),
+            );
+            let line = match current {
+                Some(line) if live => line,
+                _ => {
+                    let line = RwSignal::new(String::new());
+                    self.push(LogLine::Live(line));
+                    shown.update_value(|shown| shown.line = Some(line));
+                    line
+                }
+            };
+            if let Some(text) = shown
+                .try_update_value(|shown| shown.output(&text))
+                .flatten()
+            {
+                line.update(|line| line.push_str(&text));
+            }
+        });
+        set(&options, "onOutput", output.as_ref().clone());
+        let tty = Closure::<dyn Fn(JsValue)>::new(move |input: JsValue| {
+            let input = (!input.is_null() && !input.is_undefined()).then_some(input);
+            if input.is_none() {
+                self.reading.set(false);
+            }
+            self.terminal.set_value(input);
+        });
+        set(&options, "onTty", tty.as_ref().clone());
+        let reading = Closure::<dyn Fn()>::new(move || self.reading.set(true));
+        set(&options, "onReading", reading.as_ref().clone());
+        let names: Vec<String> = stages.iter().map(|args| args[0].clone()).collect();
+        let argvs = js_sys::Array::new();
+        for args in stages {
+            argvs.push(
+                &args
+                    .into_iter()
+                    .map(JsValue::from)
+                    .collect::<js_sys::Array>(),
+            );
+        }
+        let exited = JsFuture::from(crate::exec(&argvs, &options.into())).await;
+        self.terminal.set_value(None);
+        self.reading.set(false);
+        drop((cancelled, output, tty, reading));
+        let exited = exited.map_err(js_message)?;
+        // What is left of an error line, and how much output was not shown.
+        let (rest, hidden, line) =
+            shown.with_value(|shown| (shown.partial.clone(), shown.hidden, shown.line));
+        if !rest.is_empty() {
+            self.error(rest);
+        }
+        if hidden > 0
+            && let Some(line) = line
+        {
+            line.update(|line| {
+                line.push_str(&format!(
+                    "\n… {hidden} more lines; pipe the output into head, tail or grep to see them"
+                ))
+            });
+        }
         let field = |key: &str| js_sys::Reflect::get(&exited, &JsValue::from_str(key)).ok();
         let status = field("status").and_then(|v| v.as_f64()).unwrap_or(1.0) as i32;
         let stdout = field("stdout")
             .and_then(|v| v.as_string())
             .unwrap_or_default();
-        let stderr = field("stderr")
-            .and_then(|v| v.as_string())
-            .unwrap_or_default();
-        for line in stderr.lines() {
-            self.error(line);
-        }
+        let name = names.last().cloned().unwrap_or_default();
         if field("truncated").and_then(|v| v.as_bool()) == Some(true) {
             self.error(format!(
                 "{name}: output larger than 10 MB was cut short, and {name} stopped"
             ));
         }
-        if cli_bin::writes(name) {
+        if names.iter().any(|name| cli_bin::writes(name)) {
             self.refresh().await?;
         }
         Ok(Output {
@@ -927,6 +1090,23 @@ impl Shell {
             failed: status != 0,
             ..Default::default()
         })
+    }
+    /// End of input, Ctrl+D, for the process reading the terminal, if one may: what is typed goes
+    /// as it is, without a newline, or, if nothing is, its read ends with nothing.
+    pub fn end_of_input(self) -> bool {
+        let Some(input) = self.terminal.get_value() else {
+            return false;
+        };
+        let typed = self.input.get_untracked();
+        self.input.set(String::new());
+        self.reading.set(false);
+        if typed.is_empty() {
+            call(&input, "eof", &JsValue::UNDEFINED);
+        } else {
+            self.log(typed.clone());
+            call(&input, "write", &typed.into());
+        }
+        true
     }
     /// Run the program of user space `args[0]` as a stage: its errors go to the transcript, and
     /// its listing as a view of its own unless piped.
@@ -1072,6 +1252,15 @@ impl Shell {
 
     /// Run the pipeline `command`, typed into this tab.
     pub fn run(self, command: String) {
+        if let Some(input) = self.terminal.get_value() {
+            // The line is the input of the process reading the terminal, echoed as a terminal's
+            // line discipline echoes it.
+            self.input.set(String::new());
+            self.log(command.clone());
+            self.reading.set(false);
+            call(&input, "write", &format!("{command}\n").into());
+            return;
+        }
         if self.asking.get_untracked() {
             // The line answers the question a command is waiting on.
             self.input.set(String::new());
@@ -1154,20 +1343,62 @@ impl Shell {
             .set_value(Some(js_sys::Promise::resolve(&files)));
         self.run("upload".into());
     }
-    async fn pipeline(self, stages: Vec<Vec<Word>>) {
+    async fn pipeline(self, mut stages: Vec<Vec<Word>>) {
         let last = stages.len().saturating_sub(1);
         let mut stdin = None;
-        for (index, words) in stages.into_iter().enumerate() {
+        // A stage expanded ahead, as a run of processes was looked for its end.
+        let mut ahead = None;
+        let mut index = 0;
+        while index <= last && !stages.is_empty() {
             // Wildcards expand as the stage starts, as a shell expands them.
-            let args = self.expand(words).await;
+            let args = match ahead.take() {
+                Some(args) => args,
+                None => self.expand(std::mem::take(&mut stages[index])).await,
+            };
             if self.cancelled() {
                 break;
             }
+            let first = index == 0;
+            // A run of processes runs at once, each reading the one before through a pipe; the
+            // first of a line reads the terminal.
+            let mut run = Vec::new();
+            if let Ok(args) = &args
+                && let Some(argv) = process(args)
+            {
+                run.push(argv);
+                while index < last {
+                    let next = self.expand(std::mem::take(&mut stages[index + 1])).await;
+                    match next.as_ref().ok().and_then(|args| process(args)) {
+                        Some(argv) => {
+                            run.push(argv);
+                            index += 1;
+                        }
+                        None => {
+                            ahead = Some(next);
+                            break;
+                        }
+                    }
+                }
+            }
             let piped = index < last;
             let result = match args {
+                Ok(_) if !run.is_empty() => {
+                    // head reads only the lines it shows: then it closes the pipe.
+                    let enough = match &ahead {
+                        Some(Ok(next)) if next.first().is_some_and(|name| name == "head") => {
+                            text::parse("head", &next[1..])
+                                .ok()
+                                .and_then(|filter| filter.reads())
+                        }
+                        _ => None,
+                    };
+                    self.processes(run, stdin.take(), first, piped, false, enough)
+                        .await
+                }
                 Ok(args) => self.invoke(args, stdin.take(), piped).await,
                 Err(e) => Err(e),
             };
+            index += 1;
             match result {
                 Ok(out) if piped => {
                     let mut text = out.stdout;

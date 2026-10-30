@@ -60,10 +60,10 @@ extern "C" {
     fn focus_after(panel: bool);
     #[wasm_bindgen(js_namespace = terminal, js_name = completionFocus)]
     fn completion_focus(value: &str, inside_quote: bool);
-    /// exec(2) of a program of /bin, as a process of its own (web/wasi/exec.mjs): its exit
-    /// status, and what it wrote.
+    /// exec(2) of programs of /usr/bin, a pipeline of processes (web/wasi/exec.mjs), each
+    /// stage an argv: the last's exit status, and what it wrote if not to the terminal.
     #[wasm_bindgen(js_namespace = terminal)]
-    fn exec(argv: Vec<String>, options: &JsValue) -> js_sys::Promise;
+    fn exec(stages: &JsValue, options: &JsValue) -> js_sys::Promise;
 }
 
 fn endpoint(api: &str, path: &str) -> String {
@@ -142,22 +142,29 @@ fn upload_progress(entry: &Entry) -> Option<String> {
 pub(crate) fn listed(mtime: u64) -> String {
     userland::time::listed(mtime, (js_sys::Date::now() / 1000.0) as u64)
 }
+/// What programs write for a terminal: colours, styles and links show as they mean them.
+fn styled(text: &str) -> AnyView {
+    if !terminal_worker_core::ansi::escaped(text) {
+        return text.to_string().into_any();
+    }
+    terminal_worker_core::ansi::parse(text)
+        .into_iter()
+        .map(|run| {
+            let style = run.style.css();
+            match run.link.filter(|link| link.starts_with("https://") || link.starts_with("http://")) {
+                Some(link) => view! { <a href=link target="_blank" rel="noopener noreferrer" style=style>{run.text}</a> }.into_any(),
+                None => view! { <span style=style>{run.text}</span> }.into_any(),
+            }
+        })
+        .collect_view()
+        .into_any()
+}
+
 fn render_line(line: LogLine) -> AnyView {
     match line {
-        // What programs write for a terminal (colours, styles, links) shows as they mean it.
-        LogLine::Text(text) if terminal_worker_core::ansi::escaped(&text) => {
-            let runs = terminal_worker_core::ansi::parse(&text);
-            view! { <pre class="output-line">{runs.into_iter().map(|run| {
-                let style = run.style.css();
-                match run.link.filter(|link| link.starts_with("https://") || link.starts_with("http://")) {
-                    Some(link) => view! { <a href=link target="_blank" rel="noopener noreferrer" style=style>{run.text}</a> }.into_any(),
-                    None => view! { <span style=style>{run.text}</span> }.into_any(),
-                }
-            }).collect_view()}</pre> }
-            .into_any()
-        }
-        LogLine::Text(text) => view! { <pre class="output-line">{text}</pre> }.into_any(),
-        LogLine::Live(text) => view! { <pre class="output-line">{move || text.get()}</pre> }.into_any(),
+        LogLine::Text(text) => view! { <pre class="output-line">{styled(&text)}</pre> }.into_any(),
+        // A program's output as it writes it, its last line ended or not.
+        LogLine::Live(text) => view! { <pre class="output-line">{move || text.with(|text| styled(text.trim_end_matches('\n')))}</pre> }.into_any(),
         LogLine::Command { user, cwd, command } => {
             let symbol = if user == "root" { " # " } else { " $ " };
             view! { <pre class="command-echo"><span class="prompt-user">{user}</span><span class="prompt-separator">":"</span><span class="prompt-path">{cwd}</span><span class="prompt-symbol">{symbol}</span><span class="prompt-command">{command}</span></pre> }.into_any()
@@ -282,6 +289,11 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
                         shell.interrupt();
                         return;
                     }
+                    // Ctrl+D: the end of what a program reading the terminal is given.
+                    if e.ctrl_key() && !e.alt_key() && !e.meta_key() && !e.shift_key() && e.key().eq_ignore_ascii_case("d") && shell.end_of_input() {
+                        e.prevent_default();
+                        return;
+                    }
                     match e.key().as_str() {
                         "Tab" => { e.prevent_default(); shell.complete(e.shift_key()); },
                         "Escape" => { e.prevent_default(); shell.cancel_completion(); },
@@ -292,7 +304,7 @@ fn terminal_view(shell: Shell, active: RwSignal<u64>) -> impl IntoView {
                     }
                 }
                 node_ref=command_input/>
-            <span class="busy">{move || if shell.asking.get() { "Answer ↵" } else if shell.busy.get() { "Working..." } else { "↵" }}</span>
+            <span class="busy">{move || if shell.asking.get() { "Answer ↵" } else if shell.reading.get() { "Input ↵" } else if shell.busy.get() { "Working..." } else { "↵" }}</span>
         </form>
         // The keys a phone's keyboard lacks. Pressing one keeps the focus, and the keyboard, where
         // they are.

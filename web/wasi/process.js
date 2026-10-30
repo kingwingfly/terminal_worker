@@ -4,8 +4,12 @@
 // calls block: the Worker waits on each request. `terminal.sys` reaches the kernel's own calls,
 // which WASI has no words for (modes, owners, ACLs, devices, accounts).
 //
-// Started with {module, argv, env, stdin, umask, sudo, tty}; it posts {out, fd} as it writes and
-// {exit} when it ends.
+// Started with {module, argv, env, umask, sudo, stdin, stdout, stderr}: standard input is
+// {data} (bytes given whole) or {pipe} (a pipe's buffer, web/wasi/pipe.js), the terminal if
+// {tty}; standard output {pipe}, or the page's, a terminal if {tty}; standard error {tty}. It posts
+// {out, fd} as it writes to the page, {reading} as it waits on the terminal, and {exit} as it
+// ends.
+import { Pipe } from './pipe.js';
 
 // WASI's errno numbers, by Linux's names, as the kernel answers.
 const ERRNO = {
@@ -15,6 +19,8 @@ const ERRNO = {
   ERANGE: 68, EROFS: 69, ESPIPE: 70, ESRCH: 71, ESTALE: 72, ETIMEDOUT: 73, ETXTBSY: 74, EXDEV: 75, ENODATA: 44,
 };
 const { EBADF, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, ENOTDIR, ESPIPE, EFBIG } = ERRNO;
+// The kinds of descriptor standard input and output are: bytes given, the page's, a pipe's end.
+const STDIO = new Set(['in', 'out', 'pipe-in', 'pipe-out']);
 // What a file is, as WASI numbers it.
 const CHARACTER_DEVICE = 2, DIRECTORY = 3, REGULAR_FILE = 4, SYMBOLIC_LINK = 7, UNKNOWN = 0;
 // open(2)'s flags, as the kernel takes them (Linux's).
@@ -104,7 +110,7 @@ const fds = new Map();
 let nextFd = 4;
 function descriptor(fd) { const found = fds.get(fd); if (!found) throw new Errno(EBADF); return found; }
 function filetype(found) {
-  if (found.kind === 'in' || found.kind === 'out') return found.tty ? CHARACTER_DEVICE : UNKNOWN;
+  if (STDIO.has(found.kind)) return found.tty ? CHARACTER_DEVICE : UNKNOWN;
   if (found.kind === 'dir') return DIRECTORY;
   return REGULAR_FILE;
 }
@@ -130,7 +136,7 @@ function writeFilestat(ptr, found) {
 }
 // What a descriptor's file is now, as fstat says.
 function fstat(found) {
-  if (found.kind === 'in' || found.kind === 'out') return { filetype: filetype(found), mode: 0o020620 };
+  if (STDIO.has(found.kind)) return { filetype: filetype(found), mode: found.tty ? 0o020620 : 0o010600 };
   if (found.kind === 'dir') return stat(found.path);
   if (found.writer || found.rewrite) {
     const now = Math.floor(Date.now() / 1000);
@@ -171,7 +177,13 @@ function readFrom(found, at, count) {
     found.pos += out.length;
     return out;
   }
-  if (found.kind === 'out') throw new Errno(EBADF);
+  if (found.kind === 'pipe-in') {
+    // The terminal's reader waits for a line: what it wrote shows first, and the page hears it
+    // asks.
+    if (found.tty && found.pipe.empty) { flush(); postMessage({ reading: true }); }
+    return found.pipe.read(count);
+  }
+  if (found.kind === 'out' || found.kind === 'pipe-out') throw new Errno(EBADF);
   if (!found.read) throw new Errno(EBADF);
   if (found.rewrite) return found.data.subarray(at, at + count);
   if (found.writer) {
@@ -196,6 +208,9 @@ function readFrom(found, at, count) {
 
 function writeTo(found, at, data) {
   if (found.kind === 'out') { output(found.fd, data); return data.length; }
+  // A pipe whose reader is gone: SIGPIPE, whose default is to end the process, quietly.
+  if (found.kind === 'pipe-out') { if (!found.pipe.write(data)) { flush(); throw new Exit(141); } return data.length; }
+  if (found.kind === 'pipe-in') throw new Errno(EBADF);
   if (found.kind !== 'file' || (!found.writer && !found.rewrite)) throw new Errno(EBADF);
   if (found.rewrite) {
     if (found.append) at = found.data.length;
@@ -234,7 +249,9 @@ const safeJson = text => { try { return JSON.parse(text); } catch { return {}; }
 
 // Close a descriptor: what it wrote goes, with the close, in one request where it can.
 function closeFd(found) {
-  if (found.kind === 'file' && found.writer) {
+  if (found.kind === 'pipe-in') found.pipe.closeReader();
+  else if (found.kind === 'pipe-out') found.pipe.closeWriter();
+  else if (found.kind === 'file' && found.writer) {
     while (found.length > found.chunk) flushChunk(found);
     const calls = [];
     if (found.length > INLINE) flushChunk(found);
@@ -383,7 +400,7 @@ const wasi = {
       const at = found.pos ?? 0;
       const data = readFrom(found, at, len);
       bytes().set(data, ptr); total += data.length;
-      if (found.kind !== 'in') found.pos = at + data.length;
+      if (!STDIO.has(found.kind)) found.pos = at + data.length;
       if (data.length < len) break;
     }
     view().setUint32(nread, total, true);
@@ -537,9 +554,10 @@ const terminal = {
 onmessage = async ({ data }) => {
   process = { ...data, limit: data.limit ?? 10 << 20 };
   environ = Object.entries(data.env ?? {}).map(([name, value]) => `${name}=${value}`);
-  fds.set(0, { kind: 'in', tty: data.stdin == null && data.tty, data: data.stdin ?? new Uint8Array(0), pos: 0 });
-  fds.set(1, { kind: 'out', fd: 1, tty: data.tty });
-  fds.set(2, { kind: 'out', fd: 2, tty: data.tty });
+  const { stdin = {}, stdout = {}, stderr = {} } = data;
+  fds.set(0, stdin.pipe ? { kind: 'pipe-in', pipe: new Pipe(stdin.pipe), tty: !!stdin.tty } : { kind: 'in', tty: !!stdin.tty, data: stdin.data ?? new Uint8Array(0), pos: 0 });
+  fds.set(1, stdout.pipe ? { kind: 'pipe-out', pipe: new Pipe(stdout.pipe) } : { kind: 'out', fd: 1, tty: !!stdout.tty });
+  fds.set(2, { kind: 'out', fd: 2, tty: !!stderr.tty });
   fds.set(3, { kind: 'dir', path: '/' });
   let code = 0;
   try {
@@ -550,8 +568,9 @@ onmessage = async ({ data }) => {
     if (err instanceof Exit) code = err.code;
     else { output(2, encoder.encode(`${process.argv[0]}: ${err?.message ?? err}\n`)); code = 134; }
   }
-  // What it left open closes as it exits, as a process's descriptors do.
-  for (const [fd, found] of fds) if (fd > 2) { try { closeFd(found); } catch { /* it exits all the same */ } }
+  // What it left open closes as it exits, as a process's descriptors do: its pipes too, so that
+  // the next reads to their end, and the one before hears SIGPIPE.
+  for (const [, found] of fds) { try { closeFd(found); } catch { /* it exits all the same */ } }
   if (closing.length) { try { batch([]); } catch { /* likewise */ } }
   flush();
   postMessage({ exit: code });

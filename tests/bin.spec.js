@@ -158,7 +158,7 @@ test('/ is laid out as Arch\'s', async ({ page }) => {
   await expect(page.locator('.transcript pre').last()).toHaveText('1\n2');
 });
 
-test('Ctrl+C kills a program of /bin, and output past the limit stops it', async ({ page }) => {
+test('Ctrl+C kills a program of /bin; head stops what it reads; output past the limit stops it', async ({ page }) => {
   await terminal(page);
   const input = page.getByRole('combobox', { name: 'Terminal command' });
   const busy = page.locator('#command').locator('xpath=ancestor::form').locator('.busy');
@@ -167,7 +167,11 @@ test('Ctrl+C kills a program of /bin, and output past the limit stops it', async
   await page.waitForTimeout(500);
   await input.press('Control+c');
   await expect(busy).toHaveText('↵', { timeout: 5_000 });
+  // head takes its lines and closes the pipe: yes hears SIGPIPE, and ends.
   await run(page, 'yes | head -n 2');
-  await expect(transcript(page)).toContainText('output larger than 10 MB was cut short');
-  await expect(transcript(page)).toContainText('y\ny');
+  await expect(page.locator('.transcript pre').last()).toHaveText('y\ny');
+  await expect(transcript(page)).not.toContainText('cut short');
+  // What reads it all is given no more than 10 MB.
+  await run(page, 'yes | wc -l');
+  await expect(transcript(page)).toContainText('yes: output larger than 10 MB was cut short');
 });
