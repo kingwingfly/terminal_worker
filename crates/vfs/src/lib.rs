@@ -671,6 +671,8 @@ pub trait Filesystem {
         options: &'a OpenOptions,
     ) -> BoxFuture<'a, OpenRef>;
     /// pread: read into `buf` from `offset`, and say how much was read (0 at the end).
+    /// Offsets above [`FILE_MAX`] and ranges that overflow it are invalid (EINVAL), even at
+    /// EOF. An empty buffer still requires a valid offset.
     fn read_at<'a>(
         &'a self,
         open: &'a OpenRef,

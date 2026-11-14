@@ -9,6 +9,10 @@
 //! instance issued it. A file's content lives until its last name and its last open reference
 //! are gone. Files are sparse, as on tmpfs: content is kept in pages, holes read as zeros, and
 //! only the pages written count against the filesystem's capacity (`ENOSPC` past it).
+//! Reads of files, directories and symlink targets use relatime: atime changes when it is no
+//! newer than mtime or ctime, or its seconds field is at least 24 hours old. File reads at EOF
+//! and zero-length reads count too, as on Linux tmpfs. Mount-specific atime flags belong to
+//! the later mount layer; this driver currently uses the default policy.
 //!
 //! Devices are names here, not drivers: the client sends a device's I/O to its driver, and the
 //! I/O calls of this filesystem refuse device open references (ENXIO).
@@ -597,7 +601,7 @@ impl MemFs {
         Ok(Self::metadata_of(inode))
     }
     fn do_read_dir(&self, cred: &Cred, dir: &Handle) -> Result<Vec<DirEntry>> {
-        let state = self.state.borrow();
+        let mut state = self.state.borrow_mut();
         let ino = self.check(&state, dir)?;
         let inode = &state.inodes[&ino];
         if !inode.meta.directory {
@@ -607,7 +611,7 @@ impl MemFs {
         if inode.removed() {
             return Err(Errno::ENOENT);
         }
-        Ok(inode
+        let entries = inode
             .entries
             .iter()
             .map(|(name, ino)| DirEntry {
@@ -618,7 +622,9 @@ impl MemFs {
                 },
                 file_type: state.inodes[ino].file_type(),
             })
-            .collect())
+            .collect();
+        self.accessed(state.inodes.get_mut(&ino).expect("checked directory"));
+        Ok(entries)
     }
     /// Make a node named `name` in `dir`, after the checks every creation shares.
     fn make(
@@ -873,16 +879,33 @@ impl MemFs {
             _ => Err(Errno::ENXIO),
         }
     }
+    /// Linux's default relatime policy. Access never changes mtime or ctime, and clock
+    /// rollback must not make a recent atime appear a day old through unsigned subtraction.
+    fn accessed(&self, inode: &mut Inode) {
+        let now = (self.clock)();
+        if inode.atime <= inode.mtime
+            || inode.atime <= inode.ctime
+            || now.0.saturating_sub(inode.atime.0) >= 24 * 60 * 60
+        {
+            inode.atime = now;
+        }
+    }
     fn do_read_at(&self, open: &OpenRef, buf: &mut [u8], offset: u64) -> Result<usize> {
-        let state = self.state.borrow();
+        let mut state = self.state.borrow_mut();
         let record = self.open_record(&state, open)?;
         if !record.access.reads() {
             return Err(Errno::EBADF);
         }
-        let inode = &state.inodes[&record.ino];
+        let ino = record.ino;
+        let inode = state.inodes.get_mut(&ino).expect("open inode");
         Self::content(inode)?;
+        if offset > FILE_MAX || buf.len() as u64 > FILE_MAX - offset {
+            return Err(Errno::EINVAL);
+        }
         let len = buf.len().min(RW_MAX);
-        Ok(inode.read(offset, &mut buf[..len]))
+        let read = inode.read(offset, &mut buf[..len]);
+        self.accessed(inode);
+        Ok(read)
     }
     fn do_write_at(&self, open: &OpenRef, buf: &[u8], at: WriteAt) -> Result<Written> {
         let mut state = self.state.borrow_mut();
@@ -1172,7 +1195,9 @@ impl Drop for LockWait<'_> {
 
 macro_rules! ready {
     ($body:expr) => {
-        Box::pin(std::future::ready($body))
+        // Execute only when polled. In particular, an abandoned open/create must never
+        // allocate an open reference whose result nobody receives and releases.
+        Box::pin(async move { $body })
     };
 }
 
@@ -1210,11 +1235,11 @@ impl Filesystem for MemFs {
         ready!(self.do_parent(dir))
     }
     fn metadata<'a>(&'a self, _cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, Metadata> {
-        let state = self.state.borrow();
-        ready!(
+        ready!({
+            let state = self.state.borrow();
             self.check(&state, handle)
                 .map(|ino| Self::metadata_of(&state.inodes[&ino]))
-        )
+        })
     }
     fn setattr<'a>(
         &'a self,
@@ -1228,14 +1253,14 @@ impl Filesystem for MemFs {
         ready!(self.do_read_dir(cred, dir))
     }
     fn read_link<'a>(&'a self, _cred: &'a Cred, link: &'a Handle) -> BoxFuture<'a, String> {
-        let state = self.state.borrow();
-        ready!(
-            self.check(&state, link).and_then(|ino| state.inodes[&ino]
-                .meta
-                .link
-                .clone()
-                .ok_or(Errno::EINVAL))
-        )
+        ready!({
+            let mut state = self.state.borrow_mut();
+            let ino = self.check(&state, link)?;
+            let inode = state.inodes.get_mut(&ino).expect("checked inode");
+            let target = inode.meta.link.clone().ok_or(Errno::EINVAL)?;
+            self.accessed(inode);
+            Ok(target)
+        })
     }
     fn create<'a>(
         &'a self,
@@ -1341,11 +1366,13 @@ impl Filesystem for MemFs {
         ready!(self.do_setxattr(cred, handle, name, value, flags))
     }
     fn listxattr<'a>(&'a self, cred: &'a Cred, handle: &'a Handle) -> BoxFuture<'a, Vec<String>> {
-        let state = self.state.borrow();
-        ready!(self.check(&state, handle).map(|ino| {
-            let inode = &state.inodes[&ino];
-            xattr::listed(&cred.identity, &inode.meta, inode.xattrs.keys())
-        }))
+        ready!({
+            let state = self.state.borrow();
+            self.check(&state, handle).map(|ino| {
+                let inode = &state.inodes[&ino];
+                xattr::listed(&cred.identity, &inode.meta, inode.xattrs.keys())
+            })
+        })
     }
     fn removexattr<'a>(
         &'a self,
@@ -1356,15 +1383,17 @@ impl Filesystem for MemFs {
         ready!(self.do_removexattr(cred, handle, name))
     }
     fn statfs<'a>(&'a self, _cred: &'a Cred) -> BoxFuture<'a, StatFs> {
-        let state = self.state.borrow();
-        ready!(Ok(StatFs {
-            block_size: PAGE_BYTES,
-            blocks: self.capacity,
-            blocks_free: self.capacity.saturating_sub(state.pages),
-            files: state.inodes.len() as u64,
-            files_free: u64::MAX - state.next_ino,
-            name_max: abi::NAME_MAX as u64,
-        }))
+        ready!({
+            let state = self.state.borrow();
+            Ok(StatFs {
+                block_size: PAGE_BYTES,
+                blocks: self.capacity,
+                blocks_free: self.capacity.saturating_sub(state.pages),
+                files: state.inodes.len() as u64,
+                files_free: u64::MAX - state.next_ino,
+                name_max: abi::NAME_MAX as u64,
+            })
+        })
     }
     fn open<'a>(
         &'a self,

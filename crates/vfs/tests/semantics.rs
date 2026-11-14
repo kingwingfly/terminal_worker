@@ -646,6 +646,56 @@ fn xattrs_follow_the_kernel() {
 // Opening and creating.
 
 #[test]
+fn abandoned_open_and_create_futures_retain_no_objects() {
+    for create_existing in [false, true] {
+        let fs = fs();
+        let root = fs.root();
+        let alice = user(1000);
+        let file = new_file(&fs, &alice, &root, "f", 0o600, b"data");
+        assert_eq!(used(&fs), 1);
+        let options = read();
+        if create_existing {
+            drop(fs.create(&alice, &root, "f", 0o600, &options));
+        } else {
+            drop(fs.open(&alice, &file, &options));
+        }
+        run(fs.unlink(&alice, &root, "f")).unwrap();
+        assert_eq!((fs.inode_count(), used(&fs)), (1, 0));
+        assert_eq!(run(fs.metadata(&alice, &file)), Err(Errno::ESTALE));
+    }
+}
+
+#[test]
+fn unpolled_calls_neither_change_nor_borrow_the_filesystem() {
+    let fs = fs();
+    let root = fs.root();
+    let alice = user(1000);
+    let options = create_new(write());
+    let abandoned = fs.create(&alice, &root, "absent", 0o600, &options);
+    assert_eq!(run(fs.lookup(&alice, &root, "absent")), Err(Errno::ENOENT));
+    drop(abandoned);
+    let file = new_file(&fs, &alice, &root, "f", 0o600, b"data");
+    let reader = open(&fs, &alice, &file, read()).unwrap();
+    let truncating = *OpenOptions::new().write(true).truncate(true);
+    drop(fs.open(&alice, &file, &truncating));
+    drop(fs.create(&alice, &root, "f", 0o600, &truncating));
+    assert_eq!(read_at(&fs, &reader, 0).unwrap(), b"data");
+    // Preparing query futures must not retain a state borrow across other operations.
+    let metadata = fs.metadata(&alice, &file);
+    let attrs = fs.listxattr(&alice, &file);
+    let space = fs.statfs(&alice);
+    let writer = open(&fs, &alice, &file, write()).unwrap();
+    run(fs.set_len(&writer, 1)).unwrap();
+    assert_eq!(run(metadata).unwrap().size, 1);
+    assert!(run(attrs).unwrap().is_empty());
+    assert_eq!(run(space).unwrap().files, 2);
+    run(fs.release(&reader)).unwrap();
+    run(fs.release(&writer)).unwrap();
+    run(fs.unlink(&alice, &root, "f")).unwrap();
+    assert_eq!((fs.inode_count(), used(&fs)), (1, 0));
+}
+
+#[test]
 fn the_creator_keeps_the_access_it_asked_for() {
     // tar: open(O_CREAT|O_WRONLY|O_EXCL, 0444), then write and ftruncate through that descriptor.
     let fs = fs();
@@ -791,6 +841,152 @@ fn path_only_opens_keep_a_directory_without_access() {
 }
 
 // Content.
+
+#[test]
+fn reads_update_atime_according_to_relatime() {
+    let clock = Rc::new(Cell::new((1, 0)));
+    let time = clock.clone();
+    let fs = MemFs::new(
+        FsId("relatime".into()),
+        1,
+        0,
+        0,
+        0o1777,
+        Box::new(move || time.get()),
+    );
+    let alice = user(1000);
+    let file = new_file(&fs, &alice, &fs.root(), "f", 0o600, b"data");
+    let reader = open(&fs, &alice, &file, read()).unwrap();
+    let at = |(sec, nsec)| Time::At { sec, nsec };
+    // mtime/ctime equality, nanosecond ordering, the 24-hour boundary and a clock rollback.
+    for (atime, mtime, ctime, now, update) in [
+        ((1, 0), (2, 0), (3, 0), (4, 0), true),
+        ((20, 100), (20, 100), (10, 0), (30, 0), true),
+        ((20, 100), (10, 0), (20, 100), (30, 0), true),
+        ((20, 100), (20, 99), (20, 99), (30, 0), false),
+        ((20, 100), (10, 0), (10, 0), (86_419, 999_999_999), false),
+        ((20, 100), (10, 0), (10, 0), (86_420, 0), true),
+        ((20, 100), (10, 0), (10, 0), (5, 0), false),
+    ] {
+        clock.set(ctime);
+        run(fs.setattr(
+            &alice,
+            &file,
+            &SetAttr {
+                atime: at(atime),
+                mtime: at(mtime),
+                ..SetAttr::default()
+            },
+        ))
+        .unwrap();
+        let mut expected = run(fs.metadata(&alice, &file)).unwrap();
+        clock.set(now);
+        assert_eq!(read_at(&fs, &reader, 0).unwrap(), b"data");
+        if update {
+            expected.atime = now.into();
+        }
+        assert_eq!(run(fs.metadata(&alice, &file)).unwrap(), expected);
+    }
+    // tmpfs also records a successful read at EOF and a zero-length read.
+    for (offset, len) in [(4, 1), (0, 0)] {
+        clock.set((100, 0));
+        run(fs.setattr(
+            &alice,
+            &file,
+            &SetAttr {
+                atime: at((1, 0)),
+                ..SetAttr::default()
+            },
+        ))
+        .unwrap();
+        clock.set((200, 0));
+        assert_eq!(run(fs.read_at(&reader, &mut vec![0; len], offset)), Ok(0));
+        assert_eq!(
+            run(fs.metadata(&alice, &file)).unwrap().atime,
+            (200, 0).into()
+        );
+    }
+}
+
+#[test]
+fn directory_and_symlink_reads_update_only_the_accessed_inode() {
+    let fs = fs();
+    let root = fs.root();
+    let alice = user(1000);
+    let empty = run(fs.mkdir(&alice, &root, "empty", 0o700)).unwrap().handle;
+    let dir = run(fs.mkdir(&alice, &root, "dir", 0o700)).unwrap().handle;
+    let file = new_file(&fs, &alice, &dir, "f", 0o600, b"data");
+    let link = run(fs.symlink(&alice, &root, "link", "dir/f"))
+        .unwrap()
+        .handle;
+    let file_before = run(fs.metadata(&alice, &file)).unwrap();
+    for handle in [&empty, &dir, &link] {
+        run(fs.setattr(
+            &alice,
+            handle,
+            &SetAttr {
+                atime: Time::At { sec: 0, nsec: 0 },
+                ..SetAttr::default()
+            },
+        ))
+        .unwrap();
+        let mut expected = run(fs.metadata(&alice, handle)).unwrap();
+        for attempt in 0..2 {
+            if expected.is_dir() {
+                run(fs.read_dir(&alice, handle)).unwrap();
+            } else {
+                assert_eq!(run(fs.read_link(&alice, handle)).unwrap(), "dir/f");
+            }
+            let after = run(fs.metadata(&alice, handle)).unwrap();
+            if attempt == 0 {
+                assert!(after.atime > expected.atime);
+                expected.atime = after.atime;
+            }
+            assert_eq!(after, expected);
+        }
+    }
+    // Denied/wrong-type reads cannot update timestamps, nor does reading a link read its target.
+    let dir_before = run(fs.metadata(&alice, &dir)).unwrap();
+    assert_eq!(run(fs.read_dir(&user(1001), &dir)), Err(Errno::EACCES));
+    assert_eq!(run(fs.read_link(&alice, &file)), Err(Errno::EINVAL));
+    let writer = open(&fs, &alice, &file, write()).unwrap();
+    assert_eq!(read_at(&fs, &writer, 0), Err(Errno::EBADF));
+    assert_eq!(run(fs.metadata(&alice, &dir)).unwrap(), dir_before);
+    assert_eq!(run(fs.metadata(&alice, &file)).unwrap(), file_before);
+}
+
+#[test]
+fn positional_reads_reject_offsets_outside_off_t_before_eof() {
+    let fs = fs();
+    let alice = user(1000);
+    let file = new_file(&fs, &alice, &fs.root(), "f", 0o600, b"data");
+    let reader = open(&fs, &alice, &file, read()).unwrap();
+    let before = run(fs.metadata(&alice, &file)).unwrap();
+    let mut buf = [42; 2];
+    for offset in [FILE_MAX + 1, u64::MAX] {
+        assert_eq!(
+            run(fs.read_at(&reader, &mut buf, offset)),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            run(fs.read_at(&reader, &mut [], offset)),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(buf, [42; 2]);
+        assert_eq!(run(fs.metadata(&alice, &file)).unwrap(), before);
+    }
+    // Linux rejects a signed offset overflow in the requested range before checking EOF too.
+    for offset in [FILE_MAX - 1, FILE_MAX] {
+        assert_eq!(
+            run(fs.read_at(&reader, &mut buf, offset)),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(run(fs.metadata(&alice, &file)).unwrap(), before);
+    }
+    assert_eq!(run(fs.read_at(&reader, &mut buf, FILE_MAX - 2)), Ok(0));
+    assert_eq!(run(fs.read_at(&reader, &mut [], FILE_MAX)), Ok(0));
+    assert_eq!(buf, [42; 2]);
+}
 
 #[test]
 fn open_files_survive_unlink_and_rename_until_released() {
