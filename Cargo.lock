@@ -2873,6 +2873,7 @@ dependencies = [
 name = "os-vfs"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "os-abi",
  "os-core",
  "serde",

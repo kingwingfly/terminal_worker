@@ -381,7 +381,6 @@ pub fn open(fs: &impl Fs, process: &Process, path: &str, flags: u32, mode: u16) 
     match name.node {
         Some(_) if exclusive => Err(Errno::EEXIST.into()),
         Some(node) if flags & O_DIRECTORY != 0 && !node.directory => Err(Errno::ENOTDIR.into()),
-        Some(node) if node.directory && write => Err(Errno::EISDIR.into()),
         None if flags & O_DIRECTORY != 0 => Err(Errno::ENOENT.into()),
         Some(node) => {
             let access = if flags & O_ACCMODE == abi::O_RDWR {
@@ -391,7 +390,7 @@ pub fn open(fs: &impl Fs, process: &Process, path: &str, flags: u32, mode: u16) 
             } else {
                 READ
             };
-            require(cred, &node, access)?;
+            inode::may_open(cred, &node, access)?;
             Ok(Opening::Existing {
                 path: name.path,
                 node,
@@ -401,7 +400,7 @@ pub fn open(fs: &impl Fs, process: &Process, path: &str, flags: u32, mode: u16) 
         None if path.ends_with('/') => Err(Errno::EISDIR.into()),
         None => {
             let dir = writable_dir(fs, cred, &name.path)?;
-            let node = created(cred, &dir, mode & 0o777, false, process.umask);
+            let node = created(cred, &dir, mode & 0o7777, false, process.umask);
             Ok(Opening::New {
                 path: name.path,
                 node,
@@ -456,15 +455,11 @@ pub fn mknod(fs: &mut impl Fs, process: &Process, path: &str, mode: u16) -> Resu
     Ok(())
 }
 
-/// Whether `cred` may take the name `path`, of `node`, out of its directory, which it may
-/// write: in a sticky one, only its owner, the directory's owner and root may.
+/// Whether `cred` may take the name `path`, of `node`, out of its directory, as
+/// [`inode::may_delete`] has it.
 fn unlinkable(fs: &impl Fs, cred: &Identity, path: &str, node: &Node) -> Result<()> {
     let dir = fs.node(parent(path)).ok_or(Errno::ENOENT)?;
-    require(cred, &dir, WRITE | EXEC)?;
-    if dir.mode & STICKY != 0 && cred.id != 0 && cred.id != node.owner && cred.id != dir.owner {
-        return Err(Errno::EPERM.into());
-    }
-    Ok(())
+    Ok(inode::may_delete(cred, &dir, node)?)
 }
 
 pub fn rmdir(fs: &mut impl Fs, cred: &Identity, path: &str) -> Result<()> {
@@ -622,22 +617,9 @@ pub fn link(fs: &mut impl Fs, cred: &Identity, from: &str, to: &str, follow: boo
 
 /// symlink(2): a link at `path` to `target`, which need not exist.
 pub fn symlink(fs: &mut impl Fs, cred: &Identity, target: &str, path: &str) -> Result<()> {
-    if target.is_empty() {
-        return Err(Errno::ENOENT.into());
-    }
-    if target.len() > abi::PATH_MAX {
-        return Err(Errno::ENAMETOOLONG.into());
-    }
-    if target.contains('\0') {
-        return Err(Errno::EINVAL.into());
-    }
+    inode::check_link_target(target)?;
     let (real, dir) = creating(fs, cred, path)?;
-    let group = if dir.mode & SETGID != 0 {
-        dir.group
-    } else {
-        cred.group
-    };
-    fs.set_node(&real, &Node::symlink(cred.id, group, target));
+    fs.set_node(&real, &inode::new_symlink(cred, &dir, target));
     Ok(())
 }
 

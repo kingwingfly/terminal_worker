@@ -139,14 +139,26 @@ pub fn acl(node: &Node, space: Space) -> Result<Entries, Errno> {
     }
 }
 
-/// Take `entries` as the ACL `space` of `node`: EINVAL for entries Linux refuses, EACCES for a
-/// default ACL on anything but a directory. An access ACL sets the mode's permission bits.
-pub fn set_acl(node: &mut Node, space: Space, entries: Entries) -> Result<(), Errno> {
+/// Take `entries` as the ACL `space` of `node`, set by `cred`: EINVAL for entries Linux
+/// refuses, EACCES for a default ACL on anything but a directory. An access ACL sets the mode's
+/// permission bits and, as chmod, clears setgid unless `cred` is root or in the node's group
+/// (posix_acl_update_mode).
+pub fn set_acl(
+    cred: &Identity,
+    node: &mut Node,
+    space: Space,
+    entries: Entries,
+) -> Result<(), Errno> {
     if !valid_acl(&entries) {
         return Err(Errno::EINVAL);
     }
     match space {
-        Space::Access => node.set_entries(&entries),
+        Space::Access => {
+            node.set_entries(&entries);
+            if cred.id != 0 && !cred.groups.contains(&node.group) {
+                node.mode &= !crate::permissions::SETGID;
+            }
+        }
         Space::Default if node.directory => node.default_acl = Some(entries),
         Space::Default => return Err(Errno::EACCES),
         Space::User | Space::Trusted => return Err(Errno::EINVAL),

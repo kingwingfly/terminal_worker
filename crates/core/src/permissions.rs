@@ -234,17 +234,23 @@ pub enum Id {
 /// A new node in the directory `parent`, made by `who` asking for the permission bits
 /// `requested`, as open(2) and mkdir(2) make one: owned by `who`, in the directory's group if
 /// it is setgid, else in `who`'s; with the requested bits less `umask`, or, if the directory has
-/// a default ACL, that ACL bounded by the requested bits. A directory inherits the default ACL,
-/// and the setgid bit, and keeps the sticky bit requested, as mkdir(2) does.
+/// a default ACL, that ACL bounded by the requested bits. A directory inherits the default ACL
+/// and the setgid bit, and keeps the sticky bit requested, as mkdir(2) does. A file keeps the
+/// setuid and setgid bits requested, as open(2) and mknod(2) do, except setgid and
+/// group-executable in a setgid directory whose group is not one of `who`'s (mode_strip_sgid).
 pub fn created(who: &Identity, parent: &Node, requested: u16, directory: bool, umask: u16) -> Node {
-    let group = if parent.mode & SETGID != 0 {
-        parent.group
-    } else {
-        who.group
-    };
+    let group = crate::inode::new_group(who, parent);
     let mut node = Node::directory(who.id, group, 0);
     node.directory = directory;
-    let sticky = requested & STICKY;
+    let mut special = if directory {
+        requested & STICKY
+    } else {
+        requested & (SETUID | SETGID)
+    };
+    let foreign = parent.mode & SETGID != 0 && who.id != 0 && !who.groups.contains(&parent.group);
+    if !directory && foreign && requested & (SETGID | 0o010) == SETGID | 0o010 {
+        special &= !SETGID;
+    }
     let requested = requested & 0o777;
     match &parent.default_acl {
         Some(default) => {
@@ -256,8 +262,9 @@ pub fn created(who: &Identity, parent: &Node, requested: u16, directory: bool, u
     }
     if directory {
         node.default_acl = parent.default_acl.clone();
-        node.mode |= (parent.mode & SETGID) | sticky;
+        node.mode |= parent.mode & SETGID;
     }
+    node.mode |= special;
     node
 }
 
@@ -364,12 +371,7 @@ pub trait Store {
                         if followed > LINKS_MAX {
                             return Err(format!("Too many levels of symbolic links: {path}"));
                         }
-                        if dir.mode & STICKY != 0
-                            && dir.mode & 0o002 != 0
-                            && who.id != 0
-                            && who.id != link.owner
-                            && dir.owner != link.owner
-                        {
+                        if !crate::inode::may_follow_link(who, &dir, &link) {
                             return Err(format!(
                                 "Permission denied: {child} is another account's link in a shared sticky directory"
                             ));
@@ -445,7 +447,7 @@ pub trait Store {
         let Some(dir) = self.node(parent(path)) else {
             return Ok(());
         };
-        if dir.mode & STICKY != 0 && who.id != 0 && who.id != node.owner && who.id != dir.owner {
+        if !crate::inode::sticky_allows(who, &dir, node) {
             return Err(format!(
                 "Operation not permitted: {path} is another account's, in a sticky directory"
             ));

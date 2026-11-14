@@ -45,7 +45,7 @@ pub fn set(
         Space::Access | Space::Default => {
             xattr::check_flags(flags, xattr::has_acl(&node, space))?;
             let entries: Entries = serde_json::from_slice(value).map_err(|_| abi::Errno::EINVAL)?;
-            xattr::set_acl(&mut node, space, entries)?;
+            xattr::set_acl(cred, &mut node, space, entries)?;
             fs.set_node(&real, &node);
         }
         Space::User | Space::Trusted => {
