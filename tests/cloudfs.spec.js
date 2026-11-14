@@ -1,0 +1,170 @@
+import { test, expect, request as contexts } from './test.js';
+import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { api, call, put, sys } from './sys.js';
+const origin = process.env.OS_TEST_URL || 'http://127.0.0.1:8787';
+const password = process.env.OS_PASSWORD || readFileSync('.local-password', 'utf8').trim();
+const options = (access='read-write', extra={}) => ({read:access==='read'||access==='read-write',write:access==='write'||access==='read-write',append:false,append_implies_write:false,truncate:false,create:false,create_new:false,exec:access==='exec',path:access==='path',...extra});
+const attrs = extra => ({mode:null,uid:null,gid:null,size:null,atime:'omit',mtime:'omit',...extra});
+async function admit(request) { return call(request,{execve:{path:'/usr/bin/coreutils',argv:['coreutils','sleep','300'],env:[],cwd:'/'}}); }
+async function rpc(request,credential,session,call,errno,version=2) {
+  const response=await request.post(origin+'/api/fs',{headers:{Origin:origin},data:{version,credential,session,call}});const body=await response.json();
+  if(errno){expect(body.errno,JSON.stringify(body)).toBe(errno);return body;}
+  expect(response.ok(),JSON.stringify(body)).toBe(true);return body;
+}
+async function connection(request,token) {
+  const c={...await rpc(request,token,null,'connect'),request,token};
+  c.call=(op,args,errno)=>rpc(request,token,c.session,args===undefined?op:{[op]:args},errno);
+  c.data=async(open,operation,bytes,errno)=>{
+    const response=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Filesystem':JSON.stringify({version:2,credential:token,session:c.session,open,operation})},data:bytes??Buffer.alloc(0)});
+    if(errno){expect((await response.json()).errno).toBe(errno);return;}
+    expect(response.ok(),response.ok()?'':await response.text()).toBe(true);return 'read' in operation?response.body():response.json();
+  };
+  c.open=(handle,access='read-write',extra={})=>c.call('open',{ticket:randomUUID(),handle,options:options(access,extra)});
+  c.create=(dir,name,mode=0o600)=>c.call('create',{ticket:randomUUID(),dir,name,mode,options:options('read-write',{create_new:true})});
+  c.read=(open,offset=0,length=4096)=>c.data(open,{read:{offset,length}});
+  c.write=(open,bytes,at='end')=>c.data(open,{write:{at,length:Buffer.byteLength(bytes)}},Buffer.from(bytes));
+  return c;
+}
+async function setup(request) {
+  await call(request,'getcreds');expect((await api(request,'login',{data:{username:'root',password}})).ok()).toBe(true);
+  const p=await admit(request);const c=await connection(request,p.token);
+  const dir=await c.call('mkdir',{dir:c.root,name:'vfs-'+randomUUID(),mode:0o777});return {c,dir:dir.handle,p};
+}
+test('v2 checks credentials, version, instance ownership, proofs and component syntax',async({request})=>{
+  const {c,dir}=await setup(request);const other=await connection(request,c.token);
+  await c.call('metadata',{handle:other.root},'EACCES');await other.call('metadata',{handle:dir},'EACCES');
+  const forged=structuredClone(dir);forged.node.ino++;await c.call('metadata',{handle:forged},'EACCES');
+  await rpc(request,'forged',c.session,{metadata:{handle:dir}},'EACCES');await rpc(request,c.token,{...c.session,secret:'forged'},{metadata:{handle:dir}},'EACCES');
+  await rpc(request,c.token,c.session,'statfs','EPROTONOSUPPORT',1);
+  await rpc(request,c.token,c.session,{old_path_call:{path:'/'}},'EPROTONOSUPPORT',1);
+  for(const name of ['','..','.','a/b','x\0y'])await c.call('lookup',{dir,name},'EINVAL');
+  await c.call('walk',{dir,names:['missing','..']},'EINVAL');
+  const p=await admit(request);expect((await rpc(request,p.token,c.session,{metadata:{handle:dir}})).file_type).toBe('dir');
+  await c.call('disconnect');await other.call('disconnect');
+});
+test('open access, rename/unlink, O_PATH, sparse bytes and old readers share one inode tree',async({request})=>{
+  const {c,dir}=await setup(request);const [entry,open]=await c.create(dir,'file',0o400);
+  expect(await c.write(open,'abcdef')).toEqual({offset:0,len:6});
+  await c.call('rename',{from_dir:dir,from:'file',to_dir:dir,to:'renamed',flags:''});
+  expect((await c.call('lookup',{dir,name:'renamed'})).handle.node).toEqual(entry.handle.node);
+  const ro=await c.open(entry.handle,'read');await c.data(ro,{write:{at:'end',length:1}},Buffer.from('x'),'EBADF');
+  await c.call('set_len',{open,size:3});await c.call('set_len',{open,size:7});expect(await c.read(open)).toEqual(Buffer.from([97,98,99,0,0,0,0]));
+  expect(await c.write(open,'Z',{offset:5})).toEqual({offset:5,len:1});
+  const name=(await c.call('parent',{dir}))[1];const old=await request.get(origin+'/api/file?path='+encodeURIComponent('/'+name+'/renamed'));
+  expect(old.ok(),old.ok()?'':await old.text()).toBe(true);expect(await old.body()).toEqual(await c.read(open));
+  await c.call('unlink',{dir,name:'renamed'});expect((await c.call('metadata',{handle:entry.handle})).nlink).toBe(0);expect((await c.read(open)).length).toBe(7);
+  await c.call('release',{open});await c.call('release',{open:ro});await c.call('metadata',{handle:entry.handle},'ESTALE');
+  const sub=await c.call('mkdir',{dir,name:'cwd',mode:0});const path=await c.open(sub.handle,'path');await c.call('rmdir',{dir,name:'cwd'});
+  expect((await c.call('metadata',{handle:sub.handle})).nlink).toBe(0);await c.call('parent',{dir:sub.handle},'ENOENT');await c.call('read_dir',{dir:sub.handle},'ENOENT');
+  await c.data(path,{read:{offset:0,length:1}},undefined,'EBADF');await c.call('release',{open:path});await c.call('disconnect');
+});
+test('atomic append, lock families, durable waits, cancellation and resume',async({request})=>{
+  const {c,dir}=await setup(request);const [entry,a]=await c.create(dir,'file');const b=await c.open(entry.handle);const d=await c.open(entry.handle);
+  const writes=await Promise.all(Array.from({length:12},(_,i)=>c.write(i%2?a:b,String.fromCharCode(65+i))));expect(new Set(writes.map(w=>w.offset)).size).toBe(12);expect((await c.read(a)).length).toBe(12);
+  const range={start:0,end:null};const lock=(open,kind='exclusive',family='posix')=>({open,kind,family,range});
+  await c.call('try_lock',lock(a));await c.call('try_lock',lock(b),'EAGAIN');await c.call('try_lock',lock(b,'exclusive','flock'));
+  const ticket=randomUUID();expect(await c.call('lock',{...lock(b),ticket})).toBe(false);expect((await c.call('test_lock',{open:d,kind:'exclusive',range})).owner).toBe(a.id);
+  await c.call('renew');await c.call('unlock',{open:a,family:'posix',range});expect(await c.call('lock',{...lock(b),ticket})).toBe(true);await c.call('ack_lock',{open:b,ticket});
+  await c.call('cancel_lock',{open:b,ticket});expect(await c.call('test_lock',{open:d,kind:'exclusive',range})).toBeNull();
+  const cancelled=randomUUID();await c.call('cancel_lock',{open:b,ticket:cancelled});await c.call('lock',{...lock(b),ticket:cancelled},'ECANCELED');await c.call('disconnect');
+});
+test('cancelled opens are idempotent, stale handles stay stale, and reads reject invalid offsets',async({request})=>{
+  const {c,dir}=await setup(request);const [entry,open]=await c.create(dir,'file');
+  const ticket=randomUUID();const ask={ticket,handle:entry.handle,options:options()};const retained=await c.call('open',ask);expect(await c.call('open',ask)).toEqual(retained);
+  await c.call('cancel_open',{ticket});await c.call('open',ask,'ECANCELED');const early=randomUUID();await c.call('cancel_open',{ticket:early});await c.call('open',{...ask,ticket:early},'ECANCELED');
+  await c.data(open,{read:{offset:2**63,length:0}},undefined,'EINVAL');
+  await c.call('unlink',{dir,name:'file'});await c.call('release',{open});await c.call('metadata',{handle:entry.handle},'ESTALE');
+  const [replacement]=await c.create(dir,'file');expect(replacement.handle.node.ino).not.toBe(entry.handle.node.ino);await c.call('metadata',{handle:entry.handle},'ESTALE');await c.call('disconnect');
+});
+test('metadata, hardlinks, xattrs, relatime and grants use current credentials at the correct boundary',async({request})=>{
+  const {c,dir}=await setup(request);const [entry,open]=await c.create(dir,'file');await c.write(open,'data');
+  const linked=await c.call('link',{target:entry.handle,dir,name:'linked'});expect(linked.metadata.nlink).toBe(2);
+  await c.call('rename',{from_dir:dir,from:'file',to_dir:dir,to:'linked',flags:'NOREPLACE'},'EEXIST');
+  await c.call('setxattr',{handle:entry.handle,name:'user.test',value:[0,1,255],flags:'CREATE'});
+  expect(await c.call('getxattr',{handle:linked.handle,name:'user.test'})).toEqual([0,1,255]);
+  await c.call('setxattr',{handle:entry.handle,name:'user.test',value:[2],flags:'CREATE'},'EEXIST');
+  await c.call('setattr',{handle:entry.handle,attr:attrs({mode:0,atime:{sec:1,nsec:0}})});
+  expect((await c.call('metadata',{handle:entry.handle})).atime.sec).toBe(1);await c.read(open);expect((await c.call('metadata',{handle:entry.handle})).atime.sec).toBeGreaterThan(1);
+  await c.call('open',{ticket:randomUUID(),handle:entry.handle,options:options('exec')},'EACCES');
+  await api(request,'logout');const guest=await admit(request);
+  await rpc(request,guest.token,c.session,{open:{ticket:randomUUID(),handle:entry.handle,options:options('read')}},'EACCES');
+  const path=await rpc(request,guest.token,c.session,{open:{ticket:randomUUID(),handle:entry.handle,options:options('path')}});
+  await c.call('release',{open:path}); // another valid credential in the same instance
+  expect((await c.read(open)).toString()).toBe('data');await c.write(open,'!');
+  const sym=await c.call('symlink',{dir,name:'sym',target:'linked'});await c.call('setattr',{handle:sym.handle,attr:attrs({atime:{sec:1,nsec:0}})});
+  expect(await c.call('read_link',{handle:sym.handle})).toBe('linked');expect((await c.call('metadata',{handle:sym.handle})).atime.sec).toBeGreaterThan(1);
+  expect((await c.call('walk',{dir,names:['sym','child']})).stop).toEqual({Symlink:0});
+  await c.call('disconnect');
+});
+test('revoking an opener releases its inode and locks even when another credential presents the reference',async({request})=>{
+  const {c,dir,p}=await setup(request);const observer=await admit(request);
+  const [entry,open]=await c.create(dir,'file');await c.write(open,'kept');await c.call('unlink',{dir,name:'file'});
+  await call(request,{kill:{pid:String(p.pid),signal:9}});
+  await rpc(request,observer.token,c.session,{sync:{open,data_only:false}},'EACCES');
+  await rpc(request,observer.token,c.session,{metadata:{handle:entry.handle}},'ESTALE');
+  await rpc(request,observer.token,c.session,'disconnect');
+});
+test('lease expiry releases references while an independently renewed session remains usable',async({request})=>{
+  test.setTimeout(180000);
+  const {c,dir,p}=await setup(request);const other=await connection(request,c.token);
+  const [entry,open]=await c.create(dir,'expire');await c.write(open,'lease');
+  const dirName=(await c.call('parent',{dir}))[1];const otherDir=(await other.call('lookup',{dir:other.root,name:dirName})).handle;
+  const observed=(await other.call('lookup',{dir:otherDir,name:'expire'})).handle;await c.call('unlink',{dir,name:'expire'});
+  for(let i=0;i<5;i++){await new Promise(r=>setTimeout(r,25000));expect((await sys(request,[{proc_keep:{processes:[{pid:p.pid,proc:p.token}]}}],{}, {"X-Registry":"1"}))[0].err).toBeUndefined();await other.call('renew');}
+  await other.call('metadata',{handle:observed},'ESTALE');await c.call('renew',undefined,'ENOTCONN');await other.call('disconnect');
+});
+test('signed 64-bit offsets retain precision across SQLite and the Worker gateway',async({request})=>{
+  const {c,dir}=await setup(request);const [entry,open]=await c.create(dir,'large');
+  const data={version:2,credential:c.token,session:c.session,open,operation:{write:{at:{offset:'LARGE_OFFSET'},length:1}}};
+  const response=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Filesystem':JSON.stringify(data).replace('"LARGE_OFFSET"','9223372036854775806')},data:Buffer.from('x')});
+  expect(response.ok(),response.ok()?'':await response.text()).toBe(true);
+  expect(await response.text()).toContain('9223372036854775806');
+  const meta=await request.post(origin+'/api/fs',{headers:{Origin:origin},data:{version:2,credential:c.token,session:c.session,call:{metadata:{handle:entry.handle}}}});
+  expect(meta.ok()).toBe(true);expect(await meta.text()).toContain('"size":9223372036854775807');
+  data.operation={read:{offset:'LARGE_OFFSET',length:1}};
+  const read=await request.post(origin+'/api/fs/data',{headers:{Origin:origin,'X-OS-Filesystem':JSON.stringify(data).replace('"LARGE_OFFSET"','9223372036854775806')},data:Buffer.alloc(0)});
+  expect(read.ok(),read.ok()?'':await read.text()).toBe(true);expect((await read.body()).toString()).toBe('x');
+  await c.call('unlink',{dir,name:'large'});await c.call('disconnect');
+});
+test('moving a directory preserves descendant inode metadata and revocation denies writes',async({request})=>{
+  const {c,dir,p}=await setup(request);const sub=await c.call('mkdir',{dir,name:'from',mode:0o700});
+  const [entry,open]=await c.create(sub.handle,'file');await c.write(open,'before');
+  const before=await c.call('metadata',{handle:entry.handle});
+  await c.call('rename',{from_dir:dir,from:'from',to_dir:dir,to:'to',flags:''});
+  expect(await c.call('metadata',{handle:entry.handle})).toEqual(before);
+  // Existing path uploads are read through the v2 adapter, and become shared extents on edit.
+  const rootName=(await c.call('parent',{dir}))[1];
+  expect((await put(request,origin+'/api/file?path='+encodeURIComponent('/'+rootName+'/old'),{data:'legacy'})).ok()).toBe(true);
+  const old=await c.call('lookup',{dir,name:'old'});const oldOpen=await c.open(old.handle);
+  await c.write(oldOpen,'NEW',{offset:0});expect((await c.read(oldOpen)).toString()).toBe('NEWacy');
+  await call(request,{kill:{pid:String(p.pid),signal:9}});
+  await c.data(open,{write:{at:'end',length:1}},Buffer.from('x'),'EACCES');
+});
+test('separate service instances share inode locks but cannot exchange handle proofs',async({request})=>{
+  const {c,dir}=await setup(request);const [entry,open]=await c.create(dir,'shared');await c.write(open,'shared');
+  const other=await connection(request,c.token);expect(other.root.fs).toBe(c.root.fs);
+  const name=(await c.call('parent',{dir}))[1];const od=(await other.call('lookup',{dir:other.root,name})).handle;
+  const theirs=(await other.call('lookup',{dir:od,name:'shared'})).handle;expect(theirs.node).toEqual(entry.handle.node);expect(theirs.proof).not.toBe(entry.handle.proof);
+  const peer=await other.open(theirs);const range={start:0,end:null};
+  await c.call('try_lock',{open,family:'flock',kind:'exclusive',range});await other.call('try_lock',{open:peer,family:'flock',kind:'exclusive',range},'EAGAIN');
+  await c.call('unlink',{dir,name:'shared'});await c.call('disconnect');
+  await other.call('try_lock',{open:peer,family:'flock',kind:'exclusive',range});expect((await other.read(peer)).toString()).toBe('shared');
+  await other.call('release',{open:peer});await other.call('metadata',{handle:theirs},'ESTALE');await other.call('disconnect');
+});
+test('account lock revokes open grants and unlocking never revives them',async({request})=>{
+  const {c:admin}=await setup(request);const name='vfsc'+randomUUID().replaceAll('-','').slice(0,12);const password='account-'+randomUUID();
+  await call(request,{useradd:{name,create_home:true}});
+  const account=await contexts.newContext({extraHTTPHeaders:{'CF-Connecting-IP':'cloudfs-'+randomUUID()}});
+  try{
+    expect((await api(request,'passwd',{data:{username:name,password}})).ok()).toBe(true);
+    await call(account,'getcreds');expect((await api(account,'login',{data:{username:name,password}})).ok()).toBe(true);
+    const actor=await admit(account);const c=await connection(account,actor.token);const creds=await call(account,'getcreds');
+    const walked=await c.call('walk',{dir:c.root,names:creds.home.split('/').filter(Boolean)});const home=walked.entries.at(-1).handle;
+    const [entry,open]=await c.create(home,'retained');await c.write(open,'private');await c.call('unlink',{dir:home,name:'retained'});
+    await call(request,{usermod:{name,lock:true}});await c.data(open,{read:{offset:0,length:7}},undefined,'EACCES');
+    const guest=await admit(account);await rpc(account,guest.token,c.session,{metadata:{handle:entry.handle}},'ESTALE');
+    await call(request,{usermod:{name,unlock:true}});await c.call('renew',undefined,'EACCES');
+    await rpc(account,guest.token,c.session,'disconnect');
+  }finally{await account.dispose();await call(request,{userdel:{name,remove:true}});await admin.call('disconnect');}
+});

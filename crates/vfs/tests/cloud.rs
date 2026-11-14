@@ -1,0 +1,226 @@
+use abi::Errno;
+use abi::remote_fs::{self as wire, Call, DataRequest};
+use os_vfs::{
+    cloud::{CloudFs, Transport},
+    locks::{Held, Locks},
+    *,
+};
+use serde_json::{Value, json};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
+#[derive(Clone, Default)]
+struct Host {
+    pending: Rc<Cell<bool>>,
+    calls: Rc<RefCell<Vec<Call>>>,
+    next: Rc<Cell<u64>>,
+}
+fn root() -> Handle {
+    Handle {
+        fs: FsId("remote".into()),
+        node: NodeId {
+            ino: 1,
+            generation: 1,
+        },
+        proof: "proof".into(),
+    }
+}
+fn open() -> OpenRef {
+    OpenRef {
+        fs: root().fs,
+        id: 1,
+        node: NodeId {
+            ino: 2,
+            generation: 1,
+        },
+        access: Access::ReadWrite,
+    }
+}
+impl Transport for Host {
+    fn request(&self, request: wire::Request) -> BoxFuture<'_, Value> {
+        Box::pin(async move {
+            self.calls.borrow_mut().push(request.call.clone());
+            if self.pending.get() {
+                return std::future::pending().await;
+            }
+            Ok(match request.call {
+                Call::Connect => json!(wire::Connected {
+                    version: 2,
+                    session: wire::Session {
+                        id: "session".into(),
+                        secret: "secret".into()
+                    },
+                    root: root(),
+                    capabilities: profiles::CLOUD,
+                    lease_seconds: 120
+                }),
+                Call::Open { .. } => json!(open()),
+                Call::Lock { .. } => json!(false),
+                _ => Value::Null,
+            })
+        })
+    }
+    fn read(&self, _: DataRequest) -> BoxFuture<'_, Vec<u8>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn write<'a>(&'a self, _: DataRequest, bytes: &'a [u8]) -> BoxFuture<'a, Written> {
+        Box::pin(async move {
+            Ok(Written {
+                offset: 0,
+                len: bytes.len(),
+            })
+        })
+    }
+    fn pause(&self) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::pending())
+    }
+    fn ticket(&self) -> String {
+        let n = self.next.get() + 1;
+        self.next.set(n);
+        n.to_string()
+    }
+}
+fn ready<T>(future: BoxFuture<'_, T>) -> Result<T> {
+    now_or_never(future).expect("ready")
+}
+#[test]
+fn abandoned_and_cancelled_remote_opens_keep_cleanup_until_delivered() {
+    let host = Host::default();
+    let fs = now_or_never(CloudFs::connect(host.clone(), "credential".into()))
+        .unwrap()
+        .unwrap();
+    let mut cred = Cred::root();
+    cred.token = Some("credential".into());
+    let opts = *OpenOptions::new().read(true);
+    drop(fs.open(&cred, &root(), &opts));
+    assert_eq!(host.calls.borrow().len(), 1);
+    host.pending.set(true);
+    assert!(now_or_never(fs.open(&cred, &root(), &opts)).is_none());
+    assert_eq!(fs.pending_cancellations(), 1);
+    // Cancelling cleanup itself preserves it; a later reconnection drains it once.
+    assert!(now_or_never(fs.drain()).is_none());
+    assert_eq!(fs.pending_cancellations(), 1);
+    host.pending.set(false);
+    assert_eq!(now_or_never(fs.drain()), Some(Ok(())));
+    assert_eq!(fs.pending_cancellations(), 0);
+    assert!(matches!(host.calls.borrow().last(),Some(Call::CancelOpen{ticket}) if ticket=="1"));
+}
+#[test]
+fn cancelled_release_is_retried_and_invalid_read_offsets_never_cross_transport() {
+    let host = Host::default();
+    let fs = now_or_never(CloudFs::connect(host.clone(), "credential".into()))
+        .unwrap()
+        .unwrap();
+    let mut cred = Cred::root();
+    cred.token = Some("credential".into());
+    let opened = ready(fs.open(&cred, &root(), OpenOptions::new().read(true).write(true))).unwrap();
+    assert_eq!(
+        ready(fs.read_at(&opened, &mut [], u64::MAX)),
+        Err(Errno::EINVAL)
+    );
+    let mut forged = opened.clone();
+    forged.node.ino += 1;
+    assert_eq!(ready(fs.release(&forged)), Err(Errno::EACCES));
+    assert_eq!(fs.pending_cancellations(), 0);
+    host.pending.set(true);
+    assert!(now_or_never(fs.release(&opened)).is_none());
+    assert_eq!(fs.pending_cancellations(), 1);
+    host.pending.set(false);
+    assert_eq!(now_or_never(fs.drain()), Some(Ok(())));
+    assert_eq!(ready(fs.sync_all(&opened)), Err(Errno::EBADF));
+}
+fn held(owner: u64, start: u64, end: Option<u64>) -> Held {
+    Held {
+        owner,
+        family: LockFamily::Posix,
+        kind: LockKind::Exclusive,
+        range: LockRange::new(start, end).unwrap(),
+        ticket: None,
+    }
+}
+#[test]
+fn serialized_waits_wake_and_cancel_without_crossing_lock_families() {
+    let mut locks = Locks::default();
+    assert_eq!(locks.acquire(held(1, 0, None), None, &[]), Ok(true));
+    assert_eq!(
+        locks.acquire(held(2, 0, None), Some("wait"), &[]),
+        Ok(false)
+    );
+    let mut restored: Locks = serde_json::from_value(json!(locks)).unwrap();
+    restored.release(1);
+    assert_eq!(
+        restored.acquire(held(2, 0, None), Some("wait"), &[]),
+        Ok(true)
+    );
+    restored.cancel(2, "wait");
+    assert!(restored.held.is_empty());
+    assert_eq!(
+        restored.acquire(held(2, 0, None), Some("wait"), &[]),
+        Err(Errno::ECANCELED)
+    );
+    restored.cancel(3, "before");
+    assert_eq!(
+        restored.acquire(held(3, 0, None), Some("before"), &[]),
+        Err(Errno::ECANCELED)
+    );
+    let mut flock = held(4, 0, None);
+    flock.family = LockFamily::Flock;
+    restored.acquire(flock, None, &[]).unwrap();
+    assert_eq!(restored.acquire(held(5, 0, None), None, &[]), Ok(true));
+}
+#[test]
+fn durable_posix_deadlock_detection_crosses_inodes_and_unlock_splits_ranges() {
+    let mut a = Locks::default();
+    let mut b = Locks::default();
+    a.acquire(held(1, 0, None), None, &[]).unwrap();
+    b.acquire(held(2, 0, None), None, &[]).unwrap();
+    assert_eq!(
+        a.acquire(held(2, 0, None), Some("two"), &[b.clone()]),
+        Ok(false)
+    );
+    assert_eq!(
+        b.acquire(held(1, 0, None), Some("one"), &[a.clone()]),
+        Err(Errno::EDEADLK)
+    );
+    b.carve(2, LockFamily::Posix, LockRange::new(5, Some(10)).unwrap());
+    assert_eq!(b.held.len(), 2);
+    assert!(b.conflict(&held(3, 5, Some(10))).is_none());
+    assert!(b.conflict(&held(3, 0, Some(1))).is_some());
+}
+#[test]
+fn acknowledged_locks_do_not_accumulate_wait_records() {
+    let mut state = Locks::default();
+    for n in 0..5000 {
+        let ticket = n.to_string();
+        assert_eq!(
+            state.acquire(held(1, 0, None), Some(&ticket), &[]),
+            Ok(true)
+        );
+        state.acknowledge(1, &ticket);
+        assert!(state.waits.is_empty());
+        state.carve(1, LockFamily::Posix, LockRange::WHOLE);
+    }
+}
+#[test]
+fn dropping_a_pending_remote_lock_queues_cancellation() {
+    let host = Host::default();
+    let fs = now_or_never(CloudFs::connect(host.clone(), "credential".into()))
+        .unwrap()
+        .unwrap();
+    let mut cred = Cred::root();
+    cred.token = Some("credential".into());
+    let open = ready(fs.open(&cred, &root(), OpenOptions::new().read(true).write(true))).unwrap();
+    assert!(
+        now_or_never(fs.lock(
+            &open,
+            LockFamily::Posix,
+            LockKind::Exclusive,
+            LockRange::WHOLE
+        ))
+        .is_none()
+    );
+    assert_eq!(fs.pending_cancellations(), 1);
+    assert_eq!(now_or_never(fs.drain()), Some(Ok(())));
+    assert!(matches!(host.calls.borrow().last(),Some(Call::CancelLock{ticket,..}) if ticket=="2"));
+}

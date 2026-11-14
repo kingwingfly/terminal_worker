@@ -107,6 +107,8 @@ struct Grant {
     mime: String,
     /// Committed chunks, as (index, R2 key).
     chunks: Vec<(u64, String)>,
+    #[serde(default)]
+    extents: Vec<crate::cloud_data::Extent>,
 }
 
 thread_local! {
@@ -341,11 +343,11 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
             chunks: grant.chunks.iter().cloned().collect(),
             file: grant.file.clone(),
         };
-        let bytes = Response::from_body(ResponseBody::Stream(reader.stream(
-            grant.chunk_size,
-            0,
-            grant.size.saturating_sub(1),
-        )))?;
+        let bytes = Response::from_body(ResponseBody::Stream(if grant.chunk_size == 0 {
+            crate::cloud_data::extent_stream(env.bucket("FILES")?, grant.extents, 0, grant.size)
+        } else {
+            reader.stream(grant.chunk_size, 0, grant.size.saturating_sub(1))
+        }))?;
         return crate::compiler::image(env, &grant.file, bytes, &compile).await;
     }
     let headers = Headers::new();
@@ -395,7 +397,11 @@ pub async fn read(req: Request, env: &Env) -> Result<Response> {
     if let Err(e) = crate::resources::request_io(env, &req, false, length).await {
         return crate::resources::refused(e);
     }
-    let body = reader.stream(grant.chunk_size, start, end);
+    let body = if grant.chunk_size == 0 {
+        crate::cloud_data::extent_stream(env.bucket("FILES")?, grant.extents, start, length)
+    } else {
+        reader.stream(grant.chunk_size, start, end)
+    };
     Ok(Response::from_body(ResponseBody::Stream(body))?
         .with_status(status)
         .with_headers(headers))
@@ -508,7 +514,7 @@ impl Reader {
 }
 
 /// Stream the request's body, of `length` bytes, to the R2 object `key`.
-async fn store(
+pub(crate) async fn store(
     env: &Env,
     req: &Request,
     key: &str,
