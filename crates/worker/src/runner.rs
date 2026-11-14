@@ -646,7 +646,17 @@ impl JobRunner {
         init.with_body(Some(if size == 0 {
             JsValue::from_str("")
         } else {
-            streams::objects(self.env.bucket("FILES")?, parts).into()
+            if grant["chunk_size"].as_u64() == Some(0) {
+                crate::cloud_data::extent_stream(
+                    self.env.bucket("FILES")?,
+                    serde_json::from_value(grant["extents"].clone())?,
+                    0,
+                    size,
+                )
+                .into()
+            } else {
+                streams::objects(self.env.bucket("FILES")?, parts).into()
+            }
         }));
         let response = fetcher
             .fetch(format!("http://jobs{url}"), Some(init))
