@@ -395,8 +395,16 @@ fn modes_and_owners_change_as_their_owner_or_root_may() {
         errno(chown(&mut fs, &ann, "/w/f", Some(1001), None, true)),
         Errno::EPERM
     );
+    // The owner may name the group the file has, or one of its own; no other, as Linux's
+    // chgrp_ok has it.
     assert_eq!(
-        errno(chown(&mut fs, &ann, "/w/f", None, Some(60), true)),
+        errno(chown(&mut fs, &ann, "/w/f", None, Some(70), true)),
+        Errno::EPERM
+    );
+    chown(&mut fs, &ann, "/w/f", None, Some(60), true).unwrap();
+    // Not even the owner it already has may someone else name.
+    assert_eq!(
+        errno(chown(&mut fs, &bob, "/w/f", Some(1000), None, true)),
         Errno::EPERM
     );
     chown(&mut fs, &ann, "/w/f", None, Some(50), true).unwrap();
@@ -656,4 +664,52 @@ fn execve_runs_regular_whole_files_the_caller_may_execute() {
     assert_eq!(executable(&fs, &ann, "/bin/link").unwrap().path, "/bin/own");
     fs.incomplete.insert("empty:/bin/own".into());
     assert_eq!(errno(executable(&fs, &ann, "/bin/own")), Errno::ETXTBSY);
+}
+
+#[test]
+fn the_rules_shared_with_the_vfs_follow_linux() {
+    let mut fs = fs();
+    let (ann, bob) = (user(1000, &[]), user(1001, &[]));
+    dir(&mut fs, "/w", 0, 0o777);
+    file(&mut fs, "/w/f", 1000, 0o666);
+    // Times: both now is any writer's; one now and one left alone is the owner's; nanoseconds
+    // past a second are refused.
+    utimens(&mut fs, &bob, "/w/f", Time::Now, Time::Now, true).unwrap();
+    assert_eq!(
+        errno(utimens(&mut fs, &bob, "/w/f", Time::Now, Time::Omit, true)),
+        Errno::EPERM
+    );
+    let late = Time::At {
+        sec: 1,
+        nsec: 1_000_000_000,
+    };
+    assert_eq!(
+        errno(utimens(&mut fs, &ann, "/w/f", late, Time::Omit, true)),
+        Errno::EINVAL
+    );
+    // chown naming neither owner nor group asks nothing.
+    chown(&mut fs, &bob, "/w/f", None, None, true).unwrap();
+    // open(O_CREAT) keeps the setuid bit asked for.
+    match open(&fs, &process(&ann), "/w/new", O_CREAT | O_WRONLY, 0o4755).unwrap() {
+        Opening::New { node, .. } => assert_eq!(node.mode, 0o4755),
+        Opening::Existing { .. } => panic!("expected a new file"),
+    }
+    // Symbolic link targets: shorter than PATH_MAX with the NUL, and without one.
+    let longest = "t".repeat(4095);
+    symlink(&mut fs, &ann, &longest, "/w/long").unwrap();
+    assert_eq!(
+        errno(symlink(&mut fs, &ann, &"t".repeat(4096), "/w/longer")),
+        Errno::ENAMETOOLONG
+    );
+    assert_eq!(
+        errno(symlink(&mut fs, &ann, "a\0b", "/w/nul")),
+        Errno::EINVAL
+    );
+    // Setting an access ACL clears setgid for an owner outside the group, as chmod does.
+    file(&mut fs, "/w/g", 1000, 0o755);
+    chown(&mut fs, &Identity::root(), "/w/g", None, Some(50), true).unwrap();
+    chmod(&mut fs, &Identity::root(), "/w/g", 0o2755).unwrap();
+    let entries = br#"{"user":7,"group":5,"other":5,"mask":7,"users":{"1001":7}}"#;
+    xattr::set(&mut fs, &ann, "/w/g", ACL_ACCESS, entries, 0, true).unwrap();
+    assert_eq!(stat(&fs, &ann, "/w/g", true).unwrap().perm() & 0o2000, 0);
 }

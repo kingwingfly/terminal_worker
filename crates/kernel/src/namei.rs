@@ -86,12 +86,7 @@ pub fn namei(fs: &impl Fs, cred: &Identity, path: &str, follow: bool) -> Result<
                 if links > MAXSYMLINKS {
                     return Err(Errno::ELOOP.into());
                 }
-                if dir.mode & STICKY != 0
-                    && dir.mode & 0o002 != 0
-                    && cred.id != 0
-                    && cred.id != link.owner
-                    && dir.owner != link.owner
-                {
+                if !os_core::inode::may_follow_link(cred, &dir, &link) {
                     return Err(Errno::EACCES.into());
                 }
                 at.pop();

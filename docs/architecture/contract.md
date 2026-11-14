@@ -81,14 +81,17 @@ This is the decision record for the [#44](https://github.com/kingwingfly/os/issu
   - `lookup(dir, name)`;
   - `walk(dir, names)`: resolves several components within this one filesystem in one round trip. Each name is a single component and never `.` or `..` (`EINVAL` otherwise). It stops at the first symlink, missing name or non-directory, and returns how far it got. The client never passes a name beyond its own next mount point: it splits a path at its mount points and resolves `..`, symlinks and mount crossings itself, against its mount table and process root, so `..` can never escape a `chroot` through the server;
   - `parent(dir)`: the directory's parent and its name there, within this filesystem (at the filesystem's root it says so). The client resolves `..` with it inside a filesystem, and with its own mount table at mount roots and process roots. `getcwd` is built from it, so a cwd renamed by another instance still resolves `..` and reports its current path;
-  - `create(dir, name, mode, flags, access)`: creates and opens in one call, returning the new handle and an open reference with the requested access, whatever the new file's mode, as Linux gives the creator. With `O_EXCL` it fails with `EEXIST` if the name exists, so no other instance can slip in between;
+  - `create(dir, name, mode, options)`: creates and opens in one call, returning the new handle and an open reference with the requested access, whatever the new file's mode, as Linux gives the creator. `options` carry the access, `O_EXCL` and `O_TRUNC`. With `O_EXCL` it fails with `EEXIST` if the name exists, so no other instance can slip in between. Without it, an existing file is opened, and with `O_TRUNC` emptied, in the same call;
   - `mkdir`, `mknod`, `symlink`, `readlink`, `link(handle, dir, name)`, `unlink(dir, name)`, `rmdir(dir, name)`, `rename(dir, name, dir, name, flags)`.
 - **Attributes:** `getattr`, `setattr` (mode, owner, times, size), `readdir`, `getxattr`/`setxattr`/`listxattr`/`removexattr`, `statfs`.
 - **Open files:**
-  - `open(handle, access)` returns an **open reference**. The server records it, as the `fds` table does today.
-  - `access` is read, write, read-write, append, or **exec**. Exec is checked against execute permission, not read, and its bytes serve only the loader, so execute-only images keep running (`crates/kernel/src/lib.rs`, the X rule).
+  - `open(handle, options)` returns an **open reference**. The server records it, as the `fds` table does today. The options carry the access and `O_TRUNC`; truncation asks for write permission even with read-only access and empties the regular file in the same call.
+  - `access` is read, write, read-write, **exec**, or **path**. Exec is checked against execute permission, not read, and its bytes serve only the loader, so execute-only images keep running (`crates/kernel/src/lib.rs`, the X rule). Path (`O_PATH`) asks no permission of the object and grants no access to it.
+  - **An open reference keeps its object alive; a handle does not.** A process holds a path open reference for its working directory and its root, and the mount table one for each mount point. So a working directory removed by someone else stays usable as on Linux: `stat(".")` works, and `getcwd`, `readdir` and new names give `ENOENT`.
   - `read(open, offset, length)`, `write(open, offset, data)`, `truncate(open, size)`, `fsync(open, datasync)` and `release(open)` act on it.
-  - `lock(open, kind, range, wait)`, `unlock(open, range)` and `getlk(open, range)` take advisory locks. The cloud authority keeps them per inode, owned by open references and released with them, so every instance sees them (§3).
+  - **Append is a write position, not an access.** A write names an offset or the end of the file. The driver places a write at the end atomically, at the end as it is when the write lands, and returns where it went, so appends from several processes or instances never overwrite each other. `O_APPEND` set or cleared with `fcntl(F_SETFL)` applies from the next write.
+  - `lock(open, family, kind, range)` waits until the lock is granted (`F_SETLKW`, `flock` without `LOCK_NB`). The waiter is queued by the lock keeper, giving up the wait cancels it, and an `fcntl` wait that would deadlock fails with `EDEADLK` (`flock` does not detect deadlock, as on Linux). `try_lock` with the same arguments fails at once with `EAGAIN` (`F_SETLK`, `LOCK_NB`). `unlock(open, family, range)` and `test_lock(open, kind, range)` (`F_GETLK`) complete the set.
+  - Locks come in two families that never conflict with each other, as on Linux: `flock` locks cover the whole file and need any access but path; `fcntl` byte-range locks need read access to be shared and write access to be exclusive (`EBADF` otherwise). The cloud authority keeps both per inode, owned by open references and released with them, so every instance sees them (§3).
   - An open reference records the credential that opened it, as Linux records an open file's credential. It works only while that credential is valid: revoking the credential ends its open references, and later operations on them fail with `EACCES`.
   - **Execute-only is local policy.** Exec access sends the bytes to the client's loader, so a client that may execute a file can read it. The server still refuses exec access without execute permission, but it promises no confidentiality of executable bytes.
 - **When permission is checked, as on Linux:**
@@ -276,18 +279,18 @@ Target profiles.
 - **"Refused"** means the operation fails with the errno shown.
 - **"Stale"** means the operation succeeds, but later access through a file already open fails with the errno shown.
 
-| Capability | Cloud tree | Browser storage (OPFS) | Host folder (directory handle) | Host folder (helper) | Shared mount (export) |
-| --- | --- | --- | --- | --- | --- |
-| Filesystem identity | global | profile-local | profile-local | host-local (folder UUID) | the publisher's |
-| Open file survives unlink | yes | emulated: name removed, content deleted when the last tab releases it (or when a later tab finds its holder gone) | stale: `ESTALE` | yes (the helper holds the host descriptor) | the publisher's |
-| Open file survives rename | yes | yes | yes when renamed through the OS; stale (`ESTALE`) after an outside rename | yes | the publisher's |
-| Hard links | yes | emulated in the metadata store | refused: `EPERM` | yes | the publisher's |
-| Symbolic links | yes | emulated in the metadata store | refused: `EPERM` | yes, confined beneath the folder | the publisher's |
-| Atomic `O_EXCL` create | yes | emulated (profile lock) | emulated (profile lock) | yes | the publisher's; a lost acknowledgement is an uncertain write |
-| Atomic rename | yes | emulated (profile lock) | no: declared non-atomic | yes (`renameat2`) | the publisher's |
-| `RENAME_NOREPLACE` | yes | emulated (profile lock) | emulated: checked under the profile lock | yes (`renameat2`) | the publisher's |
-| Durability point (`fsync` returns after) | the authority's transaction and chunk commit | closing the writable stream, or the sync handle's `flush()` | closing the writable stream | the helper's `fsync(2)` | the publisher's acknowledgement |
-| Locks (`flock`, `fcntl` byte ranges) | kept by the authority, seen by every instance | across the profile's tabs: Web Locks, with byte ranges in the metadata store | across the profile's tabs, as browser storage | the host's own locks, held by the helper, seen by every host program | the publisher's |
+| Capability | Cloud tree | Browser storage (OPFS) | Host folder (directory handle) | Host folder (helper) | Shared mount (export) | Memory (tmpfs) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Filesystem identity | global | profile-local | profile-local | host-local (folder UUID) | the publisher's | instance-local |
+| Open file survives unlink | yes | emulated: name removed, content deleted when the last tab releases it (or when a later tab finds its holder gone) | stale: `ESTALE` | yes (the helper holds the host descriptor) | the publisher's | yes |
+| Open file survives rename | yes | yes | yes when renamed through the OS; stale (`ESTALE`) after an outside rename | yes | the publisher's | yes |
+| Hard links | yes | emulated in the metadata store | refused: `EPERM` | yes | the publisher's | yes |
+| Symbolic links | yes | emulated in the metadata store | refused: `EPERM` | yes, confined beneath the folder | the publisher's | yes |
+| Atomic `O_EXCL` create | yes | emulated (profile lock) | emulated (profile lock) | yes | the publisher's; a lost acknowledgement is an uncertain write | yes |
+| Atomic rename | yes | emulated (profile lock) | no: declared non-atomic | yes (`renameat2`) | the publisher's | yes |
+| `RENAME_NOREPLACE` | yes | emulated (profile lock) | emulated: checked under the profile lock | yes (`renameat2`) | the publisher's | yes |
+| Durability point (`fsync` returns after) | the authority's transaction and chunk commit | closing the writable stream, or the sync handle's `flush()` | closing the writable stream | the helper's `fsync(2)` | the publisher's acknowledgement | none: the content goes with the instance, and `fsync` returns at once |
+| Locks (`flock`, `fcntl` byte ranges) | kept by the authority, seen by every instance | across the profile's tabs: Web Locks, with byte ranges in the metadata store | across the profile's tabs, as browser storage | the host's own locks, held by the helper, seen by every host program | the publisher's | kept by the instance, seen by its processes |
 
 Baseline rows: `open-rename`, `open-unlink`, `hard-link`, `symlink` → #48; `exclusive`, `noreplace`, `flush` → #50.
 

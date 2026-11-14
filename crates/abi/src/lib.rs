@@ -55,6 +55,7 @@ pub enum Errno {
     ECANCELED,
     ENOEXEC,
     ECHILD,
+    EDEADLK,
 }
 impl Errno {
     /// What glibc's strerror says of it.
@@ -97,6 +98,7 @@ impl Errno {
             ECANCELED => "Operation canceled",
             ENOEXEC => "Exec format error",
             ECHILD => "No child processes",
+            EDEADLK => "Resource deadlock avoided",
         }
     }
 }

@@ -55,6 +55,7 @@ pub fn error(e: io::Error) -> String {
         (libc::ECANCELED, "ECANCELED"),
         (libc::ENOEXEC, "ENOEXEC"),
         (libc::ECHILD, "ECHILD"),
+        (libc::EDEADLK, "EDEADLK"),
     ] {
         if n == Some(code) {
             return name.into();
